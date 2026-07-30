@@ -353,3 +353,392 @@ docs/02_reproduction_status.md
 docs/05_gap_experiment_plan.md
 docs/06_nested_dvr_design.md
 ```
+
+## 9. 复现缺口审计与后续方案
+
+### 9.1 总体判断
+
+当前代码不是空壳，而是一个已经通过专用微基准验证的 gem5/RISC-V DVR
+机制原型：Stage 1–12 的主路径已有完整回归证据，Nested DVR 也有 Stage 13
+专项证据；helper 请求确实进入 gem5 timing cache，source load 返回的真实数据
+能够驱动逐 lane dependent-address replay。
+
+但是，目前还不能称为“完整复现 DVR 论文”。更准确的定位是：
+
+> We implement an ISA-adapted prototype of DVR on a RISC-V
+> microarchitecture.
+
+当前差距主要分为三层：
+
+1. **机制语义差距**：helper 还不是论文描述的完整有序向量子线程。
+2. **Nested DVR 差距**：当前两层 child context 尚不等价于论文的 NDM 算法。
+3. **实验差距**：尚缺论文 workload、输入、ROI、消融和严格质量指标。
+
+### 9.2 已经完成且可信的部分
+
+- 32-entry RPT、commit-ordered Discovery、32-register VTT/FLR、loop-bound 和
+  lane-count 推断均已接入主执行路径。
+- 已实现最多 128 lane、8-uop recorder、VRAT/VIR 状态和 200-uop timeout。
+- helper source/dependent 请求经过 DTLB、O3 LSQ data port、cache backpressure、
+  cache hierarchy 和 response completion，不是只增加统计计数。
+- 当前微基准的 `load → C.SLLI → C.ADD → C.LD` 链已经由真实 source value
+  驱动 replay，Stage 8/10 得到 `attempts == targets` 且 `fallbacks == 0`。
+- actual-value predicate、两路径 mask、reconvergence 和 timeout 已有专用验收。
+- cache 侧已经提供 DemandLookup、Fill、Remove、victim 和 provenance 事件出口，
+  严格质量统计不需要重写，只缺最后的 L1D listener/binding。
+
+### 9.3 P0：必须优先解决的缺口
+
+#### 9.3.1 一键完整回归尚未包含 Stage 13
+
+`run_remote_dvr_regression.sh` 当前只执行到 Stage 12，然后直接输出
+`DVR_REGRESSION_PASSED`。因此现有 full regression 不能自动证明同一源码版本的
+Nested Stage 13 也通过。
+
+应在非 QUICK 回归中加入：
+
+```bash
+run_step stage13-nested \
+    "$SCRIPT_DIR/run_remote_dvr_stage13_nested.sh"
+```
+
+QUICK 模式可以跳过，但摘要中必须明确记录 `[SKIP] stage13-nested`。
+
+#### 9.3.2 当前 Nested Controller 不等于论文的 Nested Discovery Mode
+
+论文 NDM 的完整语义包括：
+
+1. inner loop 可用 lane 少于 64 时触发 NDM；
+2. 改变 inner backward branch 的方向；
+3. 从 inner loop 后继续执行；
+4. 保存 Increment Register（IR）和 Inner Load Register（ILR）；
+5. 查找外层 striding load；
+6. 先向量化多个 outer-loop invocation；
+7. 为每个 invocation 收集 inner-loop 起始地址和 bound；
+8. 展平为最多 128 个 inner lanes；
+9. 再从 inner stride 启动普通 DVR。
+
+当前实现主要是：root discovery 中发现另一个 candidate，candidate commit 后建立
+独立 child context，child recurrence 后按 child stride 生成 helper。它证明了两层
+独立 discovery/replay context 能发送真实内存请求，但尚缺 `<64 lane` 门槛、
+branch inversion、IR/ILR、outer invocation vectorization 和 inner-lane flatten。
+
+因此，当前 Stage 13 应描述为“两层独立上下文和真实 helper 验证”，不能描述为
+论文 4.3 节 NDM 的完整复现。
+
+#### 9.3.3 helper 尚未完整共享论文中的执行资源
+
+论文要求 helper 与主线程共享执行单元，并且只有在相同端口没有 main-thread
+ready instruction 时才能发射。当前实现已经具有主线程优先的 cache/data-port
+节流，但地址计算主要由 CPU 侧 C++ evaluator 完成，VIR 尚未作为真实 gem5 FU
+pipeline 的有序发射后端。
+
+目前未完整建模：
+
+- IntALU、shift、multiply、vector FU 的占用；
+- helper uop latency；
+- per-port main-thread priority；
+- source load → dependent ALU → next load 的调度时间；
+- helper front-end buffer 对 fetch/decode 带宽的影响。
+
+这会影响最终 performance、MLP 和 timeliness，必须在正式 workload 实验前补齐
+至少一个可审计的资源 token/port contention 模型。
+
+#### 9.3.4 逐 lane evaluator 的 opcode 覆盖过窄
+
+当前主要支持 `ADD/ADDI/SLLI/ANDI/load-address` 和测试使用的
+`C.ADD/C.SLLI/C.LD`。不支持的 uop 会使 replay invalid，并回退到 learned
+仿射地址 relation。
+
+真实图算法中还常见：
+
+- `SUB/SUBW`、`ADDW/ADDIW`；
+- `AND/OR/XOR`；
+- `SLL/SRL/SRA` 及 immediate/word variants；
+- `LB/LBU/LH/LHU/LW/LWU/LD`；
+- sign/zero extension；
+- `MUL`；
+- 更多 RVC 地址生成形式。
+
+如果真实 workload 大量回退，实验主要验证的是 relation predictor，而不是 DVR
+动态指令链向量化。因此必须报告 supported-uop ratio、replayable-chain ratio、
+affine-fallback ratio 和 unstable-input ratio。
+
+#### 9.3.5 divergence 尚不是完整 SIMT 控制流执行
+
+当前 actual-value predicate 已覆盖两路径微基准，但尚缺：
+
+- `BEQ/BNE/BLT/BGE/BLTU/BGEU` 的通用逐 lane evaluation；
+- branch operand 直接来自 lane register state；
+- 按真实 target/fall-through PC 分组；
+- 多层分支、break/early exit；
+- divergent path 内继续执行后续 dependent load；
+- 8-entry stack overflow 的完整回退策略。
+
+正式验收应满足：
+
+```text
+divergences == reconvergences
+             + explicit_abandons
+             + stack_overflows
+             + timeouts
+```
+
+#### 9.3.6 严格质量指标尚未绑定到指定 L1D
+
+`DVRQualityTracker` 和 cache 事件出口已经存在，但配置中尚未创建
+`ProbeListenerObject` 并只绑定 `system.cpu.dcache` 的 `"DVR Quality"` probe。
+
+当前能够严格报告 issued/completed requests 和 bytes；尚不能用于最终报告的指标有：
+
+- issued/fill accuracy；
+- coverage；
+- timeliness；
+- average lead time；
+- pollution evictions/misses；
+- unused DVR evictions。
+
+listener 必须只监听指定 L1D，不能同时监听 L2/L3，否则会重复记账。
+
+#### 9.3.7 论文 workload 和 ROI 尚未准备
+
+论文使用 13 个 benchmark：
+
+- GAP：bc、bfs、cc、pr、sssp；
+- Camel、Graph500、HJ2、HJ8、Kangaroo、NAS-CG、NAS-IS、RandomAccess；
+- Kron、LiveJournal、Orkut、Twitter、Urand 等固定图输入；
+- 跳过初始化后模拟代表性的 500M instructions。
+
+当前没有完整的 RISC-V binaries、图输入、ROI、输入 checksum 和输出语义验证。
+Stage 9 的 `1.000083×` 只是微基准功能对照，不能外推到论文的 `2.4×`。
+
+### 9.4 P1：进入论文趋势实验前应补齐的内容
+
+#### 9.4.1 消融基线
+
+当前自动比较只有 Baseline 与 Full DVR。论文趋势复现至少需要：
+
+| 配置 | Stride trigger | Offload | Discovery | Divergence | Nested |
+|---|---:|---:|---:|---:|---:|
+| Baseline | — | — | — | — | — |
+| PRE | — | — | — | — | — |
+| VR-like | 是 | ROB/full-window trigger | 否 | 基础 | 否 |
+| Offload | 是 | 是 | 否 | 是 | 否 |
+| Discovery DVR | 是 | 是 | 是 | 是 | 否 |
+| Full DVR | 是 | 是 | 是 | 是 | 是 |
+
+IMP 和 Oracle 可作为第二阶段补充。所有配置必须使用相同二进制、输入、ROI 和
+Table-1 风格配置。
+
+#### 9.4.2 Table 1 映射边界
+
+当前 Table 1 是合理近似，但不是逐周期复制：
+
+- gem5 O3 未精确表达论文 15-stage front end；
+- `SimpleMemory` 不等同于 Sniper request-based contention；
+- stride prefetcher 的 16 streams 可映射，但 degree=4 是推定值；
+- RISC-V compiler/codegen、RVC、branch semantics 与 x86/AVX-512 不同。
+
+因此最终目标应区分“RISC-V 机制/趋势复现”和“论文 x86/Sniper 绝对数字复刻”。
+
+#### 9.4.3 innermost stride selection
+
+论文在 Discovery 中维护每个 RPT entry 的 seen bit；若另一 stride 在当前 trigger
+重现前出现两次，应切换到更内层 stride，并重置 VTT/FLR。当前单 active discovery
+和 nested-candidate 逻辑尚不能替代这一通用算法，应增加 outer/inner stride 专项
+微基准和 trigger-switch 统计。
+
+#### 9.4.4 loop-bound fallback 语义
+
+论文在 loop-bound 匹配失败时使用 128 lanes。当前安全实现会记录 fallback，但
+抑制 helper，避免未知边界越界。建议增加明确模式：
+
+- `safe`：推断失败不发 helper；
+- `paper`：推断失败使用 128 lanes。
+
+最终实验需报告两种模式影响，不能把 safe 模式直接描述成论文原行为。
+
+#### 9.4.5 硬件开销重新核算
+
+论文的 1139 bytes 对应 x86 原设计，不能直接用于当前 RISC-V 实现。应重新列出：
+
+| 结构 | entries | bits/entry | 总字节 | 论文原结构 | 模拟器专用 |
+|---|---:|---:|---:|---|---|
+
+重点区分真正硬件状态与模拟器 bookkeeping，包括 32-bit VTT、32-register VRAT、
+child context、predicate/replay metadata、relation predictor 和 quality shadow state。
+
+#### 9.4.6 MLP 和资源统计
+
+论文的核心论据是 DVR 显著增加 outstanding memory requests。当前还应增加：
+
+- average/peak L1 MSHR occupancy；
+- demand 与 DVR 分项 MSHR occupancy；
+- memory queue occupancy；
+- cache/data-port utilization；
+- helper 被主线程抑制的周期比例；
+- execution-port utilization；
+- DRAM bandwidth utilization。
+
+这些指标用于解释 miss reduction、speedup 和 timeliness，而不是只报告最终 cycles。
+
+### 9.5 分级复现目标
+
+#### Level A：机制正确性复现
+
+证明 Discovery、dependent replay、lane count、divergence、timeout、严格 NDM、
+quality accounting 和 Stage 1–13 regression 在微基准上可重复。
+
+#### Level B：同 ISA 趋势复现
+
+在 RISC-V/gem5 上验证 Offload、Discovery 和 Nested 的贡献趋势，报告 performance、
+MLP、accuracy、coverage、timeliness、bandwidth 和 pollution。
+
+#### Level C：论文结果近似复现
+
+尽可能对应论文 Figure 7–12，但明确 simulator、ISA、compiler 和 memory model
+差异。成功标准应是机制排序和趋势可解释，而不是强制得到论文的 `2.4×`。
+
+### 9.6 推荐实施阶段
+
+#### 阶段 0：冻结证据并修复回归入口
+
+1. 将 Stage 13 加入 full regression。
+2. 每次保存 git SHA、dirty status、构建命令、compiler version、benchmark hash、
+   `config.ini`、`stats.txt` 和 stdout/stderr。
+3. 本地与服务器使用相同 Git commit。
+4. 回归摘要明确显示 Stage 1–13 的 PASS/SKIP/FAIL。
+
+#### 阶段 1：接通严格 L1D 质量指标
+
+1. 实现 L1D `ProbeListenerObject`。
+2. 转发 DemandLookup、Fill 和 Remove。
+3. 导出 accuracy、coverage、timeliness、lead time、pollution 和 unused eviction。
+4. 用 timely、late、unused/polluting、redundant 四组微基准验证。
+
+#### 阶段 2：扩展 replay evaluator
+
+第一批支持 SUB、word arithmetic、逻辑运算、全套 shift、不同 load width、常见
+RVC 和 MUL。每个 semantic 必须有单元测试，不支持的操作必须显式计数。
+
+微基准验收：
+
+```text
+replay_attempts == replay_targets
+replay_fallbacks == 0
+unsupported_uops == 0
+```
+
+真实 workload 的建议门槛：replayable chains ≥90%，fallback source responses ≤5%。
+
+#### 阶段 3：完成通用控制流 replay
+
+支持六类 RISC-V 条件分支、真实逐 lane operand、target PC/mask 分组、多层路径、
+path 内 dependent load、break 和 stack overflow。
+
+#### 阶段 4：实现论文语义的 NDM
+
+建议状态机：
+
+```text
+Normal Discovery
+  ├─ lanes >= 64 → Normal DVR
+  └─ lanes < 64  → NDM
+
+NDM
+  ├─ invert inner backward branch
+  ├─ scan outside inner loop
+  ├─ find and vectorize outer striding load
+  ├─ collect inner start/bound per outer invocation
+  ├─ flatten to at most 128 inner lanes
+  └─ launch ordinary DVR from inner stride
+```
+
+新增统计建议：
+
+- `dvrNDMAttempts`
+- `dvrNDMSuccesses`
+- `dvrNDMFallbacks`
+- `dvrNDMTimeouts`
+- `dvrNDMOuterLanes`
+- `dvrNDMInnerLanesCollected`
+- `dvrNDMInnerLanesDiscarded`
+- `dvrNDMHelpersGenerated`
+
+微基准至少覆盖 inner bound 4、inner bound 20 和 NDM 200-uop timeout/fallback。
+
+#### 阶段 5：建模 helper 执行资源竞争
+
+先实现按 operation class 的每周期资源 token，并保持 main-thread priority；随后如有
+必要，再把 helper uop 接入 gem5 FU/issue scheduling。分别用 ALU、shift、load-port
+和 bandwidth 饱和微基准验证。
+
+#### 阶段 6：准备 workload
+
+1. 先跑 GAP BFS scale-10 smoke，只用于流程验证。
+2. 再固定能超过 LLC、且仿真时间可接受的小图，运行 bc/bfs/cc/pr/sssp。
+3. 随后加入 RandomAccess、NAS-IS、NAS-CG、Graph500、HashJoin 等。
+4. 每项记录 source commit、compiler flags、ELF、input checksum、ROI 和输出 checksum。
+
+#### 阶段 7：执行消融矩阵
+
+每个 workload 至少运行 Baseline、PRE、VR-like、Offload、Discovery DVR 和 Full DVR。
+收集 cycles、IPC、cache misses、branch MPKI、MSHR occupancy、helper traffic、严格质量
+指标、fallback ratio 和 NDM success ratio。
+
+#### 阶段 8：敏感性实验
+
+至少扫描：
+
+- lanes：32/64/128/256；
+- recorder：4/8/16 uops；
+- helper timeout：100/200/400；
+- NDM threshold：32/64/96；
+- ROB：128/192/224/350/512；
+- stride degree：1/2/4/8；
+- main-thread priority on/off；
+- memory latency 和 bandwidth。
+
+### 9.7 推荐执行顺序
+
+不要先直接跑大规模 benchmark。推荐顺序为：
+
+1. Stage 13 加入回归；
+2. 严格 L1D quality listener；
+3. 统计 workload opcode/fallback coverage；
+4. 扩展 evaluator；
+5. 通用 branch replay；
+6. 真正的 NDM；
+7. MLP/resource contention；
+8. GAP smoke；
+9. GAP 五 workload；
+10. 消融；
+11. hpc-db；
+12. 敏感性和最终报告。
+
+如果 evaluator 大量 fallback、quality 不可测且 NDM 仍不是论文算法，即使提前得到
+speedup，也无法判断收益来自 DVR、仿射 predictor，还是 cache traffic 的偶然效应。
+
+### 9.8 最终完成标准
+
+只有同时满足以下条件，才建议写“完成 RISC-V/gem5 DVR 机制与趋势复现”：
+
+- Stage 1–13 一键 full regression；
+- 目标 workload 上 evaluator fallback 足够低；
+- 六类 RISC-V branch 的逐 lane divergence 验证通过；
+- NDM 实现 `<64 lanes → outer invocation collection → flatten to 128`；
+- helper 具有可解释的共享执行资源竞争；
+- L1D accuracy、coverage、timeliness 和 pollution 可报告；
+- 至少完成 GAP 五 workload；
+- 完成 Baseline、PRE/VR-like、Offload、Discovery、Full DVR 消融；
+- MLP 与 speedup 能相互解释；
+- workload、二进制、输入、ROI、配置和结果均有 manifest；
+- 文档明确区分 x86/Sniper 论文数字与 RISC-V/gem5 结果。
+
+按上述标准，当前可粗略评估为：
+
+- 微基准机制原型：约 70%–80%；
+- 论文算法忠实度：约 45%–55%；
+- 论文实验复现度：约 15%–25%。
+
+现阶段最重要的三个下一步是：**严格质量接线、真正的 NDM、真实 workload 与消融矩阵**。
