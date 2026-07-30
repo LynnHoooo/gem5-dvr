@@ -1,0 +1,21 @@
+# macOS and editor files
+.DS_Store
+.claudian/
+.codex/
+.obsidian/
+.work/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# gem5 build and simulation outputs
+code/gem5-runahead-dev-pre/build/
+code/gem5-runahead-dev-pre/m5out/
+results/
+output/
+tmp/
+
+# Local environment and generated files
+*.log
+*.tmp

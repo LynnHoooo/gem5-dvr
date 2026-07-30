@@ -1,0 +1,2332 @@
+/*
+ * Copyright (c) 2011-2012, 2014, 2016, 2017, 2019-2020 ARM Limited
+ * Copyright (c) 2013 Advanced Micro Devices, Inc.
+ * All rights reserved
+ *
+ * The license below extends only to copyright in the software and shall
+ * not be construed as granting a license to any other intellectual
+ * property including but not limited to intellectual property relating
+ * to a hardware implementation of the functionality of the software
+ * licensed hereunder.  You may use the software subject to the license
+ * terms below provided that you ensure that this notice is replicated
+ * unmodified and in its entirety in all distributions of the software,
+ * modified or unmodified, in source code or in binary form.
+ *
+ * Copyright (c) 2004-2006 The Regents of The University of Michigan
+ * Copyright (c) 2011 Regents of the University of California
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are
+ * met: redistributions of source code must retain the above copyright
+ * notice, this list of conditions and the following disclaimer;
+ * redistributions in binary form must reproduce the above copyright
+ * notice, this list of conditions and the following disclaimer in the
+ * documentation and/or other materials provided with the distribution;
+ * neither the name of the copyright holders nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#include "cpu/o3/cpu.hh"
+
+#include "mem/packet_access.hh"
+
+#include "config/the_isa.hh"
+#include "cpu/activity.hh"
+#include "cpu/checker/cpu.hh"
+#include "cpu/checker/thread_context.hh"
+#include "cpu/o3/dyn_inst.hh"
+#include "cpu/o3/limits.hh"
+#include "cpu/o3/thread_context.hh"
+#include "cpu/simple_thread.hh"
+#include "cpu/thread_context.hh"
+#include "debug/Activity.hh"
+#include "debug/Drain.hh"
+#include "debug/O3CPU.hh"
+#include "debug/Quiesce.hh"
+#include "enums/MemoryMode.hh"
+#include "sim/cur_tick.hh"
+#include "sim/full_system.hh"
+#include "sim/process.hh"
+#include "sim/stat_control.hh"
+#include "sim/system.hh"
+
+namespace gem5
+{
+
+bool MJ::enable;
+Tick MJ::lastTick;
+MJ::MJ(const char *stage, const char *event)
+{
+    if (!enable)
+        return;
+    if (curTick() != lastTick) {
+        lastTick = curTick();
+        std::cout << std::endl;
+    }
+    std::cout << "[" << stage << "] @" << curTick() << " " << event;
+}
+
+struct BaseCPUParams;
+
+namespace o3
+{
+
+CPU::DVRPrefetchSenderState::DVRPrefetchSenderState(
+    bool is_source, unsigned relation_count,
+    const std::array<int64_t, MaxRelations> &relation_scales,
+    const std::array<int64_t, MaxRelations> &relation_offsets,
+    const std::array<RegVal, MaxRelations> &relation_masks,
+    const std::array<RegVal, MaxRelations> &relation_patterns,
+    std::shared_ptr<const DVRReplayTemplate> replay_template,
+    ThreadID thread)
+    : source(is_source), relationCount(relation_count),
+      scales(relation_scales), offsets(relation_offsets),
+      masks(relation_masks), patterns(relation_patterns),
+      replay(std::move(replay_template)), tid(thread)
+{
+}
+
+CPU::CPU(const BaseO3CPUParams &params)
+    : BaseCPU(params),
+      mmu(params.mmu),
+      tickEvent([this]{ tick(); }, "O3CPU tick",
+                false, Event::CPU_Tick_Pri),
+      threadExitEvent([this]{ exitThreads(); }, "O3CPU exit threads",
+                false, Event::CPU_Exit_Pri),
+#ifndef NDEBUG
+      instcount(0),
+#endif
+      removeInstsThisCycle(false),
+      fetch(this, params),
+      decode(this, params),
+      rename(this, params),
+      iew(this, params),
+      commit(this, params),
+
+      regFile(params.numPhysIntRegs,
+              params.numPhysFloatRegs,
+              params.numPhysVecRegs,
+              params.numPhysVecPredRegs,
+              params.numPhysCCRegs,
+              params.isa[0]->regClasses()),
+
+      freeList(name() + ".freelist", &regFile),
+
+      rob(this, params),
+
+      sst(this, params),
+
+      scoreboard(name() + ".scoreboard", regFile.totalNumPhysRegs()),
+
+      isa(numThreads, NULL),
+
+      timeBuffer(params.backComSize, params.forwardComSize),
+      fetchQueue(params.backComSize, params.forwardComSize),
+      decodeQueue(params.backComSize, params.forwardComSize),
+      renameQueue(params.backComSize, params.forwardComSize),
+      iewQueue(params.backComSize, params.forwardComSize),
+      activityRec(name(), NumStages,
+                  params.backComSize + params.forwardComSize,
+                  params.activity),
+
+      globalSeqNum(1),
+      system(params.system),
+      lastRunningCycle(curCycle()),
+      cpuStats(this),
+      enablePRE(params.enablePRE),
+      inPRE(false),
+      enableDVR(params.enableDVR),
+      dvrStrideDetector(params.dvrRPTEntries),
+      dvrDiscovery(params.dvrDiscoveryMaxInsts),
+      dvrMaxLanes(params.dvrMaxLanes),
+      dvrHelperMaxUops(params.dvrHelperMaxUops)
+{
+    fatal_if(FullSystem && params.numThreads > 1,
+            "SMT is not supported in O3 in full system mode currently.");
+
+    fatal_if(!FullSystem && params.numThreads < params.workload.size(),
+            "More workload items (%d) than threads (%d) on CPU %s.",
+            params.workload.size(), params.numThreads, name());
+
+    if (!params.switched_out) {
+        _status = Running;
+    } else {
+        _status = SwitchedOut;
+    }
+
+    if (params.checker) {
+        BaseCPU *temp_checker = params.checker;
+        checker = dynamic_cast<Checker<DynInstPtr> *>(temp_checker);
+        checker->setIcachePort(&fetch.getInstPort());
+        checker->setSystem(params.system);
+    } else {
+        checker = NULL;
+    }
+
+    if (!FullSystem) {
+        thread.resize(numThreads);
+        tids.resize(numThreads);
+    }
+
+    // The stages also need their CPU pointer setup.  However this
+    // must be done at the upper level CPU because they have pointers
+    // to the upper level CPU, and not this CPU.
+
+    // Set up Pointers to the activeThreads list for each stage
+    fetch.setActiveThreads(&activeThreads);
+    decode.setActiveThreads(&activeThreads);
+    rename.setActiveThreads(&activeThreads);
+    iew.setActiveThreads(&activeThreads);
+    commit.setActiveThreads(&activeThreads);
+
+    // Give each of the stages the time buffer they will use.
+    fetch.setTimeBuffer(&timeBuffer);
+    decode.setTimeBuffer(&timeBuffer);
+    rename.setTimeBuffer(&timeBuffer);
+    iew.setTimeBuffer(&timeBuffer);
+    commit.setTimeBuffer(&timeBuffer);
+
+    // Also setup each of the stages' queues.
+    fetch.setFetchQueue(&fetchQueue);
+    decode.setFetchQueue(&fetchQueue);
+    commit.setFetchQueue(&fetchQueue);
+    decode.setDecodeQueue(&decodeQueue);
+    rename.setDecodeQueue(&decodeQueue);
+    rename.setRenameQueue(&renameQueue);
+    iew.setRenameQueue(&renameQueue);
+    iew.setIEWQueue(&iewQueue);
+    commit.setIEWQueue(&iewQueue);
+    commit.setRenameQueue(&renameQueue);
+
+    commit.setIEWStage(&iew);
+    rename.setIEWStage(&iew);
+    rename.setCommitStage(&commit);
+
+    ThreadID active_threads;
+    if (FullSystem) {
+        active_threads = 1;
+    } else {
+        active_threads = params.workload.size();
+
+        if (active_threads > MaxThreads) {
+            panic("Workload Size too large. Increase the 'MaxThreads' "
+                  "constant in cpu/o3/limits.hh or edit your workload size.");
+        }
+    }
+
+    // Make Sure That this a Valid Architeture
+    assert(numThreads);
+    const auto &regClasses = params.isa[0]->regClasses();
+
+    assert(params.numPhysIntRegs >=
+            numThreads * regClasses.at(IntRegClass).numRegs());
+    assert(params.numPhysFloatRegs >=
+            numThreads * regClasses.at(FloatRegClass).numRegs());
+    assert(params.numPhysVecRegs >=
+            numThreads * regClasses.at(VecRegClass).numRegs());
+    assert(params.numPhysVecPredRegs >=
+            numThreads * regClasses.at(VecPredRegClass).numRegs());
+    assert(params.numPhysCCRegs >=
+            numThreads * regClasses.at(CCRegClass).numRegs());
+
+    if (numThreads > 1 && enablePRE) {
+        fatal("PRE supports single thread only.\n");
+    }
+
+    // Just make this a warning and go ahead anyway, to keep from having to
+    // add checks everywhere.
+    warn_if(regClasses.at(CCRegClass).numRegs() == 0 &&
+            params.numPhysCCRegs != 0,
+            "Non-zero number of physical CC regs specified, even though\n"
+            "    ISA does not use them.");
+
+    rename.setScoreboard(&scoreboard);
+    iew.setScoreboard(&scoreboard);
+
+    // Setup the rename map for whichever stages need it.
+    for (ThreadID tid = 0; tid < numThreads; tid++) {
+        isa[tid] = dynamic_cast<TheISA::ISA *>(params.isa[tid]);
+        commitRenameMap[tid].init(regClasses, &regFile, &freeList);
+        renameMap[tid].init(regClasses, &regFile, &freeList);
+    }
+
+    // Initialize rename map to assign physical registers to the
+    // architectural registers for active threads only.
+    for (ThreadID tid = 0; tid < active_threads; tid++) {
+        for (auto type = (RegClassType)0; type <= CCRegClass;
+                type = (RegClassType)(type + 1)) {
+            for (RegIndex ridx = 0; ridx < regClasses.at(type).numRegs();
+                    ++ridx) {
+                // Note that we can't use the rename() method because we don't
+                // want special treatment for the zero register at this point
+                RegId rid = RegId(type, ridx);
+                PhysRegIdPtr phys_reg = freeList.getReg(type);
+                renameMap[tid].setEntry(rid, phys_reg);
+                commitRenameMap[tid].setEntry(rid, phys_reg);
+            }
+        }
+    }
+
+    rename.setRenameMap(renameMap);
+    commit.setRenameMap(commitRenameMap);
+    rename.setFreeList(&freeList);
+
+    // Setup the ROB for whichever stages need it.
+    commit.setROB(&rob);
+
+    // Setup PRE utilities
+    decode.setSST(&sst);
+    rename.setSST(&sst);
+    commit.setSST(&sst);
+
+    lastActivatedCycle = 0;
+
+    DPRINTF(O3CPU, "Creating O3CPU object.\n");
+
+    // Setup any thread state.
+    thread.resize(numThreads);
+
+    for (ThreadID tid = 0; tid < numThreads; ++tid) {
+        if (FullSystem) {
+            // SMT is not supported in FS mode yet.
+            assert(numThreads == 1);
+            thread[tid] = new ThreadState(this, 0, NULL);
+        } else {
+            if (tid < params.workload.size()) {
+                DPRINTF(O3CPU, "Workload[%i] process is %#x", tid,
+                        thread[tid]);
+                thread[tid] = new ThreadState(this, tid, params.workload[tid]);
+            } else {
+                //Allocate Empty thread so M5 can use later
+                //when scheduling threads to CPU
+                Process* dummy_proc = NULL;
+
+                thread[tid] = new ThreadState(this, tid, dummy_proc);
+            }
+        }
+
+        gem5::ThreadContext *tc;
+
+        // Setup the TC that will serve as the interface to the threads/CPU.
+        auto *o3_tc = new ThreadContext;
+
+        tc = o3_tc;
+
+        // If we're using a checker, then the TC should be the
+        // CheckerThreadContext.
+        if (params.checker) {
+            tc = new CheckerThreadContext<ThreadContext>(o3_tc, checker);
+        }
+
+        o3_tc->cpu = this;
+        o3_tc->thread = thread[tid];
+
+        // Give the thread the TC.
+        thread[tid]->tc = tc;
+
+        // Add the TC to the CPU's list of TC's.
+        threadContexts.push_back(tc);
+    }
+
+    // O3CPU always requires an interrupt controller.
+    if (!params.switched_out && interrupts.empty()) {
+        fatal("O3CPU %s has no interrupt controller.\n"
+              "Ensure createInterruptController() is called.\n", name());
+    }
+
+    // Initiate my journal.
+    MJ::enable = params.enableMJ;
+    MJ::lastTick = 0;
+}
+
+void
+CPU::regProbePoints()
+{
+    BaseCPU::regProbePoints();
+
+    ppInstAccessComplete = new ProbePointArg<PacketPtr>(
+            getProbeManager(), "InstAccessComplete");
+    ppDataAccessComplete = new ProbePointArg<
+        std::pair<DynInstPtr, PacketPtr>>(
+                getProbeManager(), "DataAccessComplete");
+
+    fetch.regProbePoints();
+    rename.regProbePoints();
+    iew.regProbePoints();
+    commit.regProbePoints();
+}
+
+CPU::CPUStats::CPUStats(CPU *cpu)
+    : statistics::Group(cpu),
+      ADD_STAT(timesIdled, statistics::units::Count::get(),
+               "Number of times that the entire CPU went into an idle state "
+               "and unscheduled itself"),
+      ADD_STAT(idleCycles, statistics::units::Cycle::get(),
+               "Total number of cycles that the CPU has spent unscheduled due "
+               "to idling"),
+      ADD_STAT(quiesceCycles, statistics::units::Cycle::get(),
+               "Total number of cycles that CPU has spent quiesced or waiting "
+               "for an interrupt"),
+      ADD_STAT(committedInsts, statistics::units::Count::get(),
+               "Number of Instructions Simulated"),
+      ADD_STAT(committedOps, statistics::units::Count::get(),
+               "Number of Ops (including micro ops) Simulated"),
+      ADD_STAT(cpi, statistics::units::Rate<
+                    statistics::units::Cycle, statistics::units::Count>::get(),
+               "CPI: Cycles Per Instruction"),
+      ADD_STAT(totalCpi, statistics::units::Rate<
+                    statistics::units::Cycle, statistics::units::Count>::get(),
+               "CPI: Total CPI of All Threads"),
+      ADD_STAT(ipc, statistics::units::Rate<
+                    statistics::units::Count, statistics::units::Cycle>::get(),
+               "IPC: Instructions Per Cycle"),
+      ADD_STAT(totalIpc, statistics::units::Rate<
+                    statistics::units::Count, statistics::units::Cycle>::get(),
+               "IPC: Total IPC of All Threads"),
+      ADD_STAT(intRegfileReads, statistics::units::Count::get(),
+               "Number of integer regfile reads"),
+      ADD_STAT(intRegfileWrites, statistics::units::Count::get(),
+               "Number of integer regfile writes"),
+      ADD_STAT(fpRegfileReads, statistics::units::Count::get(),
+               "Number of floating regfile reads"),
+      ADD_STAT(fpRegfileWrites, statistics::units::Count::get(),
+               "Number of floating regfile writes"),
+      ADD_STAT(vecRegfileReads, statistics::units::Count::get(),
+               "number of vector regfile reads"),
+      ADD_STAT(vecRegfileWrites, statistics::units::Count::get(),
+               "number of vector regfile writes"),
+      ADD_STAT(vecPredRegfileReads, statistics::units::Count::get(),
+               "number of predicate regfile reads"),
+      ADD_STAT(vecPredRegfileWrites, statistics::units::Count::get(),
+               "number of predicate regfile writes"),
+      ADD_STAT(ccRegfileReads, statistics::units::Count::get(),
+               "number of cc regfile reads"),
+      ADD_STAT(ccRegfileWrites, statistics::units::Count::get(),
+               "number of cc regfile writes"),
+      ADD_STAT(miscRegfileReads, statistics::units::Count::get(),
+               "number of misc regfile reads"),
+      ADD_STAT(miscRegfileWrites, statistics::units::Count::get(),
+               "number of misc regfile writes"),
+      ADD_STAT(dvrLoadsObserved, statistics::units::Count::get(),
+               "DVR main-thread loads observed by the RPT"),
+      ADD_STAT(dvrStrideCandidates, statistics::units::Count::get(),
+               "DVR confident striding-load observations"),
+      ADD_STAT(dvrDiscoveryStarts, statistics::units::Count::get(),
+               "DVR 发现阶段在提交时启动的次数"),
+      ADD_STAT(dvrDiscoveryCompletions, statistics::units::Count::get(),
+               "由 trigger load 结束的 DVR 发现阶段数"),
+      ADD_STAT(dvrDiscoveryTimeouts, statistics::units::Count::get(),
+               "因指令数上限结束的 DVR 发现阶段数"),
+      ADD_STAT(dvrDiscoveryAbandons, statistics::units::Count::get(),
+               "DVR armed triggers discarded after speculative squash"),
+      ADD_STAT(dvrDiscoveredInstructions, statistics::units::Count::get(),
+               "Committed instructions recorded by completed discoveries"),
+      ADD_STAT(dvrTaintedInstructions, statistics::units::Count::get(),
+               "Discovery instructions with a tainted integer source"),
+      ADD_STAT(dvrDependentLoads, statistics::units::Count::get(),
+               "Discovery loads whose address input is tainted"),
+      ADD_STAT(dvrDiscoveriesWithFLR, statistics::units::Count::get(),
+               "Completed discoveries with a nonzero Final Load Register"),
+      ADD_STAT(dvrBackwardBranches, statistics::units::Count::get(),
+               "Backward conditional branches seen during discovery"),
+      ADD_STAT(dvrLoopBoundsFound, statistics::units::Count::get(),
+               "Loop branches enclosing the trigger-to-FLR chain"),
+      ADD_STAT(dvrDiscoveriesWithBounds, statistics::units::Count::get(),
+               "Completed discoveries with an inferred loop boundary"),
+      ADD_STAT(dvrLoopBoundMatches, statistics::units::Count::get(),
+               "Loop bounds matched by the two register checkpoints"),
+      ADD_STAT(dvrLoopBoundFallbacks, statistics::units::Count::get(),
+               "Loop bounds that fell back to the maximum lane count"),
+      ADD_STAT(dvrLaneCountSamples, statistics::units::Count::get(),
+               "Completed DVR discoveries assigned an active lane count"),
+      ADD_STAT(dvrTotalActiveLanes, statistics::units::Count::get(),
+               "Sum of active lanes selected across DVR discoveries"),
+      ADD_STAT(dvrPrefetchesGenerated, statistics::units::Count::get(),
+               "DVR stride-lane prefetch addresses generated"),
+      ADD_STAT(dvrPrefetchesIssued, statistics::units::Count::get(),
+               "DVR prefetch timing requests accepted by L1D"),
+      ADD_STAT(dvrPrefetchesCompleted, statistics::units::Count::get(),
+               "DVR prefetch responses consumed by the CPU"),
+      ADD_STAT(dvrPrefetchesDropped, statistics::units::Count::get(),
+               "DVR prefetches dropped due to replacement or backpressure"),
+      ADD_STAT(dvrPrefetchTranslationFaults, statistics::units::Count::get(),
+               "DVR prefetch virtual-address translation faults"),
+      ADD_STAT(dvrAddressRelationsTrained, statistics::units::Count::get(),
+               "DVR trigger-value to FLR-address affine relations trained"),
+      ADD_STAT(dvrDependentPrefetchesGenerated,
+               statistics::units::Count::get(),
+               "DVR indirect target prefetches generated from source data"),
+      ADD_STAT(dvrDependentPrefetchesIssued, statistics::units::Count::get(),
+               "DVR dependent prefetches accepted by L1D"),
+      ADD_STAT(dvrDependentPrefetchesCompleted,
+               statistics::units::Count::get(),
+               "DVR dependent prefetch responses completed"),
+      ADD_STAT(dvrRecordedUops, statistics::units::Count::get(),
+               "Trigger-to-FLR uops retained by the DVR recorder"),
+      ADD_STAT(dvrRecorderOverflows, statistics::units::Count::get(),
+               "Discoveries whose trigger-to-FLR slice exceeded eight uops"),
+      ADD_STAT(dvrVectorProgramsBuilt, statistics::units::Count::get(),
+               "Recorded slices materialized as DVR vector programs"),
+      ADD_STAT(dvrVRATAllocations, statistics::units::Count::get(),
+               "16-lane physical mappings allocated by the DVR VRAT"),
+      ADD_STAT(dvrVIRChunkIssues, statistics::units::Count::get(),
+               "Recorded uop chunks issued through the DVR VIR"),
+      ADD_STAT(dvrVIRChunkExecutions, statistics::units::Count::get(),
+               "Recorded uop chunks executed through the DVR VIR"),
+      ADD_STAT(dvrDivergentBranches, statistics::units::Count::get(),
+               "DVR conditional branches that split the active mask"),
+      ADD_STAT(dvrReconvergences, statistics::units::Count::get(),
+               "DVR active masks restored at reconvergence points"),
+      ADD_STAT(dvrHelperTimeouts, statistics::units::Count::get(),
+               "DVR helpers terminated by the helper-uop budget"),
+      ADD_STAT(dvrReconvergenceStackOverflows,
+               statistics::units::Count::get(),
+               "DVR helpers terminated by an eight-entry stack overflow"),
+      ADD_STAT(dvrHelpersSuppressed, statistics::units::Count::get(),
+               "DVR helper launches suppressed by invalid or terminated VIR"),
+      ADD_STAT(dvrPredicateSelections, statistics::units::Count::get(),
+               "Dependent paths selected by learned value predicates"),
+      ADD_STAT(dvrDistinctPredicatePaths, statistics::units::Count::get(),
+               "Distinct predicate relation slots exercised"),
+      ADD_STAT(dvrPredicateMisses, statistics::units::Count::get(),
+               "Source values that matched no learned dependent path"),
+      ADD_STAT(dvrSourcePrefetchesIssued, statistics::units::Count::get(),
+               "DVR source (stride-lane) prefetches accepted by L1D"),
+      ADD_STAT(dvrSourcePrefetchesCompleted, statistics::units::Count::get(),
+               "DVR source (stride-lane) prefetch responses completed"),
+      ADD_STAT(dvrPrefetchQueuePeak, statistics::units::Count::get(),
+               "Peak number of waiting DVR helper memory requests"),
+      ADD_STAT(dvrPrefetchesSuppressedMainThread,
+               statistics::units::Count::get(),
+               "DVR requests suppressed because the main-thread data port "
+               "was already occupied"),
+      ADD_STAT(dvrPrefetchesRejectedBackpressure,
+               statistics::units::Count::get(),
+               "DVR requests rejected after an available-port probe"),
+      ADD_STAT(dvrPrefetchesSuperseded, statistics::units::Count::get(),
+               "Queued DVR requests discarded by a newer helper launch"),
+      ADD_STAT(dvrPrefetchesPossiblyUseful, statistics::units::Count::get(),
+               "Demand loads to a line after a DVR prefetch completed"),
+      ADD_STAT(dvrPrefetchesLate, statistics::units::Count::get(),
+               "Demand loads to a line while a DVR prefetch was outstanding"),
+      ADD_STAT(dvrReplaySupportedUops, statistics::units::Count::get(),
+               "Supported post-trigger uops in DVR replay templates"),
+      ADD_STAT(dvrReplayUnsupportedUops, statistics::units::Count::get(),
+               "Unsupported post-trigger uops in DVR replay templates"),
+      ADD_STAT(dvrReplayUnstableInputs, statistics::units::Count::get(),
+               "Replay templates rejected due to changing external inputs"),
+      ADD_STAT(dvrReplayAttempts, statistics::units::Count::get(),
+               "Source responses offered to the scalar DVR uop replay path"),
+      ADD_STAT(dvrReplayTargetsGenerated, statistics::units::Count::get(),
+               "Dependent targets generated by real recorded-uop replay"),
+      ADD_STAT(dvrReplayFallbacks, statistics::units::Count::get(),
+               "Source responses falling back from uop replay to affine paths")
+{
+    // Register any of the O3CPU's stats here.
+    timesIdled
+        .prereq(timesIdled);
+
+    idleCycles
+        .prereq(idleCycles);
+
+    quiesceCycles
+        .prereq(quiesceCycles);
+
+    // Number of Instructions simulated
+    // --------------------------------
+    // Should probably be in Base CPU but need templated
+    // MaxThreads so put in here instead
+    committedInsts
+        .init(cpu->numThreads)
+        .flags(statistics::total);
+
+    committedOps
+        .init(cpu->numThreads)
+        .flags(statistics::total);
+
+    cpi
+        .precision(6);
+    cpi = cpu->baseStats.numCycles / committedInsts;
+
+    totalCpi
+        .precision(6);
+    totalCpi = cpu->baseStats.numCycles / sum(committedInsts);
+
+    ipc
+        .precision(6);
+    ipc = committedInsts / cpu->baseStats.numCycles;
+
+    totalIpc
+        .precision(6);
+    totalIpc = sum(committedInsts) / cpu->baseStats.numCycles;
+
+    intRegfileReads
+        .prereq(intRegfileReads);
+
+    intRegfileWrites
+        .prereq(intRegfileWrites);
+
+    fpRegfileReads
+        .prereq(fpRegfileReads);
+
+    fpRegfileWrites
+        .prereq(fpRegfileWrites);
+
+    vecRegfileReads
+        .prereq(vecRegfileReads);
+
+    vecRegfileWrites
+        .prereq(vecRegfileWrites);
+
+    vecPredRegfileReads
+        .prereq(vecPredRegfileReads);
+
+    vecPredRegfileWrites
+        .prereq(vecPredRegfileWrites);
+
+    ccRegfileReads
+        .prereq(ccRegfileReads);
+
+    ccRegfileWrites
+        .prereq(ccRegfileWrites);
+
+    miscRegfileReads
+        .prereq(miscRegfileReads);
+
+    miscRegfileWrites
+        .prereq(miscRegfileWrites);
+}
+
+void
+CPU::tick()
+{
+    DPRINTF(O3CPU, "\n\nO3CPU: Ticking main, O3CPU.\n");
+    assert(!switchedOut());
+    assert(drainState() != DrainState::Drained);
+
+    ++baseStats.numCycles;
+    updateCycleCounters(BaseCPU::CPU_STATE_ON);
+
+//    activity = false;
+
+    //Tick each of the stages
+    fetch.tick();
+
+    decode.tick();
+
+    rename.tick();
+
+    iew.tick();
+
+    // The main thread gets the first opportunity to use the LSQ data port.
+    // A DVR helper probes the port only after IEW has issued this cycle's
+    // demand accesses, and is discarded rather than retried on contention.
+    serviceDVRPrefetchQueue();
+
+    commit.tick();
+
+    // Now advance the time buffers
+    timeBuffer.advance();
+
+    fetchQueue.advance();
+    decodeQueue.advance();
+    renameQueue.advance();
+    iewQueue.advance();
+
+    activityRec.advance();
+
+    if (removeInstsThisCycle) {
+        cleanUpRemovedInsts();
+    }
+
+    if (!tickEvent.scheduled()) {
+        if (_status == SwitchedOut) {
+            DPRINTF(O3CPU, "Switched out!\n");
+            // increment stat
+            lastRunningCycle = curCycle();
+        } else if (!activityRec.active() || _status == Idle) {
+            DPRINTF(O3CPU, "Idle!\n");
+            lastRunningCycle = curCycle();
+            cpuStats.timesIdled++;
+        } else {
+            schedule(tickEvent, clockEdge(Cycles(1)));
+            DPRINTF(O3CPU, "Scheduling next tick!\n");
+        }
+    }
+
+    if (!FullSystem)
+        updateThreadPriority();
+
+    tryDrain();
+}
+
+void
+CPU::init()
+{
+    BaseCPU::init();
+
+    for (ThreadID tid = 0; tid < numThreads; ++tid) {
+        // Set noSquashFromTC so that the CPU doesn't squash when initially
+        // setting up registers.
+        thread[tid]->noSquashFromTC = true;
+    }
+
+    // Clear noSquashFromTC.
+    for (int tid = 0; tid < numThreads; ++tid)
+        thread[tid]->noSquashFromTC = false;
+
+    commit.setThreads(thread);
+}
+
+void
+CPU::startup()
+{
+    BaseCPU::startup();
+
+    fetch.startupStage();
+    decode.startupStage();
+    iew.startupStage();
+    rename.startupStage();
+    commit.startupStage();
+}
+
+void
+CPU::activateThread(ThreadID tid)
+{
+    std::list<ThreadID>::iterator isActive =
+        std::find(activeThreads.begin(), activeThreads.end(), tid);
+
+    DPRINTF(O3CPU, "[tid:%i] Calling activate thread.\n", tid);
+    assert(!switchedOut());
+
+    if (isActive == activeThreads.end()) {
+        DPRINTF(O3CPU, "[tid:%i] Adding to active threads list\n", tid);
+
+        activeThreads.push_back(tid);
+    }
+}
+
+void
+CPU::deactivateThread(ThreadID tid)
+{
+    // hardware transactional memory
+    // shouldn't deactivate thread in the middle of a transaction
+    assert(!commit.executingHtmTransaction(tid));
+
+    //Remove From Active List, if Active
+    std::list<ThreadID>::iterator thread_it =
+        std::find(activeThreads.begin(), activeThreads.end(), tid);
+
+    DPRINTF(O3CPU, "[tid:%i] Calling deactivate thread.\n", tid);
+    assert(!switchedOut());
+
+    if (thread_it != activeThreads.end()) {
+        DPRINTF(O3CPU,"[tid:%i] Removing from active threads list\n",
+                tid);
+        activeThreads.erase(thread_it);
+    }
+
+    fetch.deactivateThread(tid);
+    commit.deactivateThread(tid);
+}
+
+Counter
+CPU::totalInsts() const
+{
+    Counter total(0);
+
+    ThreadID size = thread.size();
+    for (ThreadID i = 0; i < size; i++)
+        total += thread[i]->numInst;
+
+    return total;
+}
+
+Counter
+CPU::totalOps() const
+{
+    Counter total(0);
+
+    ThreadID size = thread.size();
+    for (ThreadID i = 0; i < size; i++)
+        total += thread[i]->numOp;
+
+    return total;
+}
+
+void
+CPU::activateContext(ThreadID tid)
+{
+    assert(!switchedOut());
+
+    // Needs to set each stage to running as well.
+    activateThread(tid);
+
+    // We don't want to wake the CPU if it is drained. In that case,
+    // we just want to flag the thread as active and schedule the tick
+    // event from drainResume() instead.
+    if (drainState() == DrainState::Drained)
+        return;
+
+    // If we are time 0 or if the last activation time is in the past,
+    // schedule the next tick and wake up the fetch unit
+    if (lastActivatedCycle == 0 || lastActivatedCycle < curTick()) {
+        scheduleTickEvent(Cycles(0));
+
+        // Be sure to signal that there's some activity so the CPU doesn't
+        // deschedule itself.
+        activityRec.activity();
+        fetch.wakeFromQuiesce();
+
+        Cycles cycles(curCycle() - lastRunningCycle);
+        // @todo: This is an oddity that is only here to match the stats
+        if (cycles != 0)
+            --cycles;
+        cpuStats.quiesceCycles += cycles;
+
+        lastActivatedCycle = curTick();
+
+        _status = Running;
+
+        BaseCPU::activateContext(tid);
+    }
+}
+
+void
+CPU::suspendContext(ThreadID tid)
+{
+    DPRINTF(O3CPU,"[tid:%i] Suspending Thread Context.\n", tid);
+    assert(!switchedOut());
+
+    deactivateThread(tid);
+
+    // If this was the last thread then unschedule the tick event.
+    if (activeThreads.size() == 0) {
+        unscheduleTickEvent();
+        lastRunningCycle = curCycle();
+        _status = Idle;
+    }
+
+    DPRINTF(Quiesce, "Suspending Context\n");
+
+    BaseCPU::suspendContext(tid);
+}
+
+void
+CPU::haltContext(ThreadID tid)
+{
+    //For now, this is the same as deallocate
+    DPRINTF(O3CPU,"[tid:%i] Halt Context called. Deallocating\n", tid);
+    assert(!switchedOut());
+
+    deactivateThread(tid);
+    removeThread(tid);
+
+    // If this was the last thread then unschedule the tick event.
+    if (activeThreads.size() == 0) {
+        if (tickEvent.scheduled())
+        {
+            unscheduleTickEvent();
+        }
+        lastRunningCycle = curCycle();
+        _status = Idle;
+    }
+    updateCycleCounters(BaseCPU::CPU_STATE_SLEEP);
+}
+
+void
+CPU::insertThread(ThreadID tid)
+{
+    DPRINTF(O3CPU,"[tid:%i] Initializing thread into CPU");
+    // Will change now that the PC and thread state is internal to the CPU
+    // and not in the ThreadContext.
+    gem5::ThreadContext *src_tc;
+    if (FullSystem)
+        src_tc = system->threads[tid];
+    else
+        src_tc = tcBase(tid);
+
+    //Bind Int Regs to Rename Map
+    const auto &regClasses = isa[tid]->regClasses();
+
+    for (auto type = (RegClassType)0; type <= CCRegClass;
+            type = (RegClassType)(type + 1)) {
+        for (RegIndex idx = 0; idx < regClasses.at(type).numRegs(); idx++) {
+            PhysRegIdPtr phys_reg = freeList.getReg(type);
+            renameMap[tid].setEntry(RegId(type, idx), phys_reg);
+            scoreboard.setReg(phys_reg);
+        }
+    }
+
+    //Copy Thread Data Into RegFile
+    //copyFromTC(tid);
+
+    //Set PC/NPC/NNPC
+    pcState(src_tc->pcState(), tid);
+
+    src_tc->setStatus(gem5::ThreadContext::Active);
+
+    activateContext(tid);
+
+    //Reset ROB/IQ/LSQ Entries
+    commit.rob->resetEntries();
+}
+
+void
+CPU::removeThread(ThreadID tid)
+{
+    DPRINTF(O3CPU,"[tid:%i] Removing thread context from CPU.\n", tid);
+
+    // Copy Thread Data From RegFile
+    // If thread is suspended, it might be re-allocated
+    // copyToTC(tid);
+
+
+    // @todo: 2-27-2008: Fix how we free up rename mappings
+    // here to alleviate the case for double-freeing registers
+    // in SMT workloads.
+
+    // clear all thread-specific states in each stage of the pipeline
+    // since this thread is going to be completely removed from the CPU
+    commit.clearStates(tid);
+    fetch.clearStates(tid);
+    decode.clearStates(tid);
+    rename.clearStates(tid);
+    iew.clearStates(tid);
+
+    // Flush out any old data from the time buffers.
+    for (int i = 0; i < timeBuffer.getSize(); ++i) {
+        timeBuffer.advance();
+        fetchQueue.advance();
+        decodeQueue.advance();
+        renameQueue.advance();
+        iewQueue.advance();
+    }
+
+    // at this step, all instructions in the pipeline should be already
+    // either committed successfully or squashed. All thread-specific
+    // queues in the pipeline must be empty.
+    assert(iew.instQueue.getCount(tid) == 0);
+    assert(iew.ldstQueue.getCount(tid) == 0);
+    assert(commit.rob->isEmpty(tid));
+
+    // Reset ROB/IQ/LSQ Entries
+
+    // Commented out for now.  This should be possible to do by
+    // telling all the pipeline stages to drain first, and then
+    // checking until the drain completes.  Once the pipeline is
+    // drained, call resetEntries(). - 10-09-06 ktlim
+/*
+    if (activeThreads.size() >= 1) {
+        commit.rob->resetEntries();
+        iew.resetEntries();
+    }
+*/
+}
+
+Fault
+CPU::getInterrupts()
+{
+    // Check if there are any outstanding interrupts
+    return interrupts[0]->getInterrupt();
+}
+
+void
+CPU::processInterrupts(const Fault &interrupt)
+{
+    // Check for interrupts here.  For now can copy the code that
+    // exists within isa_fullsys_traits.hh.  Also assume that thread 0
+    // is the one that handles the interrupts.
+    // @todo: Possibly consolidate the interrupt checking code.
+    // @todo: Allow other threads to handle interrupts.
+
+    assert(interrupt != NoFault);
+    interrupts[0]->updateIntrInfo();
+
+    DPRINTF(O3CPU, "Interrupt %s being handled\n", interrupt->name());
+    trap(interrupt, 0, nullptr);
+}
+
+void
+CPU::trap(const Fault &fault, ThreadID tid, const StaticInstPtr &inst)
+{
+    // Pass the thread's TC into the invoke method.
+    fault->invoke(threadContexts[tid], inst);
+}
+
+void
+CPU::serializeThread(CheckpointOut &cp, ThreadID tid) const
+{
+    thread[tid]->serialize(cp);
+}
+
+void
+CPU::unserializeThread(CheckpointIn &cp, ThreadID tid)
+{
+    thread[tid]->unserialize(cp);
+}
+
+DrainState
+CPU::drain()
+{
+    // Deschedule any power gating event (if any)
+    deschedulePowerGatingEvent();
+
+    // If the CPU isn't doing anything, then return immediately.
+    if (switchedOut())
+        return DrainState::Drained;
+
+    DPRINTF(Drain, "Draining...\n");
+
+    // We only need to signal a drain to the commit stage as this
+    // initiates squashing controls the draining. Once the commit
+    // stage commits an instruction where it is safe to stop, it'll
+    // squash the rest of the instructions in the pipeline and force
+    // the fetch stage to stall. The pipeline will be drained once all
+    // in-flight instructions have retired.
+    commit.drain();
+
+    // Wake the CPU and record activity so everything can drain out if
+    // the CPU was not able to immediately drain.
+    if (!isCpuDrained())  {
+        // If a thread is suspended, wake it up so it can be drained
+        for (auto t : threadContexts) {
+            if (t->status() == gem5::ThreadContext::Suspended){
+                DPRINTF(Drain, "Currently suspended so activate %i \n",
+                        t->threadId());
+                t->activate();
+                // As the thread is now active, change the power state as well
+                activateContext(t->threadId());
+            }
+        }
+
+        wakeCPU();
+        activityRec.activity();
+
+        DPRINTF(Drain, "CPU not drained\n");
+
+        return DrainState::Draining;
+    } else {
+        DPRINTF(Drain, "CPU is already drained\n");
+        if (tickEvent.scheduled())
+            deschedule(tickEvent);
+
+        // Flush out any old data from the time buffers.  In
+        // particular, there might be some data in flight from the
+        // fetch stage that isn't visible in any of the CPU buffers we
+        // test in isCpuDrained().
+        for (int i = 0; i < timeBuffer.getSize(); ++i) {
+            timeBuffer.advance();
+            fetchQueue.advance();
+            decodeQueue.advance();
+            renameQueue.advance();
+            iewQueue.advance();
+        }
+
+        drainSanityCheck();
+        return DrainState::Drained;
+    }
+}
+
+bool
+CPU::tryDrain()
+{
+    if (drainState() != DrainState::Draining || !isCpuDrained())
+        return false;
+
+    if (tickEvent.scheduled())
+        deschedule(tickEvent);
+
+    DPRINTF(Drain, "CPU done draining, processing drain event\n");
+    signalDrainDone();
+
+    return true;
+}
+
+void
+CPU::drainSanityCheck() const
+{
+    assert(isCpuDrained());
+    fetch.drainSanityCheck();
+    decode.drainSanityCheck();
+    rename.drainSanityCheck();
+    iew.drainSanityCheck();
+    commit.drainSanityCheck();
+}
+
+bool
+CPU::isCpuDrained() const
+{
+    bool drained(true);
+
+    if (!instList.empty() || !removeList.empty()) {
+        DPRINTF(Drain, "Main CPU structures not drained.\n");
+        drained = false;
+    }
+
+    if (!fetch.isDrained()) {
+        DPRINTF(Drain, "Fetch not drained.\n");
+        drained = false;
+    }
+
+    if (!decode.isDrained()) {
+        DPRINTF(Drain, "Decode not drained.\n");
+        drained = false;
+    }
+
+    if (!rename.isDrained()) {
+        DPRINTF(Drain, "Rename not drained.\n");
+        drained = false;
+    }
+
+    if (!iew.isDrained()) {
+        DPRINTF(Drain, "IEW not drained.\n");
+        drained = false;
+    }
+
+    if (!commit.isDrained()) {
+        DPRINTF(Drain, "Commit not drained.\n");
+        drained = false;
+    }
+
+    return drained;
+}
+
+void CPU::commitDrained(ThreadID tid) { fetch.drainStall(tid); }
+
+void
+CPU::drainResume()
+{
+    if (switchedOut())
+        return;
+
+    DPRINTF(Drain, "Resuming...\n");
+    verifyMemoryMode();
+
+    fetch.drainResume();
+    commit.drainResume();
+
+    _status = Idle;
+    for (ThreadID i = 0; i < thread.size(); i++) {
+        if (thread[i]->status() == gem5::ThreadContext::Active) {
+            DPRINTF(Drain, "Activating thread: %i\n", i);
+            activateThread(i);
+            _status = Running;
+        }
+    }
+
+    assert(!tickEvent.scheduled());
+    if (_status == Running)
+        schedule(tickEvent, nextCycle());
+
+    // Reschedule any power gating event (if any)
+    schedulePowerGatingEvent();
+}
+
+void
+CPU::switchOut()
+{
+    DPRINTF(O3CPU, "Switching out\n");
+    BaseCPU::switchOut();
+
+    activityRec.reset();
+
+    _status = SwitchedOut;
+
+    if (checker)
+        checker->switchOut();
+}
+
+void
+CPU::takeOverFrom(BaseCPU *oldCPU)
+{
+    BaseCPU::takeOverFrom(oldCPU);
+
+    fetch.takeOverFrom();
+    decode.takeOverFrom();
+    rename.takeOverFrom();
+    iew.takeOverFrom();
+    commit.takeOverFrom();
+
+    assert(!tickEvent.scheduled());
+
+    auto *oldO3CPU = dynamic_cast<CPU *>(oldCPU);
+    if (oldO3CPU)
+        globalSeqNum = oldO3CPU->globalSeqNum;
+
+    lastRunningCycle = curCycle();
+    _status = Idle;
+}
+
+void
+CPU::verifyMemoryMode() const
+{
+    if (!system->isTimingMode()) {
+        fatal("The O3 CPU requires the memory system to be in "
+              "'timing' mode.\n");
+    }
+}
+
+RegVal
+CPU::readMiscRegNoEffect(int misc_reg, ThreadID tid) const
+{
+    return isa[tid]->readMiscRegNoEffect(misc_reg);
+}
+
+RegVal
+CPU::readMiscReg(int misc_reg, ThreadID tid)
+{
+    cpuStats.miscRegfileReads++;
+    return isa[tid]->readMiscReg(misc_reg);
+}
+
+void
+CPU::setMiscRegNoEffect(int misc_reg, RegVal val, ThreadID tid)
+{
+    isa[tid]->setMiscRegNoEffect(misc_reg, val);
+}
+
+void
+CPU::setMiscReg(int misc_reg, RegVal val, ThreadID tid)
+{
+    cpuStats.miscRegfileWrites++;
+    isa[tid]->setMiscReg(misc_reg, val);
+}
+
+RegVal
+CPU::getReg(PhysRegIdPtr phys_reg)
+{
+    switch (phys_reg->classValue()) {
+      case IntRegClass:
+        cpuStats.intRegfileReads++;
+        break;
+      case FloatRegClass:
+        cpuStats.fpRegfileReads++;
+        break;
+      case CCRegClass:
+        cpuStats.ccRegfileReads++;
+        break;
+      case VecRegClass:
+      case VecElemClass:
+        cpuStats.vecRegfileReads++;
+        break;
+      case VecPredRegClass:
+        cpuStats.vecPredRegfileReads++;
+        break;
+      default:
+        break;
+    }
+    return regFile.getReg(phys_reg);
+}
+
+void
+CPU::getReg(PhysRegIdPtr phys_reg, void *val)
+{
+    switch (phys_reg->classValue()) {
+      case IntRegClass:
+        cpuStats.intRegfileReads++;
+        break;
+      case FloatRegClass:
+        cpuStats.fpRegfileReads++;
+        break;
+      case CCRegClass:
+        cpuStats.ccRegfileReads++;
+        break;
+      case VecRegClass:
+      case VecElemClass:
+        cpuStats.vecRegfileReads++;
+        break;
+      case VecPredRegClass:
+        cpuStats.vecPredRegfileReads++;
+        break;
+      default:
+        break;
+    }
+    regFile.getReg(phys_reg, val);
+}
+
+void *
+CPU::getWritableReg(PhysRegIdPtr phys_reg)
+{
+    switch (phys_reg->classValue()) {
+      case VecRegClass:
+        cpuStats.vecRegfileReads++;
+        break;
+      case VecPredRegClass:
+        cpuStats.vecPredRegfileReads++;
+        break;
+      default:
+        break;
+    }
+    return regFile.getWritableReg(phys_reg);
+}
+
+void
+CPU::setReg(PhysRegIdPtr phys_reg, RegVal val)
+{
+    switch (phys_reg->classValue()) {
+      case IntRegClass:
+        cpuStats.intRegfileWrites++;
+        break;
+      case FloatRegClass:
+        cpuStats.fpRegfileWrites++;
+        break;
+      case CCRegClass:
+        cpuStats.ccRegfileWrites++;
+        break;
+      case VecRegClass:
+      case VecElemClass:
+        cpuStats.vecRegfileWrites++;
+        break;
+      case VecPredRegClass:
+        cpuStats.vecPredRegfileWrites++;
+        break;
+      default:
+        break;
+    }
+    regFile.setReg(phys_reg, val);
+}
+
+void
+CPU::setReg(PhysRegIdPtr phys_reg, const void *val)
+{
+    switch (phys_reg->classValue()) {
+      case IntRegClass:
+        cpuStats.intRegfileWrites++;
+        break;
+      case FloatRegClass:
+        cpuStats.fpRegfileWrites++;
+        break;
+      case CCRegClass:
+        cpuStats.ccRegfileWrites++;
+        break;
+      case VecRegClass:
+      case VecElemClass:
+        cpuStats.vecRegfileWrites++;
+        break;
+      case VecPredRegClass:
+        cpuStats.vecPredRegfileWrites++;
+        break;
+      default:
+        break;
+    }
+    regFile.setReg(phys_reg, val);
+}
+
+RegVal
+CPU::getArchReg(const RegId &reg, ThreadID tid)
+{
+    PhysRegIdPtr phys_reg = commitRenameMap[tid].lookup(reg);
+    return regFile.getReg(phys_reg);
+}
+
+void
+CPU::getArchReg(const RegId &reg, void *val, ThreadID tid)
+{
+    PhysRegIdPtr phys_reg = commitRenameMap[tid].lookup(reg);
+    regFile.getReg(phys_reg, val);
+}
+
+void *
+CPU::getWritableArchReg(const RegId &reg, ThreadID tid)
+{
+    PhysRegIdPtr phys_reg = commitRenameMap[tid].lookup(reg);
+    return regFile.getWritableReg(phys_reg);
+}
+
+void
+CPU::setArchReg(const RegId &reg, RegVal val, ThreadID tid)
+{
+    PhysRegIdPtr phys_reg = commitRenameMap[tid].lookup(reg);
+    regFile.setReg(phys_reg, val);
+}
+
+void
+CPU::setArchReg(const RegId &reg, const void *val, ThreadID tid)
+{
+    PhysRegIdPtr phys_reg = commitRenameMap[tid].lookup(reg);
+    regFile.setReg(phys_reg, val);
+}
+
+const PCStateBase &
+CPU::pcState(ThreadID tid)
+{
+    return commit.pcState(tid);
+}
+
+void
+CPU::pcState(const PCStateBase &val, ThreadID tid)
+{
+    commit.pcState(val, tid);
+}
+
+void
+CPU::squashFromTC(ThreadID tid)
+{
+    thread[tid]->noSquashFromTC = true;
+    commit.generateTCEvent(tid);
+}
+
+CPU::ListIt
+CPU::addInst(const DynInstPtr &inst)
+{
+    instList.push_back(inst);
+
+    return --(instList.end());
+}
+
+void
+CPU::instDone(ThreadID tid, const DynInstPtr &inst)
+{
+    // Keep an instruction count.
+    if (!inst->isMicroop() || inst->isLastMicroop()) {
+        thread[tid]->numInst++;
+        thread[tid]->threadStats.numInsts++;
+        cpuStats.committedInsts[tid]++;
+
+        if (enableDVR && !inPRE && !inst->isPRE()) {
+            const bool was_discovering = dvrDiscovery.isDiscovering();
+            const auto result = dvrDiscovery.observeCommit(
+                inst->pcState().instAddr(), inst->seqNum);
+            if (was_discovering &&
+                result.event != DVRDiscoveryController::Event::Completed) {
+                const auto observation = dvrTaintTracker.observe(inst);
+                if (observation.taintedInstruction) {
+                    ++cpuStats.dvrTaintedInstructions;
+                    dvrInstructionRecorder.record(inst);
+                }
+                if (observation.dependentLoad) {
+                    ++cpuStats.dvrDependentLoads;
+                    dvrLoopBoundDetector.updateFinalLoad(
+                        dvrTaintTracker.flr());
+                    if (inst->effAddrValid()) {
+                        trainDVRAddressRelation(
+                            inst->pcState().instAddr(),
+                            dvrInitiatingLoadValue, inst->effAddr);
+                    }
+                }
+                const auto loop_observation =
+                    dvrLoopBoundDetector.observe(inst);
+                if (loop_observation.backwardBranch)
+                    ++cpuStats.dvrBackwardBranches;
+                if (loop_observation.boundFound)
+                    ++cpuStats.dvrLoopBoundsFound;
+            }
+            switch (result.event) {
+              case DVRDiscoveryController::Event::Started:
+                ++cpuStats.dvrDiscoveryStarts;
+                dvrTaintTracker.begin(inst);
+                dvrLoopBoundDetector.begin(result.triggerPC);
+                dvrInstructionRecorder.begin(inst);
+                dvrCurrentTriggerPC = result.triggerPC;
+                dvrInitiatingLoadValue = 0;
+                for (int dest = 0; dest < inst->numDestRegs(); ++dest) {
+                    if (inst->destRegIdx(dest).classValue() == IntRegClass) {
+                        dvrInitiatingLoadValue = getReg(
+                            inst->renamedDestIdx(dest));
+                        break;
+                    }
+                }
+                captureDVRRegisterSnapshot(
+                    tid, inst, dvrDiscoveryStartRegs);
+                DPRINTF(O3CPU,
+                        "DVR discovery start pc=%#x stride=%lld sn=%llu\n",
+                        result.triggerPC,
+                        static_cast<long long>(result.stride), inst->seqNum);
+                break;
+              case DVRDiscoveryController::Event::Completed: {
+                ++cpuStats.dvrDiscoveryCompletions;
+                cpuStats.dvrDiscoveredInstructions += result.instructions;
+                if (dvrTaintTracker.flr() != 0)
+                    ++cpuStats.dvrDiscoveriesWithFLR;
+                if (dvrLoopBoundDetector.hasBound())
+                    ++cpuStats.dvrDiscoveriesWithBounds;
+                DVRLoopBoundDetector::RegisterSnapshot finish_regs = {};
+                captureDVRRegisterSnapshot(tid, inst, finish_regs);
+                const auto inference = dvrLoopBoundDetector.infer(
+                    dvrDiscoveryStartRegs, finish_regs, dvrMaxLanes);
+                ++cpuStats.dvrLaneCountSamples;
+                cpuStats.dvrTotalActiveLanes += inference.lanes;
+                if (inference.matched)
+                    ++cpuStats.dvrLoopBoundMatches;
+                else
+                    ++cpuStats.dvrLoopBoundFallbacks;
+                cpuStats.dvrRecordedUops += dvrInstructionRecorder.size();
+                bool helper_allowed = dvrInstructionRecorder.size() > 1 &&
+                                      dvrTaintTracker.flr() != 0 &&
+                                      !dvrInstructionRecorder.overflow();
+                if (dvrInstructionRecorder.overflow()) {
+                    ++cpuStats.dvrRecorderOverflows;
+                    helper_allowed = false;
+                }
+                if (helper_allowed) {
+                    ++cpuStats.dvrVectorProgramsBuilt;
+                    cpuStats.dvrVRATAllocations +=
+                        dvrVectorRenameTable.build(
+                            dvrInstructionRecorder, inference.lanes);
+                    const auto vir_result =
+                        dvrVectorInstructionRegister.execute(
+                            dvrInstructionRecorder, inference.lanes,
+                            dvrHelperMaxUops);
+                    cpuStats.dvrVIRChunkIssues +=
+                        vir_result.chunkIssues;
+                    cpuStats.dvrVIRChunkExecutions +=
+                        vir_result.chunkExecutions;
+                    cpuStats.dvrDivergentBranches +=
+                        vir_result.divergentBranches;
+                    cpuStats.dvrReconvergences +=
+                        vir_result.reconvergences;
+                    if (vir_result.timedOut) {
+                        ++cpuStats.dvrHelperTimeouts;
+                        helper_allowed = false;
+                    }
+                    if (vir_result.stackOverflow) {
+                        ++cpuStats.dvrReconvergenceStackOverflows;
+                        helper_allowed = false;
+                    }
+                }
+                if (helper_allowed && inst->effAddrValid()) {
+                    launchDVRStridePrefetches(
+                        tid, inst->effAddr, result.triggerPC,
+                        result.stride, inference.lanes, finish_regs);
+                } else if (dvrTaintTracker.flr() != 0) {
+                    ++cpuStats.dvrHelpersSuppressed;
+                }
+                DPRINTF(O3CPU,
+                        "DVR discovery complete pc=%#x stride=%lld "
+                        "insts=%u flr=%#x taint=%#x loop=%#x->%#x "
+                        "bound=%#x increment=%lld remaining=%llu lanes=%u\n",
+                        result.triggerPC,
+                        static_cast<long long>(result.stride),
+                        result.instructions, dvrTaintTracker.flr(),
+                        dvrTaintTracker.bits(),
+                        dvrLoopBoundDetector.branchPC(),
+                        dvrLoopBoundDetector.targetPC(), inference.bound,
+                        static_cast<long long>(inference.increment),
+                        static_cast<unsigned long long>(inference.remaining),
+                        inference.lanes);
+                dvrTaintTracker.reset();
+                dvrLoopBoundDetector.reset();
+                dvrInstructionRecorder.reset();
+                dvrVectorRenameTable.reset();
+                dvrVectorInstructionRegister.reset();
+                break;
+              }
+              case DVRDiscoveryController::Event::TimedOut:
+                ++cpuStats.dvrDiscoveryTimeouts;
+                DPRINTF(O3CPU,
+                        "DVR discovery timeout pc=%#x stride=%lld insts=%u\n",
+                        result.triggerPC,
+                        static_cast<long long>(result.stride),
+                        result.instructions);
+                dvrTaintTracker.reset();
+                dvrLoopBoundDetector.reset();
+                dvrInstructionRecorder.reset();
+                break;
+              case DVRDiscoveryController::Event::Abandoned:
+                ++cpuStats.dvrDiscoveryAbandons;
+                dvrTaintTracker.reset();
+                dvrLoopBoundDetector.reset();
+                dvrInstructionRecorder.reset();
+                break;
+              case DVRDiscoveryController::Event::None:
+                break;
+            }
+        }
+
+        // Check for instruction-count-based events.
+        thread[tid]->comInstEventQueue.serviceEvents(thread[tid]->numInst);
+    }
+    thread[tid]->numOp++;
+    thread[tid]->threadStats.numOps++;
+    cpuStats.committedOps[tid]++;
+
+    probeInstCommit(inst->staticInst, inst->pcState().instAddr());
+}
+
+void
+CPU::captureDVRRegisterSnapshot(
+    ThreadID tid, const DynInstPtr &committing_inst,
+    DVRLoopBoundDetector::RegisterSnapshot &snapshot)
+{
+    const unsigned num_int_regs = std::min<unsigned>(
+        isa[tid]->regClasses().at(IntRegClass).numRegs(), snapshot.size());
+    for (unsigned idx = 0; idx < num_int_regs; ++idx)
+        snapshot[idx] = getArchReg(RegId(IntRegClass, idx), tid);
+
+    // instDone() 紧接在 Commit 更新 commitRenameMap 之前执行。
+    for (int idx = 0; idx < committing_inst->numDestRegs(); ++idx) {
+        const RegId &dest = committing_inst->destRegIdx(idx);
+        if (dest.classValue() == IntRegClass && dest.index() < snapshot.size())
+            snapshot[dest.index()] = getReg(
+                committing_inst->renamedDestIdx(idx));
+    }
+}
+
+void
+CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
+                               Addr pc, int64_t stride, unsigned lanes,
+                               const DVRLoopBoundDetector::RegisterSnapshot
+                                   &finish_regs)
+{
+    cpuStats.dvrPrefetchesSuperseded += dvrPrefetchQueue.size();
+    cpuStats.dvrPrefetchesDropped += dvrPrefetchQueue.size();
+    dvrPrefetchQueue.clear();
+
+    std::array<int64_t, DVRPrefetchSenderState::MaxRelations> scales = {};
+    std::array<int64_t, DVRPrefetchSenderState::MaxRelations> offsets = {};
+    std::array<RegVal, DVRPrefetchSenderState::MaxRelations> masks = {};
+    std::array<RegVal, DVRPrefetchSenderState::MaxRelations> patterns = {};
+    unsigned relation_count = 0;
+    const auto trigger_it = dvrTriggerRelations.find(pc);
+    if (trigger_it != dvrTriggerRelations.end()) {
+        for (const Addr flr_pc : trigger_it->second) {
+            const auto relation_it = dvrAddressRelations.find(flr_pc);
+            if (relation_it == dvrAddressRelations.end() ||
+                !relation_it->second.trained)
+                continue;
+            const auto &relation = relation_it->second;
+            scales[relation_count] = relation.scale;
+            offsets[relation_count] = relation.offset;
+            masks[relation_count] = relation.stableMask;
+            patterns[relation_count] = relation.pattern & relation.stableMask;
+            if (++relation_count == DVRPrefetchSenderState::MaxRelations)
+                break;
+        }
+    }
+    if (relation_count > 1) {
+        // stableMask 记录训练过程中保持不变的位。
+        // 只保留两条路径都稳定且取值不同的位，避免谓词过严。
+        const auto stable_masks = masks;
+        const auto stable_patterns = patterns;
+        for (unsigned lhs = 0; lhs < relation_count; ++lhs) {
+            RegVal discriminating = 0;
+            for (unsigned rhs = 0; rhs < relation_count; ++rhs) {
+                if (lhs == rhs)
+                    continue;
+                discriminating |= stable_masks[lhs] & stable_masks[rhs] &
+                    (stable_patterns[lhs] ^ stable_patterns[rhs]);
+            }
+            masks[lhs] = discriminating;
+            patterns[lhs] = stable_patterns[lhs] & discriminating;
+        }
+    }
+
+    auto replay = std::make_shared<DVRReplayTemplate>();
+    replay->count = dvrInstructionRecorder.size();
+    replay->initialRegs = dvrDiscoveryStartRegs;
+    if (replay->count != 0) {
+        replay->triggerDestination = dvrInstructionRecorder[0].destination;
+        replay->valid = replay->count > 1 &&
+            replay->triggerDestination > 0 &&
+            replay->triggerDestination <
+                DVRLoopBoundDetector::MaxArchitecturalIntRegs;
+        uint32_t defined_regs = uint32_t(1);
+        if (replay->triggerDestination > 0 &&
+            replay->triggerDestination <
+                DVRLoopBoundDetector::MaxArchitecturalIntRegs) {
+            defined_regs |= uint32_t(1) << replay->triggerDestination;
+        }
+        bool unstable_input = false;
+        for (unsigned index = 0; index < replay->count; ++index) {
+            replay->uops[index] = dvrInstructionRecorder[index];
+            if (index == 0)
+                continue;
+            uint32_t external_sources =
+                replay->uops[index].intSources & ~defined_regs;
+            while (external_sources) {
+                const unsigned reg = __builtin_ctz(external_sources);
+                external_sources &= external_sources - 1;
+                if (dvrDiscoveryStartRegs[reg] != finish_regs[reg]) {
+                    unstable_input = true;
+                    replay->valid = false;
+                }
+            }
+            if (replay->uops[index].semantic ==
+                DVRInstructionRecorder::Uop::Semantic::Unsupported) {
+                ++cpuStats.dvrReplayUnsupportedUops;
+                replay->valid = false;
+            } else {
+                ++cpuStats.dvrReplaySupportedUops;
+            }
+            defined_regs |= replay->uops[index].intDestinations;
+        }
+        if (unstable_input)
+            ++cpuStats.dvrReplayUnstableInputs;
+    }
+
+    for (unsigned lane = 1; lane <= lanes; ++lane) {
+        const Addr address = current_address + stride * lane;
+        DVRPrefetchAddress prefetch;
+        prefetch.address = address;
+        prefetch.pc = pc;
+        prefetch.tid = tid;
+        prefetch.source = true;
+        prefetch.relationCount = relation_count;
+        prefetch.scales = scales;
+        prefetch.offsets = offsets;
+        prefetch.masks = masks;
+        prefetch.patterns = patterns;
+        prefetch.replay = replay;
+        dvrPrefetchQueue.push_back(prefetch);
+        ++cpuStats.dvrPrefetchesGenerated;
+    }
+    updateDVRPrefetchQueuePeak();
+}
+
+Addr
+CPU::dvrPrefetchLine(Addr address) const
+{
+    const Addr line_size = cacheLineSize();
+    return address & ~(line_size - 1);
+}
+
+void
+CPU::updateDVRPrefetchQueuePeak()
+{
+    if (dvrPrefetchQueue.size() > dvrPrefetchQueuePeak) {
+        const uint64_t increase =
+            dvrPrefetchQueue.size() - dvrPrefetchQueuePeak;
+        dvrPrefetchQueuePeak = dvrPrefetchQueue.size();
+        cpuStats.dvrPrefetchQueuePeak += increase;
+    }
+}
+
+void
+CPU::accountDVRDemand(Addr address)
+{
+    const Addr line = dvrPrefetchLine(address);
+    const auto completed = dvrCompletedPrefetchLines.find(line);
+    if (completed != dvrCompletedPrefetchLines.end()) {
+        ++cpuStats.dvrPrefetchesPossiblyUseful;
+        dvrCompletedPrefetchLines.erase(completed);
+        return;
+    }
+    const auto outstanding = dvrOutstandingPrefetchLines.find(line);
+    if (outstanding != dvrOutstandingPrefetchLines.end() &&
+        outstanding->second != 0) {
+        ++cpuStats.dvrPrefetchesLate;
+    }
+}
+
+void
+CPU::serviceDVRPrefetchQueue()
+{
+    if (dvrPrefetchQueue.empty())
+        return;
+
+    const auto prefetch = dvrPrefetchQueue.front();
+    dvrPrefetchQueue.pop_front();
+    Request::Flags flags;
+    flags.set(Request::PREFETCH);
+    RequestPtr req = std::make_shared<Request>(
+        prefetch.address, 8, flags, dataRequestorId(), prefetch.pc,
+        thread[prefetch.tid]->contextId());
+    req->taskId(context_switch_task_id::Prefetcher);
+
+    const Fault fault = mmu->translateAtomic(
+        req, thread[prefetch.tid]->getTC(), BaseMMU::Read);
+    if (fault != NoFault) {
+        ++cpuStats.dvrPrefetchTranslationFaults;
+        return;
+    }
+
+    PacketPtr pkt = new Packet(req, MemCmd::SoftPFReq);
+    pkt->allocate();
+    pkt->senderState = new DVRPrefetchSenderState(
+        prefetch.source, prefetch.relationCount, prefetch.scales,
+        prefetch.offsets, prefetch.masks, prefetch.patterns, prefetch.replay,
+        prefetch.tid);
+    auto &port = iew.ldstQueue.getDataPort();
+    if (!port.tryTiming(pkt)) {
+        ++cpuStats.dvrPrefetchesSuppressedMainThread;
+        ++cpuStats.dvrPrefetchesDropped;
+        delete pkt->senderState;
+        delete pkt;
+        return;
+    }
+    if (!port.sendTimingReq(pkt)) {
+        ++cpuStats.dvrPrefetchesRejectedBackpressure;
+        ++cpuStats.dvrPrefetchesDropped;
+        delete pkt->senderState;
+        delete pkt;
+        return;
+    }
+    ++cpuStats.dvrPrefetchesIssued;
+    ++dvrOutstandingPrefetchLines[dvrPrefetchLine(prefetch.address)];
+    if (!prefetch.source) {
+        ++cpuStats.dvrDependentPrefetchesIssued;
+    } else {
+        ++cpuStats.dvrSourcePrefetchesIssued;
+    }
+}
+
+void
+CPU::completeDVRPrefetch(PacketPtr pkt)
+{
+    auto *state = dynamic_cast<DVRPrefetchSenderState*>(pkt->senderState);
+    assert(state);
+    ++cpuStats.dvrPrefetchesCompleted;
+    // observeDVRLoad 使用架构有效虚拟地址，因此质量统计也使用请求虚拟地址。
+    const Addr line = dvrPrefetchLine(pkt->req->getVaddr());
+    auto outstanding = dvrOutstandingPrefetchLines.find(line);
+    if (outstanding != dvrOutstandingPrefetchLines.end()) {
+        if (--outstanding->second == 0)
+            dvrOutstandingPrefetchLines.erase(outstanding);
+    }
+    dvrCompletedPrefetchLines[line] = curTick();
+    if (state->source && pkt->hasData()) {
+        const RegVal value = pkt->getLE<RegVal>();
+        bool matched = replayDVRSource(*state, value);
+        if (!matched) {
+            if (state->replay)
+                ++cpuStats.dvrReplayFallbacks;
+            for (unsigned index = 0; index < state->relationCount; ++index) {
+                if (state->relationCount > 1 &&
+                    (value & state->masks[index]) != state->patterns[index])
+                    continue;
+                DVRPrefetchAddress dependent;
+                dependent.address = static_cast<Addr>(
+                    state->scales[index] * static_cast<int64_t>(value) +
+                    state->offsets[index]);
+                dependent.pc = pkt->req->getPC();
+                dependent.tid = state->tid;
+                dependent.source = false;
+                dvrPrefetchQueue.push_back(dependent);
+                updateDVRPrefetchQueuePeak();
+                ++cpuStats.dvrDependentPrefetchesGenerated;
+                ++cpuStats.dvrPredicateSelections;
+                if (!(dvrSelectedRelationSlots & (uint8_t(1) << index))) {
+                    dvrSelectedRelationSlots |= uint8_t(1) << index;
+                    ++cpuStats.dvrDistinctPredicatePaths;
+                }
+                matched = true;
+                break;
+            }
+        }
+        if (!matched)
+            ++cpuStats.dvrPredicateMisses;
+    }
+    if (state->source) {
+        ++cpuStats.dvrSourcePrefetchesCompleted;
+    } else {
+        ++cpuStats.dvrDependentPrefetchesCompleted;
+    }
+    delete state;
+    pkt->senderState = nullptr;
+    delete pkt;
+}
+
+bool
+CPU::replayDVRSource(const DVRPrefetchSenderState &state,
+                     RegVal source_value)
+{
+    if (!state.replay || !state.replay->valid)
+        return false;
+
+    ++cpuStats.dvrReplayAttempts;
+    auto regs = state.replay->initialRegs;
+    regs[0] = 0;
+    regs[state.replay->triggerDestination] = source_value;
+
+    for (unsigned index = 1; index < state.replay->count; ++index) {
+        const auto &uop = state.replay->uops[index];
+        if (uop.source0 < 0 ||
+            uop.source0 >= DVRLoopBoundDetector::MaxArchitecturalIntRegs)
+            return false;
+        const RegVal source0 = regs[uop.source0];
+        RegVal source1 = 0;
+        if (uop.semantic == DVRInstructionRecorder::Uop::Semantic::Add) {
+            if (uop.source1 < 0 ||
+                uop.source1 >=
+                    DVRLoopBoundDetector::MaxArchitecturalIntRegs)
+                return false;
+            source1 = regs[uop.source1];
+        }
+        RegVal result = 0;
+        if (!uop.evaluate(source0, source1, result))
+            return false;
+
+        if (uop.semantic ==
+            DVRInstructionRecorder::Uop::Semantic::LoadAddress) {
+            DVRPrefetchAddress dependent;
+            dependent.address = static_cast<Addr>(result);
+            dependent.pc = uop.pc;
+            dependent.tid = state.tid;
+            dependent.source = false;
+            dvrPrefetchQueue.push_back(dependent);
+            updateDVRPrefetchQueuePeak();
+            ++cpuStats.dvrDependentPrefetchesGenerated;
+            ++cpuStats.dvrReplayTargetsGenerated;
+            return true;
+        }
+
+        if (uop.destination <= 0 ||
+            uop.destination >=
+                DVRLoopBoundDetector::MaxArchitecturalIntRegs)
+            return false;
+        regs[uop.destination] = result;
+        regs[0] = 0;
+    }
+    return false;
+}
+
+void
+CPU::trainDVRAddressRelation(Addr flr_pc, RegVal source_value,
+                             Addr dependent_address)
+{
+    auto &relation = dvrAddressRelations[flr_pc];
+    auto &trigger_relations = dvrTriggerRelations[dvrCurrentTriggerPC];
+    if (std::find(trigger_relations.begin(), trigger_relations.end(), flr_pc) ==
+        trigger_relations.end())
+        trigger_relations.push_back(flr_pc);
+    if (relation.samples == 0) {
+        relation.pattern = source_value;
+    } else {
+        relation.stableMask &= ~(relation.previousValue ^ source_value);
+        relation.pattern &= relation.stableMask;
+    }
+    ++relation.samples;
+    if (relation.hasPrevious && source_value != relation.previousValue) {
+        const int64_t value_delta = static_cast<int64_t>(
+            source_value - relation.previousValue);
+        const int64_t address_delta = static_cast<int64_t>(
+            dependent_address - relation.previousAddress);
+        if (value_delta != 0 && address_delta % value_delta == 0) {
+            const int64_t scale = address_delta / value_delta;
+            if (scale != 0 && std::abs(scale) <= 4096) {
+                const bool newly_trained = !relation.trained;
+                relation.scale = scale;
+                relation.offset = static_cast<int64_t>(dependent_address) -
+                    scale * static_cast<int64_t>(source_value);
+                relation.trained = true;
+                if (newly_trained)
+                    ++cpuStats.dvrAddressRelationsTrained;
+            }
+        }
+    }
+    relation.hasPrevious = true;
+    relation.previousValue = source_value;
+    relation.previousAddress = dependent_address;
+}
+
+void
+CPU::removeFrontInst(const DynInstPtr &inst)
+{
+    DPRINTF(O3CPU, "Removing committed instruction [tid:%i] PC %s "
+            "[sn:%lli]\n",
+            inst->threadNumber, inst->pcState(), inst->seqNum);
+
+    removeInstsThisCycle = true;
+
+    // Remove the front instruction.
+    removeList.push(inst->getInstListIt());
+}
+
+void
+CPU::removeInstsNotInROB(ThreadID tid)
+{
+    DPRINTF(O3CPU, "Thread %i: Deleting instructions from instruction"
+            " list.\n", tid);
+
+    ListIt end_it;
+
+    bool rob_empty = false;
+
+    if (instList.empty()) {
+        return;
+    } else if (rob.isEmpty(tid)) {
+        DPRINTF(O3CPU, "ROB is empty, squashing all insts.\n");
+        end_it = instList.begin();
+        rob_empty = true;
+    } else {
+        end_it = (rob.readTailInst(tid))->getInstListIt();
+        DPRINTF(O3CPU, "ROB is not empty, squashing insts not in ROB.\n");
+    }
+
+    removeInstsThisCycle = true;
+
+    ListIt inst_it = instList.end();
+
+    inst_it--;
+
+    // Walk through the instruction list, removing any instructions
+    // that were inserted after the given instruction iterator, end_it.
+    while (inst_it != end_it) {
+        assert(!instList.empty());
+
+        squashInstIt(inst_it, tid);
+
+        inst_it--;
+    }
+
+    // If the ROB was empty, then we actually need to remove the first
+    // instruction as well.
+    if (rob_empty) {
+        squashInstIt(inst_it, tid);
+    }
+}
+
+void
+CPU::removeInstsUntil(const InstSeqNum &seq_num, ThreadID tid)
+{
+    assert(!instList.empty());
+
+    removeInstsThisCycle = true;
+
+    ListIt inst_iter = instList.end();
+
+    inst_iter--;
+
+    DPRINTF(O3CPU, "Deleting instructions from instruction "
+            "list that are from [tid:%i] and above [sn:%lli] (end=%lli).\n",
+            tid, seq_num, (*inst_iter)->seqNum);
+
+    while ((*inst_iter)->seqNum > seq_num) {
+
+        bool break_loop = (inst_iter == instList.begin());
+
+        squashInstIt(inst_iter, tid);
+
+        inst_iter--;
+
+        if (break_loop)
+            break;
+    }
+}
+
+void
+CPU::squashInstIt(const ListIt &instIt, ThreadID tid)
+{
+    if ((*instIt)->threadNumber == tid) {
+        DPRINTF(O3CPU, "Squashing instruction, "
+                "[tid:%i] [sn:%lli] PC %s\n",
+                (*instIt)->threadNumber,
+                (*instIt)->seqNum,
+                (*instIt)->pcState());
+
+        // Mark it as squashed.
+        (*instIt)->setSquashed();
+
+        // @todo: Formulate a consistent method for deleting
+        // instructions from the instruction list
+        // Remove the instruction from the list.
+        removeList.push(instIt);
+    }
+}
+
+void
+CPU::cleanUpRemovedInsts()
+{
+    while (!removeList.empty()) {
+        DPRINTF(O3CPU, "Removing instruction, "
+                "[tid:%i] [sn:%lli] PC %s\n",
+                (*removeList.front())->threadNumber,
+                (*removeList.front())->seqNum,
+                (*removeList.front())->pcState());
+
+        instList.erase(removeList.front());
+
+        removeList.pop();
+    }
+
+    removeInstsThisCycle = false;
+}
+/*
+void
+CPU::removeAllInsts()
+{
+    instList.clear();
+}
+*/
+void
+CPU::dumpInsts()
+{
+    int num = 0;
+
+    ListIt inst_list_it = instList.begin();
+
+    cprintf("Dumping Instruction List\n");
+
+    while (inst_list_it != instList.end()) {
+        cprintf("Instruction:%i\nPC:%#x\n[tid:%i]\n[sn:%lli]\nIssued:%i\n"
+                "Squashed:%i\n\n",
+                num, (*inst_list_it)->pcState().instAddr(),
+                (*inst_list_it)->threadNumber,
+                (*inst_list_it)->seqNum, (*inst_list_it)->isIssued(),
+                (*inst_list_it)->isSquashed());
+        inst_list_it++;
+        ++num;
+    }
+}
+/*
+void
+CPU::wakeDependents(const DynInstPtr &inst)
+{
+    iew.wakeDependents(inst);
+}
+*/
+void
+CPU::wakeCPU()
+{
+    if (activityRec.active() || tickEvent.scheduled()) {
+        DPRINTF(Activity, "CPU already running.\n");
+        return;
+    }
+
+    DPRINTF(Activity, "Waking up CPU\n");
+
+    Cycles cycles(curCycle() - lastRunningCycle);
+    // @todo: This is an oddity that is only here to match the stats
+    if (cycles > 1) {
+        --cycles;
+        cpuStats.idleCycles += cycles;
+        baseStats.numCycles += cycles;
+    }
+
+    schedule(tickEvent, clockEdge());
+}
+
+void
+CPU::wakeup(ThreadID tid)
+{
+    if (thread[tid]->status() != gem5::ThreadContext::Suspended)
+        return;
+
+    wakeCPU();
+
+    DPRINTF(Quiesce, "Suspended Processor woken\n");
+    threadContexts[tid]->activate();
+}
+
+ThreadID
+CPU::getFreeTid()
+{
+    for (ThreadID tid = 0; tid < numThreads; tid++) {
+        if (!tids[tid]) {
+            tids[tid] = true;
+            return tid;
+        }
+    }
+
+    return InvalidThreadID;
+}
+
+void
+CPU::updateThreadPriority()
+{
+    if (activeThreads.size() > 1) {
+        //DEFAULT TO ROUND ROBIN SCHEME
+        //e.g. Move highest priority to end of thread list
+        std::list<ThreadID>::iterator list_begin = activeThreads.begin();
+
+        unsigned high_thread = *list_begin;
+
+        activeThreads.erase(list_begin);
+
+        activeThreads.push_back(high_thread);
+    }
+}
+
+void
+CPU::addThreadToExitingList(ThreadID tid)
+{
+    DPRINTF(O3CPU, "Thread %d is inserted to exitingThreads list\n", tid);
+
+    // the thread trying to exit can't be already halted
+    assert(tcBase(tid)->status() != gem5::ThreadContext::Halted);
+
+    // make sure the thread has not been added to the list yet
+    assert(exitingThreads.count(tid) == 0);
+
+    // add the thread to exitingThreads list to mark that this thread is
+    // trying to exit. The boolean value in the pair denotes if a thread is
+    // ready to exit. The thread is not ready to exit until the corresponding
+    // exit trap event is processed in the future. Until then, it'll be still
+    // an active thread that is trying to exit.
+    exitingThreads.emplace(std::make_pair(tid, false));
+}
+
+bool
+CPU::isThreadExiting(ThreadID tid) const
+{
+    return exitingThreads.count(tid) == 1;
+}
+
+void
+CPU::scheduleThreadExitEvent(ThreadID tid)
+{
+    assert(exitingThreads.count(tid) == 1);
+
+    // exit trap event has been processed. Now, the thread is ready to exit
+    // and be removed from the CPU.
+    exitingThreads[tid] = true;
+
+    // we schedule a threadExitEvent in the next cycle to properly clean
+    // up the thread's states in the pipeline. threadExitEvent has lower
+    // priority than tickEvent, so the cleanup will happen at the very end
+    // of the next cycle after all pipeline stages complete their operations.
+    // We want all stages to complete squashing instructions before doing
+    // the cleanup.
+    if (!threadExitEvent.scheduled()) {
+        schedule(threadExitEvent, nextCycle());
+    }
+}
+
+void
+CPU::exitThreads()
+{
+    // there must be at least one thread trying to exit
+    assert(exitingThreads.size() > 0);
+
+    // terminate all threads that are ready to exit
+    auto it = exitingThreads.begin();
+    while (it != exitingThreads.end()) {
+        ThreadID thread_id = it->first;
+        bool readyToExit = it->second;
+
+        if (readyToExit) {
+            DPRINTF(O3CPU, "Exiting thread %d\n", thread_id);
+            haltContext(thread_id);
+            tcBase(thread_id)->setStatus(gem5::ThreadContext::Halted);
+            it = exitingThreads.erase(it);
+        } else {
+            it++;
+        }
+    }
+}
+
+void
+CPU::htmSendAbortSignal(ThreadID tid, uint64_t htm_uid,
+        HtmFailureFaultCause cause)
+{
+    const Addr addr = 0x0ul;
+    const int size = 8;
+    const Request::Flags flags =
+      Request::PHYSICAL|Request::STRICT_ORDER|Request::HTM_ABORT;
+
+    // O3-specific actions
+    iew.ldstQueue.resetHtmStartsStops(tid);
+    commit.resetHtmStartsStops(tid);
+
+    // notify l1 d-cache (ruby) that core has aborted transaction
+    RequestPtr req =
+        std::make_shared<Request>(addr, size, flags, _dataRequestorId);
+
+    req->taskId(taskId());
+    req->setContext(thread[tid]->contextId());
+    req->setHtmAbortCause(cause);
+
+    assert(req->isHTMAbort());
+
+    PacketPtr abort_pkt = Packet::createRead(req);
+    uint8_t *memData = new uint8_t[8];
+    assert(memData);
+    abort_pkt->dataStatic(memData);
+    abort_pkt->setHtmTransactional(htm_uid);
+
+    // TODO include correct error handling here
+    if (!iew.ldstQueue.getDataPort().sendTimingReq(abort_pkt)) {
+        panic("HTM abort signal was not sent to the memory subsystem.");
+    }
+}
+
+void
+CPU::enterPRE()
+{
+    const auto &regClasses = isa[0]->regClasses();
+
+    for (auto type = (RegClassType)0; type <= CCRegClass;
+            type = (RegClassType)(type + 1)) {
+        // Clear the usableForPRE bit of registers and only mark those that
+        // are in the free list. Only registers that are free when entering
+        // PRE can be allocated as destination register during PRE.
+
+        // Checkpoint the rename map.
+        for (RegIndex ridx = 0; ridx < regClasses.at(type).numRegs();
+                ++ridx) {
+            RegId rid = RegId(type, ridx);
+            PhysRegIdPtr phys_reg = renameMap[0].lookup(rid);
+            phys_reg->setUsableForPRE(false);
+            checkpointRenameMap[type].push_back(phys_reg);
+        }
+
+        // Checkpoint the free list.
+        for (unsigned num = freeList.numFreeRegs(type); num; num--) {
+            PhysRegIdPtr phys_reg = freeList.getReg(type);
+            freeList.addReg(phys_reg);
+            phys_reg->setUsableForPRE(true);
+            checkpointFreeList[type].push_back(phys_reg);
+        }
+    }
+
+    inPRE = true;
+}
+
+void
+CPU::exitPRE()
+{
+    const auto &regClasses = isa[0]->regClasses();
+
+    for (auto type = (RegClassType)0; type <= CCRegClass;
+            type = (RegClassType)(type + 1)) {
+
+        // Restore the rename map.
+        for (RegIndex ridx = 0; ridx < regClasses.at(type).numRegs();
+                ++ridx) {
+            RegId rid = RegId(type, ridx);
+            PhysRegIdPtr phys_reg = checkpointRenameMap[type].at(ridx);
+            renameMap[0].setEntry(rid, phys_reg);
+        }
+
+        // Restore the free list.
+        for (auto num = freeList.numFreeRegs(type); num; num--) {
+            freeList.getReg(type);
+        }
+        for (auto phys_reg : checkpointFreeList[type]) {
+            freeList.addReg(phys_reg);
+        }
+
+        // Invalidate the checkpoint.
+        checkpointRenameMap[type].clear();
+        checkpointFreeList[type].clear();
+    }
+
+    inPRE = false;
+}
+
+void
+CPU::observeDVRLoad(const DynInstPtr &inst, Addr address)
+{
+    if (!enableDVR || inPRE || inst->isPRE())
+        return;
+
+    accountDVRDemand(address);
+    ++cpuStats.dvrLoadsObserved;
+    const auto candidate = dvrStrideDetector.observe(
+        inst->pcState().instAddr(), address);
+    if (candidate) {
+        ++cpuStats.dvrStrideCandidates;
+        dvrDiscovery.arm(*candidate, inst->seqNum);
+        DPRINTF(O3CPU, "DVR stride candidate pc=%#x addr=%#x stride=%lld\n",
+                candidate->pc, candidate->address,
+                static_cast<long long>(candidate->stride));
+    }
+}
+
+} // namespace o3
+} // namespace gem5
