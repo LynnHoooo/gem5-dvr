@@ -58,6 +58,9 @@
 #include "cpu/o3/comm.hh"
 #include "cpu/o3/commit.hh"
 #include "cpu/o3/decode.hh"
+#include "cpu/o3/dvr_nested.hh"
+#include "cpu/o3/dvr_predicate.hh"
+#include "cpu/o3/dvr_quality.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/fetch.hh"
 #include "cpu/o3/free_list.hh"
@@ -654,6 +657,23 @@ class CPU : public BaseCPU
         statistics::Scalar dvrDiscoveryCompletions;
         statistics::Scalar dvrDiscoveryTimeouts;
         statistics::Scalar dvrDiscoveryAbandons;
+        statistics::Scalar dvrNestedRootStarts;
+        statistics::Scalar dvrNestedStarts;
+        statistics::Scalar dvrNestedCompletions;
+        statistics::Scalar dvrNestedTimeouts;
+        statistics::Scalar dvrNestedDepthRejects;
+        statistics::Scalar dvrNestedParentResets;
+        statistics::Scalar dvrNestedContextsBuilt;
+        statistics::Scalar dvrNestedProgramsBuilt;
+        statistics::Scalar dvrNestedVRATAllocations;
+        statistics::Scalar dvrNestedVIRExecutions;
+        statistics::Scalar dvrNestedHelpersGenerated;
+        statistics::Scalar dvrNestedHelpersIssued;
+        statistics::Scalar dvrNestedHelpersCompleted;
+        statistics::Scalar dvrNestedReplayAttempts;
+        statistics::Scalar dvrNestedReplayTargetsGenerated;
+        statistics::Scalar dvrNestedReplayFallbacks;
+        statistics::Scalar dvrNestedDependentGenerated;
         statistics::Scalar dvrDiscoveredInstructions;
         statistics::Scalar dvrTaintedInstructions;
         statistics::Scalar dvrDependentLoads;
@@ -670,6 +690,8 @@ class CPU : public BaseCPU
         statistics::Scalar dvrPrefetchesCompleted;
         statistics::Scalar dvrPrefetchesDropped;
         statistics::Scalar dvrPrefetchTranslationFaults;
+        statistics::Scalar dvrSourcePrefetchTranslationFaults;
+        statistics::Scalar dvrDependentPrefetchTranslationFaults;
         statistics::Scalar dvrAddressRelationsTrained;
         statistics::Scalar dvrDependentPrefetchesGenerated;
         statistics::Scalar dvrDependentPrefetchesIssued;
@@ -682,6 +704,7 @@ class CPU : public BaseCPU
         statistics::Scalar dvrVIRChunkExecutions;
         statistics::Scalar dvrDivergentBranches;
         statistics::Scalar dvrReconvergences;
+        statistics::Scalar dvrPredicateGenerationAbandons;
         statistics::Scalar dvrHelperTimeouts;
         statistics::Scalar dvrReconvergenceStackOverflows;
         statistics::Scalar dvrHelpersSuppressed;
@@ -702,6 +725,9 @@ class CPU : public BaseCPU
         statistics::Scalar dvrReplayAttempts;
         statistics::Scalar dvrReplayTargetsGenerated;
         statistics::Scalar dvrReplayFallbacks;
+        statistics::Scalar dvrQualityIssuedBytes;
+        statistics::Scalar dvrQualityCompletedBytes;
+        statistics::Scalar dvrQualityDemandAddressesObserved;
     } cpuStats;
 
   public:
@@ -739,24 +765,41 @@ class CPU : public BaseCPU
         bool valid = false;
     };
 
+    struct DVRPredicateGeneration
+    {
+        uint64_t generation = 0;
+        unsigned expectedLanes = 0;
+        unsigned terminalLanes = 0;
+        std::array<uint64_t, 2> terminalMask = {};
+        DVRLanePredicateTracker tracker;
+        bool divergenceCounted = false;
+        bool reported = false;
+    };
+
     struct DVRPrefetchSenderState : public Packet::SenderState
     {
         static constexpr unsigned MaxRelations = 4;
         bool source;
+        bool nested;
         unsigned relationCount;
         std::array<int64_t, MaxRelations> scales;
         std::array<int64_t, MaxRelations> offsets;
         std::array<RegVal, MaxRelations> masks;
         std::array<RegVal, MaxRelations> patterns;
         std::shared_ptr<const DVRReplayTemplate> replay;
+        std::shared_ptr<DVRPredicateGeneration> predicate;
+        unsigned lane;
         ThreadID tid;
 
-        DVRPrefetchSenderState(bool is_source, unsigned relation_count,
+        DVRPrefetchSenderState(bool is_source, bool is_nested,
+            unsigned relation_count,
             const std::array<int64_t, MaxRelations> &relation_scales,
             const std::array<int64_t, MaxRelations> &relation_offsets,
             const std::array<RegVal, MaxRelations> &relation_masks,
             const std::array<RegVal, MaxRelations> &relation_patterns,
             std::shared_ptr<const DVRReplayTemplate> replay_template,
+            std::shared_ptr<DVRPredicateGeneration> predicate_generation,
+            unsigned lane_id,
             ThreadID thread);
     };
 
@@ -774,6 +817,10 @@ class CPU : public BaseCPU
     bool enableDVR;
     DVRStrideDetector dvrStrideDetector;
     DVRDiscoveryController dvrDiscovery;
+    DVRNestedController dvrNestedController;
+    // Only request-level counters are connected here. Strict cache quality
+    // needs tag/fill/victim callbacks; the 1x1 shadow is therefore unused.
+    DVRQualityTracker dvrQualityTracker;
     DVRVectorTaintTracker dvrTaintTracker;
     DVRLoopBoundDetector dvrLoopBoundDetector;
     DVRInstructionRecorder dvrInstructionRecorder;
@@ -788,12 +835,15 @@ class CPU : public BaseCPU
         Addr pc;
         ThreadID tid;
         bool source;
+        bool nested = false;
         unsigned relationCount = 0;
         std::array<int64_t, DVRPrefetchSenderState::MaxRelations> scales = {};
         std::array<int64_t, DVRPrefetchSenderState::MaxRelations> offsets = {};
         std::array<RegVal, DVRPrefetchSenderState::MaxRelations> masks = {};
         std::array<RegVal, DVRPrefetchSenderState::MaxRelations> patterns = {};
         std::shared_ptr<const DVRReplayTemplate> replay;
+        std::shared_ptr<DVRPredicateGeneration> predicate;
+        unsigned lane = 0;
     };
     std::deque<DVRPrefetchAddress> dvrPrefetchQueue;
     struct DVRAddressRelation
@@ -813,9 +863,58 @@ class CPU : public BaseCPU
     std::unordered_map<Addr, unsigned> dvrOutstandingPrefetchLines;
     std::unordered_map<Addr, Tick> dvrCompletedPrefetchLines;
     uint64_t dvrPrefetchQueuePeak = 0;
+    uint64_t dvrNextPredicateGeneration = 1;
+    std::shared_ptr<DVRPredicateGeneration> dvrActivePredicateGeneration;
     Addr dvrCurrentTriggerPC = 0;
     uint8_t dvrSelectedRelationSlots = 0;
     RegVal dvrInitiatingLoadValue = 0;
+    struct DVRPendingNestedCandidate
+    {
+        bool valid = false;
+        Addr pc = 0;
+        InstSeqNum sequence = 0;
+        Addr address = 0;
+        int64_t stride = 0;
+    } dvrPendingNestedCandidate;
+
+    /**
+     * Child discovery owns every mutable mechanism state.  In particular it
+     * never reuses or resets the root recorder/taint/VRAT/VIR objects.
+     */
+    struct DVRNestedExecutionContext
+    {
+        bool active = false;
+        DVRNestedController::DiscoveryId id = 0;
+        ThreadID tid = 0;
+        InstSeqNum triggerSequence = 0;
+        Addr triggerPC = 0;
+        Addr triggerAddress = 0;
+        int64_t stride = 0;
+        RegVal initiatingValue = 0;
+        DVRVectorTaintTracker taint;
+        DVRLoopBoundDetector loopBound;
+        DVRInstructionRecorder recorder;
+        DVRVectorRenameTable vrat;
+        DVRVectorInstructionRegister vir;
+        DVRLoopBoundDetector::RegisterSnapshot startRegs = {};
+
+        void reset()
+        {
+            active = false;
+            id = 0;
+            triggerSequence = 0;
+            triggerPC = 0;
+            triggerAddress = 0;
+            stride = 0;
+            initiatingValue = 0;
+            taint.reset();
+            loopBound.reset();
+            recorder.reset();
+            vrat.reset();
+            vir.reset();
+            startRegs = {};
+        }
+    } dvrNestedContext;
 
     void captureDVRRegisterSnapshot(
         ThreadID tid, const DynInstPtr &committing_inst,
@@ -824,13 +923,26 @@ class CPU : public BaseCPU
                                    Addr pc, int64_t stride, unsigned lanes,
                                    const DVRLoopBoundDetector::RegisterSnapshot
                                        &finish_regs);
+    void completeDVRNestedContext(
+        const DynInstPtr &committing_inst,
+        const DVRLoopBoundDetector::RegisterSnapshot &finish_regs);
+    void launchDVRNestedPrefetches(
+        unsigned lanes,
+        const DVRLoopBoundDetector::RegisterSnapshot &finish_regs);
     void serviceDVRPrefetchQueue();
     Addr dvrPrefetchLine(Addr address) const;
     void accountDVRDemand(Addr address);
     void updateDVRPrefetchQueuePeak();
+    void retireDVRPredicateLane(
+        const std::shared_ptr<DVRPredicateGeneration> &generation,
+        unsigned lane, bool has_value, RegVal value = 0);
+    void finishDVRPredicateGeneration(
+        const std::shared_ptr<DVRPredicateGeneration> &generation,
+        bool replaced);
     bool replayDVRSource(const DVRPrefetchSenderState &state,
                          RegVal source_value);
-    void trainDVRAddressRelation(Addr flr_pc, RegVal source_value,
+    void trainDVRAddressRelation(Addr trigger_pc, Addr flr_pc,
+                                 RegVal source_value,
                                  Addr dependent_address);
 
     /** Checkpoints of the rename map when entering PRE. */

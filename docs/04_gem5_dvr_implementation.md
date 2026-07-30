@@ -3,9 +3,11 @@
 ## 当前结论
 
 主线已从 Sniper 6.0 切换到 `code/gem5-runahead-dev-pre`。该代码库在 PRE
-基础上加入了 RISC-V DVR 原型。Stage 1–4、8–11 已有当前树回归证据；
-Stage 5–7 仅保留早期回归证据，仍需在当前树上重跑。通用 uop evaluator 和
-两层 Nested Controller 已编译，但尚未接成逐 lane/Nested helper memory 后端。
+基础上加入了 RISC-V DVR 原型。Stage 1–12 已通过当前树的完整非 QUICK 回归，
+包括 actual-value predicate 和质量 tracker 独立 smoke。
+通用 uop evaluator 和
+两层 Nested Controller 已接入 CPU 提交生命周期和独立 child
+taint/recorder/VRAT/VIR/replay context；Stage 13 已验证真实 nested helper memory。
 
 ## 论文 Table 1
 
@@ -147,7 +149,7 @@ RISC-V 原型扩展为 32 bit，覆盖 x0–x31；这是 ISA 适配，不应当�
 `indices[i] -> payload[indices[i]]` 依赖链。验证结果：
 
 ```text
-DVR_STAGE4_SMOKE_PASSED tainted=12124 dependent_loads=2291 with_flr=2291
+DVR_STAGE4_SMOKE_PASSED tainted=12401 dependent_loads=2396 with_flr=2396
 ```
 
 ## 已完成：Stage 5 - backward branch 与循环边界
@@ -166,7 +168,7 @@ branch 的最多两个整数源寄存器保存为 loop-bound candidates。这保
 验证结果：
 
 ```text
-DVR_STAGE5_SMOKE_PASSED backward=4766 bounds=3897 discoveries=3897
+DVR_STAGE5_SMOKE_PASSED backward=5213 bounds=2396 discoveries=2396
 ```
 
 对应结果目录：
@@ -189,17 +191,18 @@ map 更新之前，快照会用当前提交指令的 destination physical regist
 - 另一个值发生变化，其有符号差值作为 loop increment；
 - 根据方向计算 `ceil(distance / abs(increment))`；
 - active lanes 为 remaining iterations 与 `dvrMaxLanes=128` 的较小值；
-- 无法形成“一常量、一变量”匹配时，严格按论文回退为 128 lanes。
+- 无法形成“一常量、一变量”匹配时仍记录 128-lane fallback 统计，但为避免
+  未知循环边界越界，当前 CPU 不启动该次 memory helper。
 
 验证结果：
 
 ```text
-DVR_STAGE6_SMOKE_PASSED matches=3897 fallbacks=867 \
-samples=4764 lanes=607699
+DVR_STAGE6_SMOKE_PASSED matches=2396 fallbacks=2817 \
+samples=5213 lanes=665909
 ```
 
-3897 个已识别 loop-bound 的 discovery 全部成功完成寄存器值匹配；867 个没有
-可用边界的 discovery 使用 128-lane fallback。结果目录：
+2396 个 discovery 成功完成寄存器值匹配；2817 个没有可信边界的 discovery
+只计入 fallback 统计并抑制 memory helper。结果目录：
 
 ```text
 /home/lynnhoo/dvr-repro/results/dvr-stage6-lane-count
@@ -208,26 +211,33 @@ samples=4764 lanes=607699
 ## 已完成：Stage 7 - 128-lane L1D timing prefetch
 
 在 discovery 完成且存在 FLR 后，helper 根据当前 trigger 地址、已学习 stride 和
-active lane count 生成最多 128 个虚拟地址。地址先经当前线程的 DTLB 翻译，再以
-`SoftPFReq` timing packet 送入 O3 LSQ 的 data-cache port；端口 backpressure、翻译
+active lane count 生成最多 128 个虚拟地址。地址先经当前线程的 DTLB 翻译；
+source 以带 prefetch 标记的 `ReadReq`、dependent 以 `SoftPFReq` 送入 O3 LSQ
+data-cache port；端口 backpressure、翻译
 fault、完成响应均有独立统计。验证结果：
 
 ```text
-DVR_STAGE7_SMOKE_PASSED generated=289710 issued=99304 \
-completed=99304 dropped=190406 faults=0
+DVR_STAGE7_SMOKE_PASSED generated=305333 issued=110005 \
+completed=110005 dropped=292747 faults=0 \
+source_faults=0 dependent_faults=0
 ```
+
+source helper 使用带 `Request::PREFETCH` 标记的 `ReadReq`，因为 trigger-to-FLR
+重放必须取得实际 load bytes；dependent helper 使用 `SoftPFReq`，只保留 cache
+副作用。此前两级都使用 `SoftPFReq` 时，source response payload 未定义并产生
+54,436 个错误 dependent 地址。当前脚本强制要求两类 translation fault 都为 0。
 
 ## 已完成：Stage 8 - 两级依赖预取
 
-针对 `indices[i] -> payload[indices[i]]`，discovery 从相邻样本训练
-`FLR address = scale * trigger load value + offset`。source prefetch 返回 8-byte 数据
-后，CPU 用该关系产生 dependent target `SoftPFReq`。这是已经进入真实 cache timing
-路径的两级依赖预取，但目前只覆盖可归约为单个仿射表达式的 trigger-to-FLR 链，
-不能等同于任意指令链执行。
+针对 `indices[i] -> payload[indices[i]]`，source prefetch 返回 8-byte 数据后，
+CPU 将真实值写入该 lane 的寄存器快照，并重放 FLR 之前记录的
+`C.SLLI → C.ADD → C.LD`，由最后一个 load-address uop 产生 dependent
+`SoftPFReq`。模板严格在 FLR 截断，不执行主线程中消费 FLR 的 reduction 指令。
 
 ```text
-DVR_STAGE8_SMOKE_PASSED relations=1 generated=94287 \
-issued=8198 completed=8198
+DVR_STAGE8_SMOKE_PASSED relations=1 generated=97419 issued=12586 \
+completed=12586 replay_supported=7188 replay_attempts=97419 \
+replay_targets=97419 replay_fallbacks=0
 ```
 
 ## 已完成：Stage 9 - baseline/DVR 自动对照
@@ -236,11 +246,11 @@ issued=8198 completed=8198
 
 | 指标 | Baseline | DVR | 变化 |
 |---|---:|---:|---:|
-| cycles | 2,462,727 | 2,462,511 | speedup 1.000088× |
-| demand L1D misses | 250,819 | 170,348 | -32.08% |
+| cycles | 2,462,727 | 2,462,523 | speedup 1.000083× |
+| demand L1D misses | 250,819 | 221,823 | -11.56% |
 
 该微基准先初始化整个 payload，且多数请求会在较低层 cache 命中，所以目前应把
-32.08% 的 demand miss 降幅视为功能证据，不把很小的周期差包装成论文级性能复现。
+11.56% 的 demand miss 降幅视为功能证据，不把很小的周期差包装成论文级性能复现。
 
 ## Stage 10 - 8-uop recorder、VRAT 与 VIR 骨架
 
@@ -253,12 +263,14 @@ issued=8198 completed=8198
 - discovery 完成时按实际 active lanes 构建映射并驱动 VIR 结构计数。
 
 ```text
-DVR_STAGE10_SMOKE_PASSED uops=17371 overflows=0 programs=2291 \
-vrat_allocations=91195 vir_issues=91195 vir_executions=91195
+DVR_STAGE10_SMOKE_PASSED uops=17614 overflows=0 programs=2396 \
+vrat_allocations=95470 vir_issues=95470 vir_executions=95470
 ```
 
-这里的 VIR 还是微结构/调度原型；通用整数 uop 的逐 lane 数据执行尚未替代 Stage 8
-的仿射 fast path。
+这里的 VRAT/VIR 仍是微结构/调度原型，但 Stage 8 的实际 memory helper 已执行
+逐 lane 寄存器值和异步 source response。当前 evaluator 覆盖测试所需的
+`ADD/ADDI/SLLI/ANDI/load-address` 以及 `C.ADD/C.SLLI/C.LD`；其他语义会明确
+回退到训练关系，不能据此声称支持任意 RISC-V 指令链。
 
 结果目录：
 
@@ -274,7 +286,8 @@ vrat_allocations=91195 vir_issues=91195 vir_executions=91195
 `scripts/run_remote_dvr_stage11_control_flow.sh` 对正常和强制 timeout 两组运行做
 硬性断言：
 
-- divergent branch 和 reconvergence 均大于零且数量相等；
+- actual-value divergent generation 大于零；
+- 每个 divergence 最终必须 reconverge 或被后继 generation 显式 abandon；
 - distinct predicate paths 至少为 2；
 - 至少训练两个地址关系并产生 dependent prefetch；
 - 正常组 timeout 和 reconvergence-stack overflow 为零；
@@ -287,25 +300,34 @@ vrat_allocations=91195 vir_issues=91195 vir_executions=91195
 
 ```text
 relations=2 distinctPredicatePaths=2
-divergent=5448 reconvergences=5448
-predicateSelections=368572 predicateMisses=149
-dependentPrefetchGenerated=368572
-forcedTimeouts=2884 forcedGenerated=0
+divergent=3019 reconvergences=604 predicateGenerationAbandons=2415
+predicateSelections=238232 predicateMisses=100
+dependentPrefetchGenerated=238232
+forcedTimeouts=1965 forcedGenerated=0
 ```
 
+3019 个 divergence 全部由真实 source response 与 learned discriminator 形成，
+其中 604 个收齐 lane 后 reconverge，2415 个因下一轮 launch 替换而 abandon。
 正常组和强制 timeout 组均已通过脚本中的硬断言。
 
 ## 通用 RISC-V uop template 与 Nested Controller
 
-Recorder 现在保存原始 32-bit encoding、整数源/目标寄存器和立即数，并能无架构
-副作用执行 `ADD`、`ADDI`、`SLLI`、`ANDI` 和 load effective-address。未知或
-RVC 指令明确标记为 `Unsupported`。该 evaluator 已编译并通过 Stage 11 回归，
-但 CPU 尚未把逐 lane register values 和异步 load response 喂给它，所以当前
-memory helper 仍保留仿射 fast path。
+Recorder 现在保存原始 encoding、整数源/目标寄存器和立即数，并能无架构副作用
+执行 `ADD`、`ADDI`、`SLLI`、`ANDI`、load effective-address，以及测试使用的
+`C.ADD/C.SLLI/C.LD`。CPU 已将逐 lane register snapshot 和异步 source response
+接入 evaluator；Stage 8/10 硬断言得到 `attempts=targets=97419`、`fallbacks=0`。
+未知语义仍会显式回退，当前不是任意 opcode 执行器。
 
 `dvr_nested.hh/.cc` 新增了最多两层、LIFO 完成、父子 ID 校验和逐 commit timeout
-的 Nested Controller，并通过独立 C++ smoke test 和 gem5 完整链接。它尚未绑定
-独立 VRAT/VIR/helper memory context，不能据此声称 Nested memory execution 已完成。
+的 Nested Controller，通过独立 C++ smoke test 和 gem5 完整链接，并已在提交
+路径中产生 root/child start、child recurrence completion 与 parent reset 统计。
+child 现在独立保存 taint、recorder、loop-bound、register snapshot、VRAT、VIR 和
+replay template，并以 append-only 方式生成最多 128 lane helper。共享的 relation
+predictor 和 physical request queue 不属于独立 context。
+
+Stage 13 的真实结果为 `contexts=440, programs=2, vrat=80, vir=80,
+generated=256, issued=251, completed=251`；因此 nested memory execution 已在专用
+微基准上成立，但尚未扩展为 GAP/论文 benchmark 性能结论。
 
 ## 回归入口
 
@@ -313,7 +335,7 @@ memory helper 仍保留仿射 fast path。
 # 短回归；用于快速发现结构性退化
 QUICK=1 ~/dvr-repro/scripts/run_remote_dvr_regression.sh
 
-# 完整 Stage 1–11；默认先构建
+# 完整 Stage 1–12；默认先构建
 ~/dvr-repro/scripts/run_remote_dvr_regression.sh
 
 # 保留完整测试、跳过构建
@@ -324,10 +346,15 @@ SKIP_BUILD=1 ~/dvr-repro/scripts/run_remote_dvr_regression.sh
 串联现有每个 Stage 的自校验脚本，失败立即停止，并把逐步日志及摘要保存到
 `~/dvr-repro/results/dvr-regression-logs/`。
 
+当前源码的完整非 QUICK 回归已通过，摘要为：
+
+```text
+/home/lynnhoo/dvr-repro/results/dvr-regression-logs/20260730T102004Z.summary
+```
+
 ## 后续实现顺序
 
-1. 把已实现的 uop evaluator 接到逐 lane register state，移除仿射 fast path。
+1. 扩展逐 lane evaluator 的 RV64/RVC opcode，并逐步缩小仿射 fallback 覆盖面。
 2. 把真实 value-predicate 扩展到更多 branch opcode和复杂路径。
-3. 把 Nested Controller 接到独立 VRAT/VIR/helper memory context。
-4. 在主线程优先 cache-port 节流和质量 proxy 上补执行端口与严格质量统计。
-5. 完整回归后进入缩小版 GAP 和四档消融实验。
+3. 在主线程优先 cache-port 节流和质量 proxy 上补执行端口与严格质量统计。
+4. 完整回归后进入缩小版 GAP 和四档消融实验。

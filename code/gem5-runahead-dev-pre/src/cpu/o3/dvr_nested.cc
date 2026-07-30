@@ -72,10 +72,16 @@ DVRNestedController::timeoutTop()
 }
 
 DVRNestedController::Result
-DVRNestedController::observeCommit()
+DVRNestedController::observeCommit(Addr pc, InstSeqNum sequence)
 {
     if (!active())
         return {};
+
+    const Frame &top = frames[activeDepth - 1];
+    if (activeDepth > 1 && sequence > top.triggerSequence &&
+        pc == top.triggerPC) {
+        return complete(top.id, pc);
+    }
 
     for (unsigned i = 0; i < activeDepth; ++i)
         ++frames[i].committedInstructions;
@@ -109,6 +115,14 @@ DVRNestedController::currentId() const
     if (!active())
         return std::nullopt;
     return frames[activeDepth - 1].id;
+}
+
+std::optional<DVRNestedController::DiscoveryId>
+DVRNestedController::rootId() const
+{
+    if (!active())
+        return std::nullopt;
+    return frames[0].id;
 }
 
 void

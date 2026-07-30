@@ -40,6 +40,8 @@ if env['CONF']['TARGET_ISA'] != 'null':
     Source('cpu.cc')
     Source('decode.cc')
     Source('dvr_nested.cc')
+    Source('dvr_quality.cc')
+    Source('dvr_predicate.cc')
     Source('dyn_inst.cc')
     Source('fetch.cc')
     Source('free_list.cc')

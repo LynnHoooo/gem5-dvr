@@ -19,13 +19,16 @@ code/gem5-runahead-dev-pre/
 1. `src/cpu/o3/pre.hh`：DVR 各微结构的类和数据结构。
 2. `src/cpu/o3/pre.cc`：Stride、Discovery、VTT、Loop Bound、Recorder、
    VRAT、VIR、mask/reconvergence 的算法实现。
-3. `src/cpu/o3/cpu.cc` 中的 `CPU::instDone()`：在 commit 阶段把上述结构串起来。
-4. `src/cpu/o3/cpu.cc` 中的 `launchDVRStridePrefetches()`、
+3. `src/cpu/o3/dvr_predicate.hh/.cc`：由真实 source response 构造逐 lane
+   path mask。
+4. `src/cpu/o3/dvr_quality.hh/.cc`：严格质量指标的事件驱动 tracker。
+5. `src/cpu/o3/cpu.cc` 中的 `CPU::instDone()`：在 commit 阶段把上述结构串起来。
+6. `src/cpu/o3/cpu.cc` 中的 `launchDVRStridePrefetches()`、
    `serviceDVRPrefetchQueue()`、`completeDVRPrefetch()`：128-lane helper 和
    dependent prefetch 的真实 cache timing 路径。
-5. `src/cpu/o3/lsq_unit.cc`：主线程 load 在 LSQ 发射时训练 RPT。
-6. `src/cpu/o3/lsq.cc`：截获并消费 DVR 的 cache response。
-7. `configs/dvr/table1_se.py`：论文 Table 1 风格的 gem5 配置和 DVR 参数。
+7. `src/cpu/o3/lsq_unit.cc`：主线程 load 在 LSQ 发射时训练 RPT。
+8. `src/cpu/o3/lsq.cc`：截获并消费 DVR 的 cache response。
+9. `configs/dvr/table1_se.py`：论文 Table 1 风格的 gem5 配置和 DVR 参数。
 
 如果只想看本次新增代码，可在源码根目录执行：
 
@@ -48,7 +51,9 @@ prefetch/
 │       ├── src/cpu/o3/
 │       │   ├── BaseO3CPU.py             # DVR 参数
 │       │   ├── pre.hh / pre.cc           # DVR 微结构主体
-│       │   ├── dvr_nested.hh / .cc       # 两层 Nested 控制器（尚未接 CPU）
+│       │   ├── dvr_nested.hh / .cc       # 两层 Nested 提交生命周期控制器
+│       │   ├── dvr_predicate.hh / .cc    # 实际逐 lane predicate mask
+│       │   ├── dvr_quality.hh / .cc      # 严格质量事件 tracker
 │       │   ├── cpu.hh / cpu.cc           # 状态、统计、commit 与 helper
 │       │   ├── lsq_unit.cc               # RPT load observation
 │       │   └── lsq.cc                    # helper response 路径
@@ -69,12 +74,14 @@ prefetch/
 │   ├── run_remote_dvr_stage9_compare.sh
 │   ├── run_remote_dvr_stage10_smoke.sh
 │   ├── run_remote_dvr_stage11_control_flow.sh
+│   ├── run_remote_dvr_stage12_quality.sh
 │   └── run_remote_dvr_regression.sh     # QUICK/full 一键回归
 └── docs/
     ├── 02_reproduction_status.md
     ├── 04_gem5_dvr_implementation.md
     ├── 05_gap_experiment_plan.md
-    └── 06_nested_dvr_design.md
+    ├── 06_nested_dvr_design.md
+    └── 07_dvr_quality_metrics.md
 ```
 
 服务器对应目录：
@@ -159,68 +166,99 @@ discovery complete
 | 1 | RPT stride detection | 通过 | 174317 loads，173525 candidates |
 | 2 | Table 1 baseline config | 通过 | 自动配置 smoke test |
 | 3 | Discovery/timeout | 通过 | 5080 completions，5222 forced timeouts |
-| 4 | VTT/FLR | 当前树通过 | 12124 tainted、2291 dependent loads/FLR |
-| 5 | Loop Bound | 历史回归通过；当前树待全回归 | 3897 bounds |
-| 6 | Lane inference | 历史回归通过；当前树待全回归 | 607699 total active lanes |
-| 7 | 128-lane cache injection | 历史回归通过；当前树待全回归 | 99304 timing requests completed |
-| 8 | 两级 dependent prefetch | 当前树通过 | 8198 dependent requests completed |
-| 9 | Baseline vs DVR | 当前树通过 | demand L1D miss 降低 32.08% |
-| 10 | 8-uop recorder/VRAT/VIR | 当前树通过 | 2291 programs，91195 VIR executions |
-| 11 | predicate path/reconvergence/timeout | 当前树完整通过 | 2 relations、2 paths、5448 divergent=5448 reconvergences；forced timeout 2884、generated 0 |
+| 4 | VTT/FLR | 当前树通过 | 12401 tainted、2396 dependent loads/FLR |
+| 5 | Loop Bound | 当前树通过 | 2396 bounds / discoveries |
+| 6 | Lane inference | 当前树通过 | 2396 matches，665909 total active lanes |
+| 7 | 128-lane cache injection | 当前树通过 | 110005 timing requests completed；source/dependent translation faults 均为 0 |
+| 8 | 真实逐 lane dependent replay | 当前树通过 | 97419 replay attempts/targets，0 fallback；12586 dependent requests completed |
+| 9 | Baseline vs DVR | 当前树通过 | demand L1D miss 降低 11.56% |
+| 10 | 8-uop recorder/VRAT/VIR | 当前树通过 | 2396 programs，95470 VIR executions；真实 replay 守恒断言通过 |
+| 11 | actual-value predicate/reconvergence/timeout | 当前树完整通过 | divergent=3019，reconverged=604，abandoned=2415；forced timeout=1965/generated=0 |
+| 12 | predicate/quality 独立严格 smoke | 当前树通过 | actual-value mask 与质量计数器 `-Werror` smoke |
 
 Stage 9 的当前稳定结果：
 
 ```text
 baseline_cycles=2462727
-dvr_cycles=2462511
-speedup=1.000088
+dvr_cycles=2462523
+speedup=1.000083
 baseline_demand_l1d_misses=250819
-dvr_demand_l1d_misses=170348
-miss_reduction=32.08%
+dvr_demand_l1d_misses=221823
+miss_reduction=11.56%
 ```
 
 该微基准证明了 cache miss coverage，但不代表已经复现论文的 2.4× 绝对结果。
 
+Stage 8/10 对真实 trigger-to-FLR replay 的最新硬断言结果：
+
+```text
+replay_supported=7188 replay_unsupported=0
+replay_unstable_inputs=0
+replay_attempts=97419 replay_targets=97419 replay_fallbacks=0
+```
+
+该测试中的 RVC 链为 `load → C.SLLI → C.ADD → C.LD`。模板在 FLR 截断，
+source response 的真实 64-bit load value 被写入每个 lane 的寄存器快照，再依次
+执行地址生成 uop。`targets == attempts` 且 `fallbacks == 0`，因此这里的
+dependent target 已不再由仿射 fast path 产生。
+
 Stage 11 在加入主线程优先节流和 predicate 判别位修复后的最新完整结果：
 
 ```text
-starts=8168 completions=8168 abandons=4634 programs=5449
+starts=8520 completions=8519 abandons=4567 programs=3027
 relations=2 distinct_predicate_paths=2
-divergent=5448 reconvergences=5448
-predicate_selections=368572 predicate_misses=149
-dependent_prefetch_generated=368572
-forced_timeouts=2884 forced_generated=0
+divergent=3019 reconvergences=604 predicate_generation_abandons=2415
+predicate_selections=238232 predicate_misses=100
+dependent_prefetch_generated=238232
+forced_timeouts=1965 forced_generated=0
 ```
 
-正常组满足多 relation、多 path 和分歧/重汇合数量相等的断言；强制
+正常组的 3019 个实际 divergence 全部以 reconvergence 或显式 abandon 终止；
+lane mask 来自真实 source value，不再由 lane 奇偶生成。强制
 `dvrHelperMaxUops=1` 的第二组也证明 timeout 后不会发出 helper prefetch。
 
-新增的质量/节流 proxy：
+Stage 8 当前可严格证明的 bandwidth：
 
 ```text
-source_issued=368887 source_completed=368883
-dependent_issued=29812 dependent_completed=29812
-queue_peak=133 suppressed_main_thread=15862
-possibly_useful=33607 late=697
+dvrQualityIssuedBytes=880040
+dvrQualityCompletedBytes=880040
 ```
 
-最后 4 个 source request 在程序退出时仍 outstanding，因此 issued 与 completed
-相差 4；总 issued 严格等于 source issued 与 dependent issued 之和。
+accuracy、coverage、timeliness 和 pollution 需要 L1 tag lookup/fill/victim
+回调；在接线前旧的 possibly-useful/late 仍只标记为 proxy。
 
 ## 5. 还缺什么
 
 按重要程度排列：
 
-1. 将已支持的 `ADD/ADDI/SLLI/ANDI/load-address` evaluator 接入逐 lane
-   register values 和异步 load response，替代仿射 fast path。
-2. 将已验证的实际 value-predicate 路径选择进一步扩展到任意 branch opcode。
-3. 把已实现的两层 Nested Controller 接入独立 VRAT/VIR/helper memory context。
-4. 将当前主线程优先 cache-port 节流扩展为执行端口级资源竞争模型。
-5. 在现有 possibly-useful/late proxy 上增加严格 accuracy、coverage、
-   timeliness、bandwidth、pollution 统计。
-6. 缩小版 GAP workload。
-7. Baseline、PRE、Offload/Discovery、Nested DVR 消融。
-8. 最终实验报告（Stage 1–11 一键回归入口已经补齐）。
+1. 将已验证的逐 lane evaluator 扩展到更多 RV64/RVC 整数、比较和地址生成 opcode；
+   仿射逻辑仅保留为 unsupported 链的显式 fallback。
+2. 将已验证的实际 value-predicate 路径选择进一步扩展到任意 branch opcode，
+   并让 replay 直接执行逐 lane predicate。
+3. 将当前主线程优先 cache-port 节流扩展为执行端口级资源竞争模型。
+4. 将已完成的严格质量 tracker 接到 L1 tag lookup/fill/victim/invalidate，
+   使 accuracy、coverage、timeliness 和 pollution 可用于 workload 报告。
+5. 缩小版 GAP workload。
+6. Baseline、PRE、Offload/Discovery、Nested DVR 消融。
+7. 最终实验报告（Stage 1–13 验收入口已经补齐）。
+
+Nested 专用验收：
+
+```bash
+~/dvr-repro/scripts/run_remote_dvr_stage13_nested.sh
+```
+
+当前证据为 `contexts=440, programs=2, vrat=80, vir=80,
+generated/issued/completed=256/251/251`。child 独立持有 taint、recorder、
+loop-bound、register snapshots、VRAT、VIR 和 replay template；relation predictor
+与物理 helper queue 仍由 root/child 共享。
+
+最新完整回归已经通过：
+
+```text
+DVR_REGRESSION_PASSED quick=0
+summary=/home/lynnhoo/dvr-repro/results/dvr-regression-logs/20260730T102004Z.summary
+```
 
 因此当前不能写“faithfully reproduce the DVR paper”。推荐表述：
 
@@ -262,7 +300,7 @@ PYTHON_CONFIG=/nix/store/28wlfb25i3q4wq06ap0n9gb04qkjdjyn-python3-3.11.15/bin/py
 QUICK=1 ~/dvr-repro/scripts/run_remote_dvr_regression.sh
 ```
 
-完整回归（默认先编译，再串联 Stage 1–11）：
+完整回归（默认先编译，再串联 Stage 1–12）：
 
 ```bash
 ~/dvr-repro/scripts/run_remote_dvr_regression.sh

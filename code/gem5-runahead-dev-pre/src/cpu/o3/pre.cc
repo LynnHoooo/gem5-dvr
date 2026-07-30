@@ -189,6 +189,7 @@ void
 DVRVectorTaintTracker::begin(const DynInstPtr &initiating_load)
 {
     // Discovery 开始时，只把 trigger load 的目标寄存器标为污点。
+    reset();
     for (int idx = 0; idx < initiating_load->numDestRegs(); ++idx)
         setTainted(initiating_load->destRegIdx(idx), true);
 }
@@ -282,14 +283,54 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
     uop.encoding = static_cast<uint32_t>(encoded);
     uop.encodingValid = true;
 
-    // 只解码当前支持的 RISC-V 标量语义，其他指令保持 Unsupported。
-    if ((uop.encoding & 0x3) != 0x3)
+    using Semantic = DVRInstructionRecorder::Uop::Semantic;
+
+    /*
+     * RV64C forms emitted by the dependent-load benchmark.  Register
+     * identities still come from the decoded StaticInst above; only the
+     * operation and immediate are recovered here.
+     */
+    if ((uop.encoding & 0x3) != 0x3) {
+        const uint16_t compressed = uop.encoding & 0xffff;
+        const uint32_t quadrant = compressed & 0x3;
+        const uint32_t funct3 = (compressed >> 13) & 0x7;
+
+        // C.LD rd', uimm(rs1') -- RV64C quadrant 0, funct3 011.
+        if (quadrant == 0 && funct3 == 3) {
+            uop.semantic = Semantic::LoadAddress;
+            uop.immediate =
+                ((compressed >> 10) & 0x7) << 3 |
+                ((compressed >> 5) & 0x3) << 6;
+            return;
+        }
+
+        // C.SLLI rd, shamt -- quadrant 2, funct3 000.
+        if (quadrant == 2 && funct3 == 0 &&
+            ((compressed >> 7) & 0x1f) != 0) {
+            uop.semantic = Semantic::ShiftLeftImmediate;
+            uop.immediate =
+                ((compressed >> 12) & 0x1) << 5 |
+                ((compressed >> 2) & 0x1f);
+            return;
+        }
+
+        /*
+         * C.ADD rd, rs2 -- quadrant 2, funct3 100, bit12=1 and both
+         * registers non-zero.  C.JALR/C.EBREAK share the major encoding.
+         */
+        if (quadrant == 2 && funct3 == 4 &&
+            ((compressed >> 12) & 1) != 0 &&
+            ((compressed >> 7) & 0x1f) != 0 &&
+            ((compressed >> 2) & 0x1f) != 0) {
+            uop.semantic = Semantic::Add;
+            return;
+        }
         return;
+    }
 
     const uint32_t opcode = uop.encoding & 0x7f;
     const uint32_t funct3 = (uop.encoding >> 12) & 0x7;
     const uint32_t funct7 = (uop.encoding >> 25) & 0x7f;
-    using Semantic = DVRInstructionRecorder::Uop::Semantic;
 
     if (opcode == 0x33 && funct3 == 0 && funct7 == 0) {
         uop.semantic = Semantic::Add;
@@ -324,6 +365,7 @@ DVRInstructionRecorder::Uop::evaluate(
 {
     // 只计算已解码的简单标量操作；不支持的语义返回 false。
     switch (semantic) {
+      case Semantic::Add:
         result = source0_value + source1_value;
         return true;
       case Semantic::AddImmediate:
@@ -400,6 +442,7 @@ DVRVectorRenameTable::build(const DVRInstructionRecorder &program,
                             unsigned lanes)
 {
     // 为每个带目标寄存器的 uop 和每个 lane 分块分配向量物理寄存器。
+    reset();
     const unsigned chunks = std::min(NumChunks, (lanes + 15) / 16);
     unsigned allocations = 0;
     for (unsigned uop = 0; uop < program.size(); ++uop) {
@@ -430,6 +473,7 @@ DVRVectorInstructionRegister::execute(
     unsigned max_helper_uops)
 {
     // 先建立 active mask，再按 uop 和 16-lane 分块统计执行。
+    reset();
     Result result;
     lanes = std::min(lanes, 128U);
     for (unsigned lane = 0; lane < lanes; ++lane)
@@ -438,28 +482,14 @@ DVRVectorInstructionRegister::execute(
     const unsigned chunks = (lanes + 15) / 16;
     result.activeLanes = lanes;
     for (unsigned uop = 0; uop < program.size(); ++uop) {
-        const auto &instruction = program[uop];
-        if (instruction.conditional && lanes > 1) {
-            // 当前原型按 lane 奇偶构造两条路径，用于验证分歧和重汇合。
-            std::array<uint64_t, 2> taken = {};
-            std::array<uint64_t, 2> fallthrough = {};
-            for (unsigned lane = 0; lane < lanes; ++lane) {
-                const bool lane_taken = ((lane & 1) != 0) ^
-                                        instruction.branchTaken;
-                auto &mask = lane_taken ? taken : fallthrough;
-                mask[lane / 64] |= uint64_t(1) << (lane % 64);
-            }
-            if ((taken[0] || taken[1]) &&
-                (fallthrough[0] || fallthrough[1])) {
-                if (stackDepth == ReconvergenceEntries) {
-                    result.stackOverflow = true;
-                    return result;
-                }
-                stack[stackDepth++] = {fallthrough, instruction.pc};
-                activeMask = taken;
-                ++result.divergentBranches;
-            }
-        }
+        /*
+         * A conditional uop cannot be partitioned here: source-load values
+         * arrive asynchronously after VIR construction.  The old prototype
+         * fabricated taken/fall-through masks from lane parity, which made
+         * reconvergence counters look active without executing a predicate.
+         * DVRLanePredicateTracker now forms masks solely from returned lane
+         * values and learned discriminating masks at response time.
+         */
 
         for (unsigned chunk = 0; chunk < chunks; ++chunk) {
             if (result.helperUops >= max_helper_uops) {
@@ -473,12 +503,6 @@ DVRVectorInstructionRegister::execute(
             ++result.helperUops;
         }
 
-        if (instruction.conditional && stackDepth) {
-            const auto deferred = stack[--stackDepth].deferredMask;
-            activeMask[0] |= deferred[0];
-            activeMask[1] |= deferred[1];
-            ++result.reconvergences;
-        }
     }
     return result;
 }

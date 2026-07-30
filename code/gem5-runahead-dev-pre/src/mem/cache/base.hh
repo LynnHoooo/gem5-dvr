@@ -59,6 +59,7 @@
 #include "debug/CachePort.hh"
 #include "enums/Clusivity.hh"
 #include "mem/cache/cache_blk.hh"
+#include "mem/cache/dvr_quality_event.hh"
 #include "mem/cache/compressors/base.hh"
 #include "mem/cache/mshr_queue.hh"
 #include "mem/cache/tags/base.hh"
@@ -137,6 +138,8 @@ class BaseCache : public ClockedObject
         {
         }
     };
+
+    using DVRQualityEvent = DVRCacheQualityEvent;
 
   protected:
 
@@ -363,6 +366,9 @@ class BaseCache : public ClockedObject
 
     /** To probe when a cache fill occurs */
     ProbePointArg<PacketPtr> *ppFill;
+
+    /** Exact lookup/fill/removal stream for DVR quality accounting. */
+    ProbePointArg<DVRQualityEvent> *ppDVRQuality;
 
     /**
      * To probe when the contents of a block are updated. Content updates
@@ -701,6 +707,13 @@ class BaseCache : public ClockedObject
      * between, we create this event with a higher priority.
      */
     EventFunctionWrapper writebackTempBlockAtomicEvent;
+
+    /**
+     * Victims selected while handling the current fill. Cache event handling
+     * is non-reentrant; recvTimingResp consumes this immediately after
+     * handleFill returns.
+     */
+    std::vector<DVRQualityEvent::Victim> dvrFillVictims;
 
     /**
      * When a block is overwriten, its compression information must be updated,

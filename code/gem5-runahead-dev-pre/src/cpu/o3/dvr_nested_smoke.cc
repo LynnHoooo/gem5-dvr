@@ -25,11 +25,11 @@ main()
     controller.clear();
     root = controller.startRoot(0x100, 1);
     child = controller.startNested(root.id, 0x200, 2);
-    assert(controller.observeCommit().event ==
+    assert(controller.observeCommit(0x104, 3).event ==
            DVRNestedController::Event::None);
-    assert(controller.observeCommit().event ==
+    assert(controller.observeCommit(0x104, 4).event ==
            DVRNestedController::Event::None);
-    const auto timeout = controller.observeCommit();
+    const auto timeout = controller.observeCommit(0x104, 5);
     assert(timeout.event == DVRNestedController::Event::TimedOut);
     assert(timeout.id == child.id);
     assert(controller.depth() == 1);

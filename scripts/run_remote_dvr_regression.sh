@@ -82,6 +82,8 @@ if [[ "$QUICK" == 1 ]]; then
 else
     run_step stage11-control-flow "$SCRIPT_DIR/run_remote_dvr_stage11_control_flow.sh"
 fi
+run_step stage12-quality-predicate \
+    "$SCRIPT_DIR/run_remote_dvr_stage12_quality.sh"
 
 printf 'DVR_REGRESSION_PASSED quick=%s summary=%s\n' "$QUICK" "$summary" |
     tee -a "$summary"

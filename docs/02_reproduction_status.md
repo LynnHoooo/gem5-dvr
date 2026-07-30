@@ -11,41 +11,51 @@ prefetch、8-uop recorder、VRAT/VIR 与控制流验收结构。它不是论文
 Sniper/x86/AVX-512 后端或论文绝对性能数字的逐项复刻。
 
 当前源码已通过 32-register VTT、两级 dependent prefetch、VRAT/VIR 和多路径
-控制流回归；通用 uop evaluator 与两层 Nested Controller 已编译，但尚未连接成
-完整的逐 lane/Nested helper memory 后端。
+控制流回归；通用 uop evaluator 已用于逐 lane replay。两层 Nested Controller
+已接入真实提交生命周期和独立 child taint/recorder/VRAT/VIR/replay context，
+Stage 13 已证明 child helper 经 L1D timing port 发出并返回。
 
-## Stage 1–11 证据台账
+## Stage 1–13 证据台账
 
 | Stage | 验收点 | 已知证据 | 当前判定 |
 |---|---|---:|---|
 | 1 | 32-entry RPT / stride candidate | loads=174317, candidates=173525 | 已通过 |
 | 2 | Table 1 风格配置 | config.ini 自动逐项检查通过 | 已通过 |
 | 3 | Discovery 正常结束和强制 timeout | completions=5080, timeouts=5222 | 已通过 |
-| 4 | 32-register VTT / FLR | tainted=12124, dependent loads/FLR=2291 | 当前树通过 |
-| 5 | backward branch / loop bound | 历史 bounds=3897 | 当前树待重跑 |
-| 6 | remaining iterations / lane count | 历史 active lanes=607699 | 当前树待重跑 |
-| 7 | 最多 128-lane `SoftPFReq` timing 注入 | 历史 completed=99304 | 当前树待重跑 |
-| 8 | source response 驱动 dependent prefetch | completed=8198 | 当前树通过 |
-| 9 | 同配置 baseline vs DVR | misses 250819→170348 (-32.08%) | 当前树通过 |
-| 10 | recorder / VRAT / VIR chunk | programs=2291, executions=91195 | 当前树通过 |
-| 11 | predicate paths / reconvergence / timeout | 2 paths，5448 divergent=reconvergences，forced timeout=2884/generated=0 | 当前树通过 |
+| 4 | 32-register VTT / FLR | tainted=12401, dependent loads/FLR=2396 | 当前树通过 |
+| 5 | backward branch / loop bound | bounds=discoveries=2396 | 当前树通过 |
+| 6 | remaining iterations / lane count | matches=2396, active lanes=665909 | 当前树通过 |
+| 7 | 最多 128-lane timing 注入 | completed=110005, source/dependent translation faults=0 | 当前树通过 |
+| 8 | source response 驱动真实逐 lane replay | attempts=targets=97419, fallback=0, dependent completed=12586 | 当前树通过 |
+| 9 | 同配置 baseline vs DVR | misses 250819→221823 (-11.56%) | 当前树通过 |
+| 10 | recorder / VRAT / VIR chunk | programs=2396, executions=95470, replay守恒断言通过 | 当前树通过 |
+| 11 | actual-value predicate / reconvergence / timeout | divergent=3019, reconverged=604, abandoned=2415；forced timeout=1965/generated=0 | 当前树通过 |
+| 12 | predicate/quality 独立 smoke | actual lane masks、严格事件计数 | 当前树通过 |
+| 13 | Nested 独立执行上下文和真实 helper | contexts=440, programs=2, generated/issued/completed=256/251/251 | 当前树通过 |
 
-Stage 9 的最新周期为 baseline 2,462,727、DVR 2,462,511，
-speedup 1.000088×。它证明该微基准的 demand-miss coverage，不证明论文报告的
+Stage 9 的最新周期为 baseline 2,462,727、DVR 2,462,523，
+speedup 1.000083×。它证明该微基准的 demand-miss coverage，不证明论文报告的
 整体 speedup。
 
 Stage 11 正常预算组的当前树证据为：
 
 ```text
-starts=8168 completions=8168 abandons=4634 programs=5449
+starts=8520 completions=8519 abandons=4567 programs=3027
 relationsTrained=2 distinctPredicatePaths=2
-dependentPrefetchGenerated=368572
-divergent=5448 reconvergences=5448
-predicateSelections=368572 predicateMisses=149
-forcedTimeouts=2884 forcedGenerated=0
+dependentPrefetchGenerated=238232
+divergent=3019 reconvergences=604 predicateGenerationAbandons=2415
+predicateSelections=238232 predicateMisses=100
+forcedTimeouts=1965 forcedGenerated=0
 ```
 
 Stage 11 的正常和强制 timeout 两组均由脚本完成硬断言。
+
+2026-07-30 17:27 完成了当前源码的非 QUICK 全回归：
+
+```text
+DVR_REGRESSION_PASSED quick=0
+summary=/home/lynnhoo/dvr-repro/results/dvr-regression-logs/20260730T102004Z.summary
+```
 
 ## 一键复现
 
@@ -80,15 +90,15 @@ SKIP_BUILD=1 ~/dvr-repro/scripts/run_remote_dvr_regression.sh
 
 ## 仍未完成
 
-1. 将通用 RISC-V uop evaluator 接入逐 lane VRAT values 与 load response，
-   完全替代仿射 fast path。
+1. 扩展当前已接入 source response 的逐 lane evaluator，使其覆盖更多
+   RV64/RVC opcode；当前 unsupported 链仍显式回退仿射关系。
 2. 将实际 value-predicate 路径选择扩展到更多 branch opcode。
-3. 将两层 Nested Controller 接入 CPU、独立 VRAT/VIR 和 helper memory。
-4. 把主线程优先 cache-port 节流扩展为执行端口级竞争。
-5. 在质量 proxy 上增加严格 accuracy/coverage/timeliness/bandwidth/pollution。
-6. 缩小版 GAP workload。
-7. Baseline → PRE → Offload/Discovery → Nested DVR 消融。
-8. 基于新完整回归和消融数据生成最终 Markdown 实验报告。
+3. 把主线程优先 cache-port 节流扩展为执行端口级竞争。
+4. 将严格质量 tracker 接到 L1 tag/fill/victim/invalidate 回调；当前 workload
+   已有严格 issued/completed bytes，其他指标仍不可报告。
+5. 缩小版 GAP workload。
+6. Baseline → PRE → Offload/Discovery → Nested DVR 消融。
+7. 基于新完整回归和消融数据生成最终 Markdown 实验报告。
 
 推荐对外表述：
 

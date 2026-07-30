@@ -445,6 +445,13 @@ BaseCache::recvTimingReq(PacketPtr pkt)
     pkt->headerDelay = pkt->payloadDelay = 0;
 
     if (satisfied) {
+        if (!pkt->req->isDVRPrefetch() && !pkt->req->isPrefetch() &&
+            pkt->isRequest() && (pkt->isRead() || pkt->isWrite())) {
+            ppDVRQuality->notify(DVRQualityEvent{
+                DVRQualityEvent::Kind::DemandLookup,
+                pkt->getBlockAddr(blkSize), pkt->req->requestorId(), true,
+                DVRQualityEvent::Origin::Demand, pkt->isSecure(), {}});
+        }
         // notify before anything else as later handleTimingReqHit might turn
         // the packet in a response
         ppHit->notify(pkt);
@@ -454,9 +461,15 @@ BaseCache::recvTimingReq(PacketPtr pkt)
                     pkt->getAddr(), pkt->isSecure() ? "s" : "ns");
             blk->clearPrefetched();
         }
-
         handleTimingReqHit(pkt, blk, request_time);
     } else {
+        if (!pkt->req->isDVRPrefetch() && !pkt->req->isPrefetch() &&
+            pkt->isRequest() && (pkt->isRead() || pkt->isWrite())) {
+            ppDVRQuality->notify(DVRQualityEvent{
+                DVRQualityEvent::Kind::DemandLookup,
+                pkt->getBlockAddr(blkSize), pkt->req->requestorId(), false,
+                DVRQualityEvent::Origin::Demand, pkt->isSecure(), {}});
+        }
         handleTimingReqMiss(pkt, blk, forward_time, request_time);
 
         ppMiss->notify(pkt);
@@ -553,8 +566,24 @@ BaseCache::recvTimingResp(PacketPtr pkt)
 
         const bool allocate = (writeAllocator && mshr->wasWholeLineWrite) ?
             writeAllocator->allocate() : mshr->allocOnFill();
+        dvrFillVictims.clear();
         blk = handleFill(pkt, blk, writebacks, allocate);
         assert(blk != nullptr);
+        if (blk != tempBlock) {
+            const auto origin = pkt->req->isDVRPrefetch() ?
+                DVRQualityEvent::Origin::DVR :
+                (pkt->req->isPrefetch() ?
+                    DVRQualityEvent::Origin::OtherPrefetch :
+                    DVRQualityEvent::Origin::Demand);
+            if (origin == DVRQualityEvent::Origin::DVR)
+                blk->setDVRPrefetched();
+            else
+                blk->clearDVRPrefetched();
+            ppDVRQuality->notify(DVRQualityEvent{
+                DVRQualityEvent::Kind::Fill, pkt->getBlockAddr(blkSize),
+                pkt->req->requestorId(), false, origin, pkt->isSecure(),
+                dvrFillVictims});
+        }
         ppFill->notify(pkt);
     }
 
@@ -1637,11 +1666,27 @@ BaseCache::allocateBlock(const PacketPtr pkt, PacketList &writebacks)
     if (!victim)
         return nullptr;
 
+    // Snapshot before handleEvictions invalidates the actual replacement
+    // entries and destroys their provenance.
+    dvrFillVictims.clear();
+    for (const auto *evicted : evict_blks) {
+        if (evicted->isValid()) {
+            const auto origin = evicted->wasDVRPrefetched() ?
+                DVRQualityEvent::Origin::DVR :
+                (evicted->wasPrefetched() ?
+                    DVRQualityEvent::Origin::OtherPrefetch :
+                    DVRQualityEvent::Origin::Demand);
+            dvrFillVictims.push_back(DVRQualityEvent::Victim{
+                regenerateBlkAddr(evicted), origin, evicted->isSecure()});
+        }
+    }
+
     // Print victim block's information
     DPRINTF(CacheRepl, "Replacement victim: %s\n", victim->print());
 
     // Try to evict blocks; if it fails, give up on allocation
     if (!handleEvictions(evict_blks, writebacks)) {
+        dvrFillVictims.clear();
         return nullptr;
     }
 
@@ -1661,6 +1706,17 @@ BaseCache::allocateBlock(const PacketPtr pkt, PacketList &writebacks)
 void
 BaseCache::invalidateBlock(CacheBlk *blk)
 {
+    if (blk->isValid()) {
+        const auto origin = blk->wasDVRPrefetched() ?
+            DVRQualityEvent::Origin::DVR :
+            (blk->wasPrefetched() ?
+                DVRQualityEvent::Origin::OtherPrefetch :
+                DVRQualityEvent::Origin::Demand);
+        ppDVRQuality->notify(DVRQualityEvent{
+            DVRQualityEvent::Kind::Remove, regenerateBlkAddr(blk),
+            static_cast<RequestorID>(blk->getSrcRequestorId()), false, origin,
+            blk->isSecure(), {}});
+    }
     // If block is still marked as prefetched, then it hasn't been used
     if (blk->wasPrefetched()) {
         prefetcher->prefetchUnused();
@@ -2508,6 +2564,8 @@ BaseCache::regProbePoints()
     ppHit = new ProbePointArg<PacketPtr>(this->getProbeManager(), "Hit");
     ppMiss = new ProbePointArg<PacketPtr>(this->getProbeManager(), "Miss");
     ppFill = new ProbePointArg<PacketPtr>(this->getProbeManager(), "Fill");
+    ppDVRQuality = new ProbePointArg<DVRQualityEvent>(
+        this->getProbeManager(), "DVR Quality");
     ppDataUpdate =
         new ProbePointArg<DataUpdate>(this->getProbeManager(), "Data Update");
 }

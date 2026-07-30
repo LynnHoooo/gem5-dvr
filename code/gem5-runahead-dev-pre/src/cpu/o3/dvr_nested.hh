@@ -97,7 +97,7 @@ class DVRNestedController
      * 为所有活动发现记录一条已提交指令。
      * 超时后弹出栈顶；后续提交仍需继续检查父发现是否超时。
      */
-    Result observeCommit();
+    Result observeCommit(Addr pc, InstSeqNum sequence);
 
     /** 完成当前栈顶发现并返回结束事件。 */
     Result complete(DiscoveryId id, Addr final_load_pc);
@@ -105,6 +105,7 @@ class DVRNestedController
     bool active() const { return activeDepth != 0; }
     unsigned depth() const { return activeDepth; }
     std::optional<DiscoveryId> currentId() const;
+    std::optional<DiscoveryId> rootId() const;
     const Statistics &statistics() const { return counters; }
 
     /** 清除活动帧，但保留累计统计。 */

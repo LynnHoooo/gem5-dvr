@@ -181,6 +181,9 @@ class CacheBlk : public TaggedEntry
         if (other.wasPrefetched()) {
             setPrefetched();
         }
+        if (other.wasDVRPrefetched()) {
+            setDVRPrefetched();
+        }
         setCoherenceBits(other.coherence);
         setTaskId(other.getTaskId());
         setWhenReady(curTick());
@@ -202,6 +205,7 @@ class CacheBlk : public TaggedEntry
         TaggedEntry::invalidate();
 
         clearPrefetched();
+        clearDVRPrefetched();
         clearCoherenceBits(AllBits);
 
         setTaskId(context_switch_task_id::Unknown);
@@ -256,6 +260,11 @@ class CacheBlk : public TaggedEntry
 
     /** Marks this blocks as a recently prefetched block. */
     void setPrefetched() { _prefetched = true; }
+
+    /** Provenance for a line installed by a DVR helper request. */
+    bool wasDVRPrefetched() const { return _dvrPrefetched; }
+    void clearDVRPrefetched() { _dvrPrefetched = false; }
+    void setDVRPrefetched() { _dvrPrefetched = true; }
 
     /**
      * Get tick at which block's data will be available for access.
@@ -490,6 +499,9 @@ class CacheBlk : public TaggedEntry
 
     /** Whether this block is an unaccessed hardware prefetch. */
     bool _prefetched = 0;
+
+    /** Separate from generic HW-prefetch provenance; retained after use. */
+    bool _dvrPrefetched = false;
 };
 
 /**
