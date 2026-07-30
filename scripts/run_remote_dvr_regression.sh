@@ -7,7 +7,8 @@ set -euo pipefail
 #
 # QUICK=1 is a structural/short functional regression.  It skips the build,
 # the duplicate Stage 5/6 runs, cache-traffic-heavy Stages 7/8, the two-run
-# Stage 9 comparison, and the two-run Stage 11 control-flow test.
+# Stage 9 comparison, the two-run Stage 11 control-flow test, and the
+# Stage 13 nested test.
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${ROOT:-$HOME/dvr-repro/source/gem5-runahead-dev-pre}"
@@ -84,6 +85,12 @@ else
 fi
 run_step stage12-quality-predicate \
     "$SCRIPT_DIR/run_remote_dvr_stage12_quality.sh"
+
+if [[ "$QUICK" == 1 ]]; then
+    skip_step stage13-nested "two-level nested discovery simulation; full only"
+else
+    run_step stage13-nested "$SCRIPT_DIR/run_remote_dvr_stage13_nested.sh"
+fi
 
 printf 'DVR_REGRESSION_PASSED quick=%s summary=%s\n' "$QUICK" "$summary" |
     tee -a "$summary"

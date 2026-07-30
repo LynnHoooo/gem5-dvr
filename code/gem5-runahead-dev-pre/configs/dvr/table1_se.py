@@ -6,6 +6,7 @@ import argparse
 
 import m5
 from m5.objects import *
+from m5.util.convert import toMemorySize
 
 
 class DVRIntAdd(FUDesc):
@@ -151,6 +152,11 @@ def parse_args():
     parser.add_argument("--dvr", action="store_true")
     parser.add_argument("--dvr-helper-max-uops", type=int, default=200)
     parser.add_argument("--discovery-max-insts", type=int, default=512)
+    parser.add_argument(
+        "--dvr-quality-probe",
+        action="store_true",
+        help="Attach the strict DVR quality listener to the L1D only",
+    )
     return parser.parse_args()
 
 
@@ -182,6 +188,20 @@ def main():
     l1i = Table1L1I()
     l1d = Table1L1D()
     system.cpu.addPrivateSplitL1Caches(l1i, l1d)
+
+    if args.dvr_quality_probe:
+        # Derive the shadow geometry from the measured cache so coverage is
+        # not computed against a differently-sized counterfactual cache.
+        l1d_bytes = toMemorySize(str(l1d.size))
+        l1d_sets = l1d_bytes // (int(l1d.assoc) * int(system.cache_line_size))
+        # manager is bound to the L1D alone: also listening on L2/L3 would
+        # double-count every lookup and fill.
+        system.cpu.dvr_quality_probe = DVRQualityProbe(
+            manager=l1d,
+            sets=l1d_sets,
+            assoc=int(l1d.assoc),
+            line_bytes=int(system.cache_line_size),
+        )
 
     system.l2bus = L2XBar(frontend_latency=0, forward_latency=0,
                           response_latency=0)

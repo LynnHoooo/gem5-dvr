@@ -67,7 +67,9 @@ if len(sys.argv) < 4:
 
 _, cpp, python, modpath, abspath = sys.argv
 
-with open(python, 'r') as f:
+# SimObject sources may contain non-ASCII comments and the embedded
+# gem5py interpreter defaults to the ASCII locale, so be explicit.
+with open(python, 'r', encoding='utf-8') as f:
     src = f.read()
 
 compiled = compile(src, python, 'exec')
