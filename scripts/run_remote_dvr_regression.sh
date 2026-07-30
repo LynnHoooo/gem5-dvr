@@ -88,8 +88,11 @@ run_step stage12-quality-predicate \
 
 if [[ "$QUICK" == 1 ]]; then
     skip_step stage13-nested "two-level nested discovery simulation; full only"
+    skip_step stage14-ndm-control "three NDM control simulations; full only"
 else
     run_step stage13-nested "$SCRIPT_DIR/run_remote_dvr_stage13_nested.sh"
+    run_step stage14-ndm-control \
+        "$SCRIPT_DIR/run_remote_dvr_stage14_ndm_control.sh"
 fi
 
 printf 'DVR_REGRESSION_PASSED quick=%s summary=%s\n' "$QUICK" "$summary" |

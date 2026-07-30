@@ -86,6 +86,32 @@ child program 由独立 VRAT/VIR 物化，生成 256 个 child source lanes，�
 经 L1D timing port 接受并全部返回；其余 5 个被主线程优先仲裁抑制。它仍是机制
 微基准证据，不等同于 GAP 或论文全套 benchmark 的 Nested 性能复现。
 
+## Stage 14：NDM 控制语义第一阶段
+
+在现有两层 controller 之外新增 `DVRNestedDiscoveryMode`，用于明确表达论文
+Nested Discovery Mode 的控制入口，而不把普通 child discovery 误称为完整 NDM。
+当前阶段实现：
+
+- 可配置 `dvrNDMThreshold`，默认 64；只有可信 inner lane count 小于阈值时启动；
+- 独立 `dvrNDMMaxInsts` 提交预算，默认 512，不需要缩短普通 Discovery；
+- 保存 Inner Load Register（inner trigger PC）、Increment Register（loop increment）
+  和 inner lane count；
+- 只接受不同于 inner trigger、且经过精确动态 load commit 过滤的 outer stride；
+- commit-budget timeout 和显式 ordinary-DVR fallback；
+- `dvrNDMAttempts`、`dvrNDMOuterFound`、`dvrNDMFallbacks`、
+  `dvrNDMTimeouts` 统计；
+- Stage 14 正常、阈值禁用和 timeout 三组验收入口。
+
+本阶段仍不包含 branch-direction inversion、outer-lane vectorization、逐 outer
+invocation 的 inner bound 收集或 flatten-to-128，因此不能描述为论文 4.3 的完整
+NDM 实现。它为下一阶段提供了可提交排序、可超时、可观察的控制状态。
+
+专用入口：
+
+```bash
+~/dvr-repro/scripts/run_remote_dvr_stage14_ndm_control.sh
+```
+
 ## 最小验证矩阵
 
 | 场景 | 预期 |

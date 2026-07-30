@@ -182,6 +182,10 @@ class BaseO3CPU(BaseCPU):
         "DVR 辅助线程终止前允许的最大微操作数")
     dvrDiscoveryMaxInsts = Param.Unsigned(512,
         "一次 DVR 发现区间允许提交的最大指令数")
+    dvrNDMThreshold = Param.Unsigned(64,
+        "进入 Nested Discovery Mode 的最大 inner-loop lane 数（不含阈值）")
+    dvrNDMMaxInsts = Param.Unsigned(512,
+        "NDM 搜索 outer stride 前允许提交的最大指令数")
     numPRDQEntries = Param.Unsigned(192, "Number of precise register "
                                     "deallocation queue entries")
     numSSTEntries = Param.Unsigned(128, "Number of stalling slice table "

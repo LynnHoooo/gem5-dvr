@@ -114,6 +114,81 @@ class DVRNestedController
     void clear();
 };
 
+/**
+ * 论文 Nested Discovery Mode 的控制状态。
+ *
+ * 第一阶段只负责低 lane 数触发、IR/ILR 状态、已提交 outer stride 候选和
+ * timeout/fallback。它不生成 helper，也不假装已经完成 branch inversion 或
+ * inner-lane flatten。
+ */
+class DVRNestedDiscoveryMode
+{
+  public:
+    enum class State { Idle, SeekingOuter, OuterFound };
+    enum class Event { None, Started, OuterAccepted, TimedOut, Fallback };
+
+    struct Result
+    {
+        Event event = Event::None;
+        State state = State::Idle;
+        Addr innerLoadPC = 0;
+        int64_t increment = 0;
+        unsigned innerLanes = 0;
+        Addr outerLoadPC = 0;
+        Addr outerAddress = 0;
+        int64_t outerStride = 0;
+        unsigned committedInstructions = 0;
+    };
+
+    struct Statistics
+    {
+        uint64_t attempts = 0;
+        uint64_t outerFound = 0;
+        uint64_t fallbacks = 0;
+        uint64_t timeouts = 0;
+    };
+
+  private:
+    State currentState = State::Idle;
+    unsigned laneThreshold;
+    unsigned maxInstructions;
+    unsigned committedInstructions = 0;
+    Addr innerLoadPC = 0;
+    int64_t increment = 0;
+    unsigned innerLanes = 0;
+    Addr outerLoadPC = 0;
+    Addr outerAddress = 0;
+    int64_t outerStride = 0;
+    Statistics counters = {};
+
+    Result snapshot(Event event) const;
+
+  public:
+    DVRNestedDiscoveryMode(unsigned lane_threshold,
+                           unsigned max_instructions);
+
+    /** Start NDM only for a trusted, non-empty lane count below threshold. */
+    Result start(Addr inner_load_pc, int64_t loop_increment,
+                 unsigned inner_lanes);
+
+    /** Age an active NDM generation by one committed instruction. */
+    Result observeCommit();
+
+    /** Accept a distinct, committed outer striding-load candidate. */
+    Result acceptOuter(Addr outer_load_pc, Addr outer_address,
+                       int64_t outer_stride);
+
+    /** Finish this control-only generation via ordinary inner DVR fallback. */
+    Result fallback();
+
+    bool active() const { return currentState != State::Idle; }
+    State state() const { return currentState; }
+    unsigned threshold() const { return laneThreshold; }
+    const Statistics &statistics() const { return counters; }
+    void reset();
+    void clear();
+};
+
 } // namespace o3
 } // namespace gem5
 

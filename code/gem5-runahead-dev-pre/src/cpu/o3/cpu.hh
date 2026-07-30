@@ -674,6 +674,10 @@ class CPU : public BaseCPU
         statistics::Scalar dvrNestedReplayTargetsGenerated;
         statistics::Scalar dvrNestedReplayFallbacks;
         statistics::Scalar dvrNestedDependentGenerated;
+        statistics::Scalar dvrNDMAttempts;
+        statistics::Scalar dvrNDMOuterFound;
+        statistics::Scalar dvrNDMFallbacks;
+        statistics::Scalar dvrNDMTimeouts;
         statistics::Scalar dvrDiscoveredInstructions;
         statistics::Scalar dvrTaintedInstructions;
         statistics::Scalar dvrDependentLoads;
@@ -818,6 +822,7 @@ class CPU : public BaseCPU
     DVRStrideDetector dvrStrideDetector;
     DVRDiscoveryController dvrDiscovery;
     DVRNestedController dvrNestedController;
+    DVRNestedDiscoveryMode dvrNestedDiscoveryMode;
     // Only request-level counters are connected here. Strict cache quality
     // needs tag/fill/victim callbacks; the 1x1 shadow is therefore unused.
     DVRQualityTracker dvrQualityTracker;
@@ -876,6 +881,7 @@ class CPU : public BaseCPU
         Addr address = 0;
         int64_t stride = 0;
     } dvrPendingNestedCandidate;
+    DVRPendingNestedCandidate dvrCommittedNestedCandidate;
 
     /**
      * Child discovery owns every mutable mechanism state.  In particular it

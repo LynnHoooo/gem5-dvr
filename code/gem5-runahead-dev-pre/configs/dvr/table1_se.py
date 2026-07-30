@@ -152,6 +152,8 @@ def parse_args():
     parser.add_argument("--dvr", action="store_true")
     parser.add_argument("--dvr-helper-max-uops", type=int, default=200)
     parser.add_argument("--discovery-max-insts", type=int, default=512)
+    parser.add_argument("--dvr-ndm-threshold", type=int, default=64)
+    parser.add_argument("--dvr-ndm-max-insts", type=int, default=512)
     parser.add_argument(
         "--dvr-quality-probe",
         action="store_true",
@@ -181,6 +183,8 @@ def main():
         branchPred=TAGE_SC_L_8KB(), fuPool=DVRFUPool(),
         enableDVR=args.dvr, dvrDiscoveryMaxInsts=args.discovery_max_insts,
         dvrHelperMaxUops=args.dvr_helper_max_uops,
+        dvrNDMThreshold=args.dvr_ndm_threshold,
+        dvrNDMMaxInsts=args.dvr_ndm_max_insts,
     )
     if args.maxinsts:
         system.cpu.max_insts_any_thread = args.maxinsts

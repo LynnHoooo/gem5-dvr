@@ -768,4 +768,27 @@ speedup，也无法判断收益来自 DVR、仿射 predictor，还是 cache traf
 - 论文算法忠实度：约 45%–55%；
 - 论文实验复现度：约 15%–25%。
 
-现阶段最重要的三个下一步是：**严格质量接线、真正的 NDM、真实 workload 与消融矩阵**。
+现阶段最重要的三个下一步是：**真正的 NDM 数据路径、真实 workload 与消融矩阵、执行资源竞争建模**。
+
+## 10. Stage 14：NDM 控制语义第一阶段
+
+在服务器提交已完成严格 L1D quality probe 和 Stage 13 full-regression 接入后，
+下一迭代开始实现论文 Nested Discovery Mode 的独立控制状态：
+
+- `dvrNDMThreshold=64`，仅可信 inner lane count 小于阈值时启动；
+- `dvrNDMMaxInsts=512`，独立限制 NDM 搜索 outer stride 的提交预算；
+- 保存 inner trigger PC（ILR 语义）、loop increment（IR 语义）和 inner lanes；
+- outer stride 必须不同于 inner trigger，并通过动态 load sequence 的 commit 过滤；
+- commit-budget timeout 后显式回退 ordinary inner DVR；
+- 导出 attempts、outer-found、fallback 和 timeout 统计；
+- 新增 `dvr_ndm.c` 与 Stage 14 正常/禁用/timeout 三组服务器验收。
+
+运行：
+
+```bash
+~/dvr-repro/scripts/run_remote_dvr_stage14_ndm_control.sh
+```
+
+当前 Stage 14 是控制语义和可观测性骨架，尚未实现论文要求的 branch-direction
+inversion、outer-lane vectorization、每个 outer invocation 的 inner bound 收集和
+flatten-to-128。服务器完成构建与回归前，其状态应写为“已实现，待远端验证”。

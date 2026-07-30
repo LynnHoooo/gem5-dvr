@@ -32,6 +32,7 @@ Stage 13 已证明 child helper 经 L1D timing port 发出并返回。
 | 11 | actual-value predicate / reconvergence / timeout | divergent=3019, reconverged=604, abandoned=2415；forced timeout=1965/generated=0 | 当前树通过 |
 | 12 | predicate/quality 独立 smoke | actual lane masks、严格事件计数 | 当前树通过 |
 | 13 | Nested 独立执行上下文和真实 helper | contexts=440, programs=2, generated/issued/completed=256/251/251 | 当前树通过 |
+| 14 | NDM `<64 lanes` 控制、IR/ILR、outer candidate、fallback/timeout | 等待服务器运行新增三组验收 | 已实现，待远端验证 |
 
 Stage 9 的最新周期为 baseline 2,462,727、DVR 2,462,523，
 speedup 1.000083×。它证明该微基准的 demand-miss coverage，不证明论文报告的
@@ -55,6 +56,20 @@ Stage 11 的正常和强制 timeout 两组均由脚本完成硬断言。
 ```text
 DVR_REGRESSION_PASSED quick=0
 summary=/home/lynnhoo/dvr-repro/results/dvr-regression-logs/20260730T102004Z.summary
+```
+
+## Stage 14 待验证说明
+
+当前代码新增 NDM 控制语义第一阶段：默认仅在可信 inner lane count `<64` 时启动，
+保存 inner trigger PC（ILR 语义）、loop increment（IR 语义），并只接受经过动态
+load commit 过滤的 distinct outer stride。NDM 使用独立的提交预算，新增正常、
+threshold=1 禁用和 NDM timeout 三组服务器验收。
+
+该阶段尚未实现 branch inversion、outer vectorization、per-invocation inner bound
+收集和 flatten-to-128，不能写成完整论文 NDM。服务器验证入口：
+
+```bash
+~/dvr-repro/scripts/run_remote_dvr_stage14_ndm_control.sh
 ```
 
 ## 一键复现

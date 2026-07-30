@@ -140,5 +140,104 @@ DVRNestedController::clear()
     nextId = 1;
 }
 
+DVRNestedDiscoveryMode::DVRNestedDiscoveryMode(
+    unsigned lane_threshold, unsigned max_instructions)
+    : laneThreshold(lane_threshold), maxInstructions(max_instructions)
+{
+    assert(laneThreshold > 0);
+    assert(maxInstructions > 0);
+}
+
+DVRNestedDiscoveryMode::Result
+DVRNestedDiscoveryMode::snapshot(Event event) const
+{
+    return {event, currentState, innerLoadPC, increment, innerLanes,
+            outerLoadPC, outerAddress, outerStride, committedInstructions};
+}
+
+DVRNestedDiscoveryMode::Result
+DVRNestedDiscoveryMode::start(
+    Addr inner_load_pc, int64_t loop_increment, unsigned inner_lanes)
+{
+    if (active() || inner_load_pc == 0 || inner_lanes == 0 ||
+        inner_lanes >= laneThreshold) {
+        return snapshot(Event::None);
+    }
+
+    reset();
+    currentState = State::SeekingOuter;
+    innerLoadPC = inner_load_pc;
+    increment = loop_increment;
+    innerLanes = inner_lanes;
+    ++counters.attempts;
+    return snapshot(Event::Started);
+}
+
+DVRNestedDiscoveryMode::Result
+DVRNestedDiscoveryMode::observeCommit()
+{
+    if (!active())
+        return {};
+
+    ++committedInstructions;
+    if (committedInstructions < maxInstructions)
+        return snapshot(Event::None);
+
+    const Result result = snapshot(Event::TimedOut);
+    ++counters.timeouts;
+    ++counters.fallbacks;
+    reset();
+    return result;
+}
+
+DVRNestedDiscoveryMode::Result
+DVRNestedDiscoveryMode::acceptOuter(
+    Addr outer_load_pc, Addr outer_address, int64_t outer_stride)
+{
+    if (currentState != State::SeekingOuter || outer_load_pc == 0 ||
+        outer_load_pc == innerLoadPC || outer_stride == 0) {
+        return snapshot(Event::None);
+    }
+
+    currentState = State::OuterFound;
+    outerLoadPC = outer_load_pc;
+    outerAddress = outer_address;
+    outerStride = outer_stride;
+    ++counters.outerFound;
+    return snapshot(Event::OuterAccepted);
+}
+
+DVRNestedDiscoveryMode::Result
+DVRNestedDiscoveryMode::fallback()
+{
+    if (!active())
+        return {};
+
+    const Result result = snapshot(Event::Fallback);
+    ++counters.fallbacks;
+    reset();
+    return result;
+}
+
+void
+DVRNestedDiscoveryMode::reset()
+{
+    currentState = State::Idle;
+    committedInstructions = 0;
+    innerLoadPC = 0;
+    increment = 0;
+    innerLanes = 0;
+    outerLoadPC = 0;
+    outerAddress = 0;
+    outerStride = 0;
+}
+
+void
+DVRNestedDiscoveryMode::clear()
+{
+    reset();
+    counters = {};
+}
+
 } // namespace o3
 } // namespace gem5
