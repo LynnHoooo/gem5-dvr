@@ -42,6 +42,9 @@ if env['CONF']['TARGET_ISA'] != 'null':
     Source('simple_trace.cc')
     DebugFlag('SimpleTrace')
 
+    SimObject('DVRQualityProbe.py', sim_objects=['DVRQualityProbe'])
+    Source('dvr_quality_probe.cc')
+
     SimObject('ElasticTrace.py', sim_objects=['ElasticTrace'], tags='protobuf')
     Source('elastic_trace.cc', tags='protobuf')
     DebugFlag('ElasticTrace', tags='protobuf')

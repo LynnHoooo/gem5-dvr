@@ -1669,7 +1669,7 @@ BaseCache::allocateBlock(const PacketPtr pkt, PacketList &writebacks)
     // Snapshot before handleEvictions invalidates the actual replacement
     // entries and destroys their provenance.
     dvrFillVictims.clear();
-    for (const auto *evicted : evict_blks) {
+    for (auto *evicted : evict_blks) {
         if (evicted->isValid()) {
             const auto origin = evicted->wasDVRPrefetched() ?
                 DVRQualityEvent::Origin::DVR :

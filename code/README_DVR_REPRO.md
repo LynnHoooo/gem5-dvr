@@ -389,7 +389,7 @@ docs/06_nested_dvr_design.md
 
 ### 9.3 P0：必须优先解决的缺口
 
-#### 9.3.1 一键完整回归尚未包含 Stage 13
+#### 9.3.1 一键完整回归尚未包含 Stage 13（已完成）
 
 `run_remote_dvr_regression.sh` 当前只执行到 Stage 12，然后直接输出
 `DVR_REGRESSION_PASSED`。因此现有 full regression 不能自动证明同一源码版本的
@@ -403,6 +403,14 @@ run_step stage13-nested \
 ```
 
 QUICK 模式可以跳过，但摘要中必须明确记录 `[SKIP] stage13-nested`。
+
+已实现：`run_remote_dvr_regression.sh` 在非 QUICK 模式下执行 `stage13-nested`，
+QUICK 模式记录 `[SKIP] stage13-nested`。最新一次完整回归 Stage 1–13 全部通过：
+
+```text
+DVR_REGRESSION_PASSED quick=0
+summary=/home/lynnhoo/dvr-repro/results/dvr-regression-logs/20260730T134006Z.summary
+```
 
 #### 9.3.2 当前 Nested Controller 不等于论文的 Nested Discovery Mode
 
@@ -484,7 +492,7 @@ divergences == reconvergences
              + timeouts
 ```
 
-#### 9.3.6 严格质量指标尚未绑定到指定 L1D
+#### 9.3.6 严格质量指标尚未绑定到指定 L1D（已完成）
 
 `DVRQualityTracker` 和 cache 事件出口已经存在，但配置中尚未创建
 `ProbeListenerObject` 并只绑定 `system.cpu.dcache` 的 `"DVR Quality"` probe。
@@ -499,6 +507,25 @@ divergences == reconvergences
 - unused DVR evictions。
 
 listener 必须只监听指定 L1D，不能同时监听 L2/L3，否则会重复记账。
+
+已实现：`src/cpu/o3/probe/dvr_quality_probe.{hh,cc}` 与 `DVRQualityProbe.py`
+提供 `ProbeListenerObject`，通过 `configs/dvr/table1_se.py --dvr-quality-probe`
+以 `manager=l1d` 只绑定 L1D，shadow 几何由 L1D 的 size/assoc/line 推导。
+
+`dvr_dependent.riscv` 实测：
+
+```text
+fills=17419  usefulTimely=13313  unusedEvictions=4084
+pollutionEvictions=7853  coveredMisses=12660  shadowDemandMisses=151563
+fillAccuracy=0.764280  coverage=0.083530  averageLeadTime=175713.58
+```
+
+`demandAccesses` / `actualDemandMisses` 与 gem5 自带的
+`system.cpu.dcache.demandAccesses/demandMisses` 完全一致，可作为记账正确性交叉验证。
+
+仍未解决：`usefulLate` 只能由 CPU 侧 issue 流观测，cache-only listener 看不到，
+因此 `timeliness` 目前恒为 1.0，`issuedAccuracy` 仍需与 CPU 侧 `dvrQualityIssued`
+合并计算。这两项在 README 与 stat 描述中均已显式标注，不得直接引用。
 
 #### 9.3.7 论文 workload 和 ROI 尚未准备
 
