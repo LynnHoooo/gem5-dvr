@@ -1098,3 +1098,38 @@ L1D demand misses 也均增加；这说明当前小图收益不能解释为 miss
 
 这仍是三模式流程验证，不是论文要求的六模式正式消融。下一步必须运行 VR-like、
 Offload、Discovery，并把图规模提高到能够超过 LLC，同时控制仿真时间。
+
+## 15. GAP 五 workload 六模式消融
+
+脚本 `scripts/run_remote_dvr_gap5_ablation.sh` 已完成五个 workload × 六个模式共 30
+次运行。`vr_like` 目录标签映射到 CLI 的合法参数 `--dvr-mode=vr`；脚本同时检查
+每个后台 job 的退出状态和非空 `stats.txt`。结果：
+
+```text
+~/dvr-repro/results/gap5-ablation-s10/summary.csv
+GAP5_DVR_ABLATION_PASSED
+```
+
+下表给出 cycles（单位为 gem5 ticks）；括号内为 helper issued：
+
+| Workload | Baseline | VR-like | Offload | Discovery | Full DVR | Nested DVR |
+|---|---:|---:|---:|---:|---:|---:|
+| BC | 2886148250 | 2663538250 (9219733) | 2885642250 (9763) | 2886148250 | 2874269250 (346411) | 2875078250 (347649) |
+| BFS | 2741965500 | 2517964500 (8713440) | 2741365500 (9071) | 2741965500 | 2730218500 (274544) | 2730218500 (274544) |
+| CC | 2722113750 | 2492037750 (8608174) | 2722113750 (6940) | 2722113750 | 2709197750 (292594) | 2709197750 (293077) |
+| PR | 3122066000 | 2893802750 (10241887) | 3122249000 (15617) | 3122066000 | 3107696000 (712518) | 3108382000 (810632) |
+| SSSP | 3308999500 | 3031403250 (9821398) | 3305743250 (844) | 3308999500 | 3248807250 (494587) | 3248902250 (494863) |
+
+模式行为符合预期：Discovery 与 Baseline 完全相同，因为它只运行发现和 replay
+分析而不发 helper；Offload 只产生少量单 lane traffic；Full/Nested 产生稳定的
+helper stream；VR-like 的 helper traffic 和资源冲突数量远高于其它配置。
+
+VR-like 的 cycles 明显更低、misses 也更低，但它在 BFS/BC/CC/PR/SSSP 分别发出
+约 8.6M–24.6M helper 请求，资源冲突最高超过 1.1M，不能直接当作“更好的 DVR”，
+而应视为高流量 PRE 对照。Full/Nested 的收益较小且部分 workload 的 demand misses
+增加，必须结合更大图和 MLP/MSHR 统计解释，不能把这些 scale-10 结果外推为论文的
+绝对 speedup。
+
+Nested flatten 统计：BC `57/114/2702`、BFS `0/0/0`、CC `10/20/1280`、PR
+`4283/8566/285973`、SSSP `15/30/320`（分别为 batches/outer instances/
+flattened lanes）。
