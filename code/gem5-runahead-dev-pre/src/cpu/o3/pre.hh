@@ -229,6 +229,10 @@ class DVRVectorInstructionRegister
 
     std::array<uint64_t, 2> activeMask = {};
     std::array<ReconvergenceEntry, ReconvergenceEntries> stack = {};
+    // Vector register file used by the helper interpreter.  Values are
+    // private to the DVR context and are never copied to architectural regs.
+    std::array<std::array<RegVal, 128>,
+               DVRVectorRenameTable::NumArchitecturalRegs> vectorRegs = {};
     unsigned stackDepth = 0;
     uint16_t issuedChunks = 0;
     uint16_t executedChunks = 0;
@@ -250,6 +254,7 @@ class DVRVectorInstructionRegister
                    unsigned max_helper_uops = 200);
     void reset();
     const std::array<uint64_t, 2> &mask() const { return activeMask; }
+    RegVal laneValue(unsigned reg, unsigned lane) const;
 };
 
 /** 适配 RISC-V 分支的 LCR/SBB 风格循环边界检测器。 */

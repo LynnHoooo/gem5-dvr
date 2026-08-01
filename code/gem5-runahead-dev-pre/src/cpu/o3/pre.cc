@@ -472,26 +472,83 @@ DVRVectorInstructionRegister::execute(
     const DVRInstructionRecorder &program, unsigned lanes,
     unsigned max_helper_uops)
 {
-    // 先建立 active mask，再按 uop 和 16-lane 分块统计执行。
+    // 建立 active mask 和私有向量寄存器文件，再按 uop/lane 实际执行。
     reset();
     Result result;
     lanes = std::min(lanes, 128U);
-    for (unsigned lane = 0; lane < lanes; ++lane)
+    for (unsigned lane = 0; lane < lanes; ++lane) {
         activeMask[lane / 64] |= uint64_t(1) << (lane % 64);
+        // lane ordinal is the only value known before asynchronous source
+        // loads return; it provides a deterministic seed for address-only
+        // instructions.  Real load values are consumed by the helper request
+        // path and never become architectural state.
+        for (unsigned reg = 0; reg < DVRVectorRenameTable::NumArchitecturalRegs;
+             ++reg)
+            vectorRegs[reg][lane] = lane;
+    }
 
     const unsigned chunks = (lanes + 15) / 16;
     result.activeLanes = lanes;
     for (unsigned uop = 0; uop < program.size(); ++uop) {
-        /*
-         * A conditional uop cannot be partitioned here: source-load values
-         * arrive asynchronously after VIR construction.  The old prototype
-         * fabricated taken/fall-through masks from lane parity, which made
-         * reconvergence counters look active without executing a predicate.
-         * DVRLanePredicateTracker now forms masks solely from returned lane
-         * values and learned discriminating masks at response time.
-         */
-
         for (unsigned chunk = 0; chunk < chunks; ++chunk) {
+            unsigned active_in_chunk = 0;
+            const unsigned first = chunk * 16;
+            const unsigned last = std::min(first + 16, lanes);
+            for (unsigned lane = first; lane < last; ++lane) {
+                if (!(activeMask[lane / 64] & (uint64_t(1) << (lane % 64))))
+                    continue;
+                RegVal lhs = 0;
+                RegVal rhs = 0;
+                const auto &op = program[uop];
+                if (op.source0 >= 0)
+                    lhs = vectorRegs[op.source0][lane];
+                if (op.source1 >= 0)
+                    rhs = vectorRegs[op.source1][lane];
+                RegVal value = 0;
+                if (!op.evaluate(lhs, rhs, value))
+                    continue;
+                if (op.destination >= 0)
+                    vectorRegs[op.destination][lane] = value;
+                ++active_in_chunk;
+                ++result.helperUops;
+                if (result.helperUops >= max_helper_uops) {
+                    result.timedOut = uop + 1 < program.size() ||
+                        lane + 1 < last;
+                    return result;
+                }
+            }
+            if (active_in_chunk == 0)
+                continue;
+            issuedChunks |= uint16_t(1) << chunk;
+            executedChunks |= uint16_t(1) << chunk;
+            ++result.chunkIssues;
+            ++result.chunkExecutions;
+        }
+    }
+    return result;
+}
+
+RegVal
+DVRVectorInstructionRegister::laneValue(unsigned reg, unsigned lane) const
+{
+    assert(reg < DVRVectorRenameTable::NumArchitecturalRegs);
+    assert(lane < 128);
+    return vectorRegs[reg][lane];
+}
+
+void
+DVRVectorInstructionRegister::reset()
+{
+    activeMask = {};
+    stack = {};
+    vectorRegs = {};
+    stackDepth = 0;
+    issuedChunks = 0;
+    executedChunks = 0;
+}
+
+/* old implementation removed: VIR now executes supported uops per lane. */
+/*
             if (result.helperUops >= max_helper_uops) {
                 result.timedOut = true;
                 return result;
@@ -516,6 +573,7 @@ DVRVectorInstructionRegister::reset()
     issuedChunks = 0;
     executedChunks = 0;
 }
+*/
 
 void
 DVRLoopBoundDetector::begin(Addr trigger_pc)
