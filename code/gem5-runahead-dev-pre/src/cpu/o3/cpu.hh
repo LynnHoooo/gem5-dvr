@@ -773,6 +773,8 @@ class CPU : public BaseCPU
 
     /** 用主线程 load 地址训练 DVR 的 RPT。 */
     void observeDVRLoad(const DynInstPtr &inst, Addr address);
+    /** IEW dispatch 阶段观察指令并启动/推进 DVR Discovery。 */
+    void observeDVRDispatch(const DynInstPtr &inst);
 
     struct DVRReplayTemplate
     {
@@ -848,8 +850,11 @@ class CPU : public BaseCPU
     DVRVectorRenameTable dvrVectorRenameTable;
     DVRVectorInstructionRegister dvrVectorInstructionRegister;
     DVRLoopBoundDetector::RegisterSnapshot dvrDiscoveryStartRegs = {};
+    std::set<InstSeqNum> dvrDispatchTainted;
+    std::set<InstSeqNum> dvrDispatchDependentLoads;
     unsigned dvrMaxLanes;
     unsigned dvrHelperMaxUops;
+    bool dvrEnableDependentPrefetch;
     struct DVRPrefetchAddress
     {
         Addr address;

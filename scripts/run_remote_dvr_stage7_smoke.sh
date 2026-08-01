@@ -8,7 +8,8 @@ OUT="${OUT:-$HOME/dvr-repro/results/dvr-stage7-prefetch}"
 rm -rf "$OUT"
 mkdir -p "$OUT"
 "$ROOT/build/RISCV/gem5.opt" --outdir="$OUT" \
-    "$ROOT/configs/dvr/table1_se.py" --cmd="$BENCH" --dvr
+    "$ROOT/configs/dvr/table1_se.py" --cmd="$BENCH" --dvr \
+    --dvr-no-dependent-prefetch
 
 read_stat() {
     awk -v name="$2" '$1 == name { print $2; exit }' "$1"

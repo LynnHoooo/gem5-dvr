@@ -71,6 +71,20 @@ DVRStrideDetector::observe(Addr pc, Addr address)
     return std::nullopt;
 }
 
+std::optional<DVRStrideDetector::Candidate>
+DVRStrideDetector::observeDispatch(Addr pc) const
+{
+    for (const auto &entry : entries) {
+        if (entry.valid && entry.pc == pc && entry.stride != 0 &&
+            entry.confidence >= 2) {
+            return Candidate{pc, static_cast<Addr>(
+                static_cast<int64_t>(entry.lastAddress) + entry.stride),
+                entry.stride};
+        }
+    }
+    return std::nullopt;
+}
+
 void
 DVRStrideDetector::reset()
 {
@@ -90,15 +104,29 @@ void
 DVRDiscoveryController::arm(
     const DVRStrideDetector::Candidate &candidate, InstSeqNum sequence)
 {
-    // 只允许同时存在一个待启动的 Discovery。
+    // Discovery starts speculatively at dispatch; commit observes its end.
     if (state != State::Idle)
         return;
 
-    state = State::Armed;
+    state = State::Discovering;
     triggerPC = candidate.pc;
     triggerStride = candidate.stride;
     triggerSequence = sequence;
+    stopSequence = 0;
     instructions = 0;
+}
+
+bool
+DVRDiscoveryController::observeDispatch(Addr pc, InstSeqNum sequence)
+{
+    if (state != State::Discovering || sequence <= triggerSequence ||
+        stopSequence != 0)
+        return false;
+    if (pc == triggerPC) {
+        stopSequence = sequence;
+        return true;
+    }
+    return false;
 }
 
 DVRDiscoveryController::Result
@@ -123,7 +151,7 @@ DVRDiscoveryController::observeCommit(Addr pc, InstSeqNum sequence)
     if (state != State::Discovering || sequence <= triggerSequence)
         return {};
 
-    if (pc == triggerPC) {
+    if (stopSequence != 0 && sequence == stopSequence) {
         // 再次提交相同 trigger PC，表示本次 Discovery 到达循环边界。
         const Result result{
             Event::Completed, triggerPC, triggerStride, instructions};
@@ -150,6 +178,7 @@ DVRDiscoveryController::finish()
     triggerPC = 0;
     triggerStride = 0;
     triggerSequence = 0;
+    stopSequence = 0;
     instructions = 0;
 }
 
@@ -215,6 +244,19 @@ DVRVectorTaintTracker::observe(const DynInstPtr &inst)
         setTainted(inst->destRegIdx(idx), source_tainted);
 
     return {source_tainted, dependent_load};
+}
+
+DVRVectorTaintTracker::Observation
+DVRVectorTaintTracker::classify(const DynInstPtr &inst) const
+{
+    bool source_tainted = false;
+    for (int idx = 0; idx < inst->numSrcRegs(); ++idx) {
+        if (isTainted(inst->srcRegIdx(idx))) {
+            source_tainted = true;
+            break;
+        }
+    }
+    return {source_tainted, inst->isLoad() && source_tainted};
 }
 
 void

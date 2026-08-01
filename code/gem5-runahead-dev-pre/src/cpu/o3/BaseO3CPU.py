@@ -182,6 +182,8 @@ class BaseO3CPU(BaseCPU):
     dvrMaxLanes = Param.Unsigned(128, "DVR 最大等效标量通道数")
     dvrHelperMaxUops = Param.Unsigned(200,
         "DVR 辅助线程终止前允许的最大微操作数")
+    dvrEnableDependentPrefetch = Param.Bool(True,
+        "Enable DVR dependent target prefetch generation")
     dvrDiscoveryMaxInsts = Param.Unsigned(512,
         "一次 DVR 发现区间允许提交的最大指令数")
     dvrNDMThreshold = Param.Unsigned(64,

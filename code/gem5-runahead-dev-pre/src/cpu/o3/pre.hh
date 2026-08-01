@@ -56,6 +56,7 @@ class DVRStrideDetector
   public:
     explicit DVRStrideDetector(unsigned num_entries);
     std::optional<Candidate> observe(Addr pc, Addr address);
+    std::optional<Candidate> observeDispatch(Addr pc) const;
     void reset();
 };
 
@@ -92,6 +93,7 @@ class DVRDiscoveryController
     Addr triggerPC = 0;
     int64_t triggerStride = 0;
     InstSeqNum triggerSequence = 0;
+    InstSeqNum stopSequence = 0;
     unsigned instructions = 0;
     const unsigned maxInstructions;
 
@@ -101,8 +103,10 @@ class DVRDiscoveryController
     explicit DVRDiscoveryController(unsigned max_instructions);
     void arm(const DVRStrideDetector::Candidate &candidate,
              InstSeqNum sequence);
+    bool observeDispatch(Addr pc, InstSeqNum sequence);
     Result observeCommit(Addr pc, InstSeqNum sequence);
     bool isDiscovering() const { return state == State::Discovering; }
+    InstSeqNum triggerSeq() const { return triggerSequence; }
     void reset();
 };
 
@@ -127,6 +131,7 @@ class DVRVectorTaintTracker
 
     void begin(const DynInstPtr &initiating_load);
     Observation observe(const DynInstPtr &inst);
+    Observation classify(const DynInstPtr &inst) const;
     void reset();
     Addr flr() const { return finalLoadPC; }
     uint32_t bits() const { return taint; }

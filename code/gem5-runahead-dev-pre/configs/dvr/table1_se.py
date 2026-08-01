@@ -156,6 +156,7 @@ def parse_args():
         default="nested",
     )
     parser.add_argument("--dvr-helper-max-uops", type=int, default=200)
+    parser.add_argument("--dvr-no-dependent-prefetch", action="store_true")
     parser.add_argument("--discovery-max-insts", type=int, default=512)
     parser.add_argument("--dvr-ndm-threshold", type=int, default=64)
     parser.add_argument("--dvr-ndm-max-insts", type=int, default=512)
@@ -194,6 +195,7 @@ def main():
         dvrMaxLanes=1 if args.dvr_mode == "offload" else 128,
         dvrDiscoveryMaxInsts=args.discovery_max_insts,
         dvrHelperMaxUops=args.dvr_helper_max_uops,
+        dvrEnableDependentPrefetch=not args.dvr_no_dependent_prefetch,
         dvrNDMThreshold=args.dvr_ndm_threshold,
         dvrNDMMaxInsts=args.dvr_ndm_max_insts,
     )

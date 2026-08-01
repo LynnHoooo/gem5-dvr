@@ -161,7 +161,8 @@ CPU::CPU(const BaseO3CPUParams &params)
           params.dvrNDMThreshold, params.dvrNDMMaxInsts),
       dvrQualityTracker(1, 1),
       dvrMaxLanes(params.dvrMaxLanes),
-      dvrHelperMaxUops(params.dvrHelperMaxUops)
+      dvrHelperMaxUops(params.dvrHelperMaxUops),
+      dvrEnableDependentPrefetch(params.dvrEnableDependentPrefetch)
 {
     dvrIssueWidth = params.issueWidth;
     dvrFetchWidth = params.fetchWidth;
@@ -757,6 +758,11 @@ CPU::tick()
     serviceDVRPrefetchQueue();
 
     commit.tick();
+
+    // A Discovery can finish in commit.tick() and enqueue a helper request
+    // after the normal pre-commit helper arbitration point.  Give that
+    // newly-created queue one same-cycle, residual service opportunity.
+    serviceDVRPrefetchQueue();
 
     // Now advance the time buffers
     timeBuffer.advance();
@@ -1519,11 +1525,45 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
 
         if (enableDVR && !inPRE && !inst->isPRE()) {
             const bool was_discovering = dvrDiscovery.isDiscovering();
+            if (was_discovering &&
+                inst->seqNum > dvrDiscovery.triggerSeq()) {
+                const bool dispatch_tainted =
+                    dvrDispatchTainted.erase(inst->seqNum) != 0;
+                const bool dispatch_dependent =
+                    dvrDispatchDependentLoads.erase(inst->seqNum) != 0;
+                if (dispatch_tainted)
+                    dvrInstructionRecorder.record(inst);
+                if (dispatch_dependent) {
+                    dvrLoopBoundDetector.updateFinalLoad(
+                        dvrTaintTracker.flr());
+                    if (inst->effAddrValid()) {
+                        trainDVRAddressRelation(
+                            dvrCurrentTriggerPC, inst->pcState().instAddr(),
+                            dvrInitiatingLoadValue, inst->effAddr);
+                    }
+                }
+                const auto loop_observation =
+                    dvrLoopBoundDetector.observe(inst);
+                if (loop_observation.backwardBranch)
+                    ++cpuStats.dvrBackwardBranches;
+                if (loop_observation.boundFound)
+                    ++cpuStats.dvrLoopBoundsFound;
+            }
             const auto result = dvrDiscovery.observeCommit(
                 inst->pcState().instAddr(), inst->seqNum);
             const auto nested_result = dvrNestedController.observeCommit(
                 inst->pcState().instAddr(), inst->seqNum);
             const auto ndm_result = dvrNestedDiscoveryMode.observeCommit();
+            if (was_discovering &&
+                inst->seqNum == dvrDiscovery.triggerSeq()) {
+                for (int dest = 0; dest < inst->numDestRegs(); ++dest) {
+                    if (inst->destRegIdx(dest).classValue() == IntRegClass) {
+                        dvrInitiatingLoadValue = getReg(
+                            inst->renamedDestIdx(dest));
+                        break;
+                    }
+                }
+            }
             if (ndm_result.event ==
                 DVRNestedDiscoveryMode::Event::TimedOut) {
                 ++cpuStats.dvrNDMTimeouts;
@@ -1646,30 +1686,6 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 nested_result.id == dvrNestedContext.id) {
                 dvrNestedContext.reset();
             }
-            if (was_discovering &&
-                result.event != DVRDiscoveryController::Event::Completed) {
-                const auto observation = dvrTaintTracker.observe(inst);
-                if (observation.taintedInstruction) {
-                    ++cpuStats.dvrTaintedInstructions;
-                    dvrInstructionRecorder.record(inst);
-                }
-                if (observation.dependentLoad) {
-                    ++cpuStats.dvrDependentLoads;
-                    dvrLoopBoundDetector.updateFinalLoad(
-                        dvrTaintTracker.flr());
-                    if (inst->effAddrValid()) {
-                        trainDVRAddressRelation(
-                            dvrCurrentTriggerPC, inst->pcState().instAddr(),
-                            dvrInitiatingLoadValue, inst->effAddr);
-                    }
-                }
-                const auto loop_observation =
-                    dvrLoopBoundDetector.observe(inst);
-                if (loop_observation.backwardBranch)
-                    ++cpuStats.dvrBackwardBranches;
-                if (loop_observation.boundFound)
-                    ++cpuStats.dvrLoopBoundsFound;
-            }
             switch (result.event) {
               case DVRDiscoveryController::Event::Started:
                 ++cpuStats.dvrDiscoveryStarts;
@@ -1746,7 +1762,6 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 bool helper_allowed = dvrMode != "discovery" &&
                                       dvrInstructionRecorder.size() > 1 &&
                                       dvrTaintTracker.flr() != 0 &&
-                                      inference.matched &&
                                       !dvrInstructionRecorder.overflow();
                 if (dvrInstructionRecorder.overflow()) {
                     ++cpuStats.dvrRecorderOverflows;
@@ -1882,6 +1897,11 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
                                    &finish_regs)
 {
     lanes = std::min(lanes, DVRLanePredicateTracker::MaxLanes);
+    // Dispatch-started discoveries can complete faster than the helper port
+    // drains its queue.  Preserve the oldest committed helper instead of
+    // replacing it on every subsequent discovery.
+    if (!dvrPrefetchQueue.empty())
+        return;
     for (const auto &queued : dvrPrefetchQueue) {
         if (queued.source && queued.predicate) {
             retireDVRPredicateLane(
@@ -1996,7 +2016,10 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
             ++cpuStats.dvrReplayUnstableInputs;
     }
 
-    startDVRHelper(pc, replay->count, lanes);
+    // Source stride prefetches are useful even when the committed slice did
+    // not contain a replayable load uop.  Keep the helper alive for source
+    // lanes; replay->count only controls dependent replay semantics.
+    startDVRHelper(pc, std::max(1u, replay->count), lanes);
     for (unsigned lane = 1; lane <= lanes; ++lane) {
         const Addr address = current_address + stride * lane;
         DVRPrefetchAddress prefetch;
@@ -2432,8 +2455,9 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
     if (state->source && pkt->hasData()) {
         const RegVal value = pkt->getLE<RegVal>();
         retireDVRPredicateLane(state->predicate, state->lane, true, value);
-        bool matched = replayDVRSource(*state, value);
-        if (!matched) {
+        bool matched = dvrEnableDependentPrefetch &&
+                       replayDVRSource(*state, value);
+        if (dvrEnableDependentPrefetch && !matched) {
             if (state->replay) {
                 ++cpuStats.dvrReplayFallbacks;
                 if (state->nested)
@@ -2447,6 +2471,13 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
                 dependent.address = static_cast<Addr>(
                     state->scales[index] * static_cast<int64_t>(value) +
                     state->offsets[index]);
+                // RISC-V user virtual addresses in this SE model are below
+                // the canonical 47-bit boundary.  Do not enqueue an affine
+                // target that can only become an MMU translation fault.
+                if (dependent.address == 0 ||
+                    dependent.address >= (Addr(1) << 47)) {
+                    continue;
+                }
                 dependent.pc = pkt->req->getPC();
                 dependent.tid = state->tid;
                 dependent.source = false;
@@ -2550,6 +2581,9 @@ CPU::replayDVRSource(const DVRPrefetchSenderState &state,
             DVRInstructionRecorder::Uop::Semantic::LoadAddress) {
             DVRPrefetchAddress dependent;
             dependent.address = static_cast<Addr>(result);
+            if (dependent.address == 0 ||
+                dependent.address >= (Addr(1) << 47))
+                return false;
             dependent.pc = uop.pc;
             dependent.tid = state.tid;
             dependent.source = false;
@@ -3000,6 +3034,63 @@ CPU::exitPRE()
 }
 
 void
+CPU::observeDVRDispatch(const DynInstPtr &inst)
+{
+    if (!enableDVR || inPRE || inst->isPRE())
+        return;
+
+    const bool is_discovery_end = dvrDiscovery.observeDispatch(
+        inst->pcState().instAddr(), inst->seqNum);
+
+    if (inst->isLoad()) {
+        const auto candidate = dvrStrideDetector.observeDispatch(
+            inst->pcState().instAddr());
+        if (candidate) {
+            ++cpuStats.dvrStrideCandidates;
+            if (dvrMode == "vr") {
+                launchDVRVectorRunahead(inst->threadNumber, candidate->address,
+                                        candidate->pc, candidate->stride);
+            } else if (dvrDiscovery.isDiscovering() ||
+                       dvrNestedDiscoveryMode.active()) {
+                if (!dvrPendingNestedCandidate.valid ||
+                    inst->seqNum < dvrPendingNestedCandidate.sequence) {
+                    dvrPendingNestedCandidate = {
+                        true, candidate->pc, inst->seqNum,
+                        candidate->address, candidate->stride};
+                }
+            } else {
+                dvrDiscovery.arm(*candidate, inst->seqNum);
+                ++cpuStats.dvrDiscoveryStarts;
+                dvrTaintTracker.begin(inst);
+                dvrLoopBoundDetector.begin(candidate->pc);
+                dvrInstructionRecorder.begin(inst);
+                dvrDispatchTainted.clear();
+                dvrDispatchDependentLoads.clear();
+                dvrNestedDiscoveryMode.reset();
+                dvrCommittedNestedCandidate = {};
+                dvrCurrentTriggerPC = candidate->pc;
+                dvrInitiatingLoadValue = 0;
+                captureDVRRegisterSnapshot(
+                    inst->threadNumber, inst, dvrDiscoveryStartRegs);
+            }
+        }
+    }
+
+    if (dvrDiscovery.isDiscovering() && !is_discovery_end &&
+        inst->seqNum > dvrDiscovery.triggerSeq()) {
+        const auto observation = dvrTaintTracker.observe(inst);
+        if (observation.taintedInstruction) {
+            ++cpuStats.dvrTaintedInstructions;
+            dvrDispatchTainted.insert(inst->seqNum);
+        }
+        if (observation.dependentLoad) {
+            ++cpuStats.dvrDependentLoads;
+            dvrDispatchDependentLoads.insert(inst->seqNum);
+        }
+    }
+}
+
+void
 CPU::observeDVRLoad(const DynInstPtr &inst, Addr address)
 {
     if (!enableDVR || inPRE || inst->isPRE())
@@ -3009,33 +3100,15 @@ CPU::observeDVRLoad(const DynInstPtr &inst, Addr address)
     dvrQualityTracker.demandAddressObserved();
     ++cpuStats.dvrQualityDemandAddressesObserved;
     ++cpuStats.dvrLoadsObserved;
-    const auto candidate = dvrStrideDetector.observe(
-        inst->pcState().instAddr(), address);
-    if (candidate) {
-        ++cpuStats.dvrStrideCandidates;
-        if (dvrMode == "vr") {
-            launchDVRVectorRunahead(inst->threadNumber, candidate->address,
-                                    candidate->pc, candidate->stride);
-            return;
-        }
-        if ((dvrDiscovery.isDiscovering() &&
-             candidate->pc != dvrCurrentTriggerPC) ||
-            dvrNestedDiscoveryMode.active()) {
-            // IEW can observe several younger loads before the oldest
-            // candidate reaches commit.  Retain that oldest candidate;
-            // replacing it here made the commit-side child trigger vanish.
-            if (!dvrPendingNestedCandidate.valid ||
-                inst->seqNum < dvrPendingNestedCandidate.sequence) {
-                dvrPendingNestedCandidate = {
-                    true, candidate->pc, inst->seqNum,
-                    candidate->address, candidate->stride};
+    dvrStrideDetector.observe(inst->pcState().instAddr(), address);
+    if (dvrDiscovery.isDiscovering() &&
+        inst->seqNum == dvrDiscovery.triggerSeq()) {
+        for (int dest = 0; dest < inst->numDestRegs(); ++dest) {
+            if (inst->destRegIdx(dest).classValue() == IntRegClass) {
+                dvrInitiatingLoadValue = getReg(inst->renamedDestIdx(dest));
+                break;
             }
-        } else {
-            dvrDiscovery.arm(*candidate, inst->seqNum);
         }
-        DPRINTF(O3CPU, "DVR stride candidate pc=%#x addr=%#x stride=%lld\n",
-                candidate->pc, candidate->address,
-                static_cast<long long>(candidate->stride));
     }
 }
 
