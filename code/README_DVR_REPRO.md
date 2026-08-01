@@ -365,6 +365,33 @@ docs/06_nested_dvr_design.md
 
 ## 9. 复现缺口审计与后续方案
 
+### 9.0 2026-08-01 状态更新
+
+本节以下内容基于当前本地开发分支和服务器日志更新。必须区分“代码已提交”和
+“服务器已重新编译并验证”：
+
+| 项目 | 当前状态 | 证据边界 |
+| --- | --- | --- |
+| VIR 私有向量寄存器 | 代码已加入 | 尚未在服务器重新编译后的 Stage 10 验证 |
+| 逐 lane uop evaluator | 代码已加入，支持已有有限语义 | 尚未重新生成 workload 级结果 |
+| helper thread 生命周期 | 代码已加入 | 尚未用新二进制完成完整回归 |
+| branch target / deferred mask / reconvergence metadata | 代码已加入 | 尚未完成任意 branch opcode 验收 |
+| 服务器最新 Stage 1–8 | 通过 | 使用服务器当时可执行的构建结果 |
+| 服务器最新 Stage 9 | 不可作为新代码结论 | 该次回归使用 `SKIP_BUILD=1`，运行的是旧二进制 |
+| 服务器最近一次完整构建 | 失败 | 当时 `pre.hh` 与 `pre.cc` 版本不同步，出现 `vectorRegs`/`laneValue` 编译错误 |
+
+因此，完成新代码验证的正确顺序是：
+
+```text
+重新编译
+  → Stage 10–14（VIR、predicate、Nested、NDM）
+  → Stage 8–9（dependent replay 和性能对比）
+  → 必要时完整 Stage 1–14 回归
+```
+
+在上述验证完成前，不应把新增 VIR、helper 或 reconvergence 代码写成“已通过
+服务器验证”。
+
 ### 9.1 总体判断
 
 当前代码不是空壳，而是一个已经通过专用微基准验证的 gem5/RISC-V DVR
