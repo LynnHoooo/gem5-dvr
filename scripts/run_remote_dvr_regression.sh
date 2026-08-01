@@ -93,6 +93,8 @@ else
     run_step stage13-nested "$SCRIPT_DIR/run_remote_dvr_stage13_nested.sh"
     run_step stage14-ndm-control \
         "$SCRIPT_DIR/run_remote_dvr_stage14_ndm_control.sh"
+    run_step stage15-resource \
+        "$SCRIPT_DIR/run_remote_dvr_stage15_resource_smoke.sh"
 fi
 
 printf 'DVR_REGRESSION_PASSED quick=%s summary=%s\n' "$QUICK" "$summary" |

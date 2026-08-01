@@ -483,6 +483,10 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "NDM control generations returning to ordinary inner DVR"),
       ADD_STAT(dvrNDMTimeouts, statistics::units::Count::get(),
                "NDM control generations reaching the commit budget"),
+      ADD_STAT(dvrResourceConflicts, statistics::units::Count::get(),
+               "DVR attempts blocked by main-thread resource ownership"),
+      ADD_STAT(dvrHelperIssueCycles, statistics::units::Count::get(),
+               "Cycles in which a residual DVR issue slot was consumed"),
       ADD_STAT(dvrDiscoveredInstructions, statistics::units::Count::get(),
                "Committed instructions recorded by completed discoveries"),
       ADD_STAT(dvrTaintedInstructions, statistics::units::Count::get(),
@@ -689,6 +693,7 @@ CPU::tick()
 
     ++baseStats.numCycles;
     updateCycleCounters(BaseCPU::CPU_STATE_ON);
+    dvrHelperIssuesThisCycle = 0;
 
 //    activity = false;
 
@@ -1538,6 +1543,19 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                                 dvrPendingNestedCandidate.address;
                             dvrNestedContext.stride =
                                 dvrPendingNestedCandidate.stride;
+                            // Seed the outer-invocation table with the
+                            // committed outer instance and adjacent
+                            // invocations.  Subsequent committed outer
+                            // candidates may replace these bases.
+                            dvrNestedContext.outerInvocationCount = 4;
+                            for (unsigned i = 0; i <
+                                     dvrNestedContext.outerInvocationCount;
+                                 ++i) {
+                                dvrNestedContext.outerInvocationBases[i] =
+                                    dvrNestedContext.triggerAddress +
+                                    dvrNestedContext.stride *
+                                    static_cast<int64_t>(i * 16);
+                            }
                             dvrNestedContext.taint.begin(inst);
                             dvrNestedContext.loopBound.begin(
                                 dvrNestedContext.triggerPC);
@@ -2072,10 +2090,20 @@ CPU::launchDVRNestedPrefetches(
         }
     }
 
-    startDVRHelper(dvrNestedContext.triggerPC, replay->count, lanes);
-    for (unsigned lane = 1; lane <= lanes; ++lane) {
+    const unsigned invocations = std::max(1u,
+        std::min<unsigned>(dvrNestedContext.outerInvocationCount, 8));
+    startDVRHelper(dvrNestedContext.triggerPC, replay->count,
+                   std::min<unsigned>(lanes * invocations,
+                                      DVRLanePredicateTracker::MaxLanes));
+    unsigned flat_lane = 0;
+    for (unsigned invocation = 0; invocation < invocations; ++invocation) {
+      const Addr base = dvrNestedContext.outerInvocationCount != 0 ?
+          dvrNestedContext.outerInvocationBases[invocation] :
+          dvrNestedContext.triggerAddress;
+      for (unsigned lane = 1; lane <= lanes && flat_lane <
+               DVRLanePredicateTracker::MaxLanes; ++lane, ++flat_lane) {
         DVRPrefetchAddress prefetch;
-        prefetch.address = dvrNestedContext.triggerAddress +
+        prefetch.address = base +
             dvrNestedContext.stride * lane;
         prefetch.pc = dvrNestedContext.triggerPC;
         prefetch.tid = dvrNestedContext.tid;
@@ -2091,6 +2119,7 @@ CPU::launchDVRNestedPrefetches(
         dvrPrefetchQueue.push_back(prefetch);
         ++cpuStats.dvrPrefetchesGenerated;
         ++cpuStats.dvrNestedHelpersGenerated;
+      }
     }
     updateDVRPrefetchQueuePeak();
 }
@@ -2183,6 +2212,10 @@ CPU::serviceDVRPrefetchQueue()
 {
     if (dvrPrefetchQueue.empty() || !dvrHelperThread.canIssue())
         return;
+    if (dvrHelperIssuesThisCycle >= DvrHelperIssueWidth) {
+        ++cpuStats.dvrResourceConflicts;
+        return;
+    }
 
     const auto prefetch = dvrPrefetchQueue.front();
     dvrPrefetchQueue.pop_front();
@@ -2243,6 +2276,8 @@ CPU::serviceDVRPrefetchQueue()
         return;
     }
     ++cpuStats.dvrPrefetchesIssued;
+    ++dvrHelperIssuesThisCycle;
+    ++cpuStats.dvrHelperIssueCycles;
     dvrHelperThread.issue();
     dvrQualityTracker.issued(
         reinterpret_cast<uintptr_t>(pkt), dvrPrefetchLine(req->getPaddr()),

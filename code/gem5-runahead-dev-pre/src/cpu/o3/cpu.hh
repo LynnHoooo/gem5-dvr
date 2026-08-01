@@ -678,6 +678,8 @@ class CPU : public BaseCPU
         statistics::Scalar dvrNDMOuterFound;
         statistics::Scalar dvrNDMFallbacks;
         statistics::Scalar dvrNDMTimeouts;
+        statistics::Scalar dvrResourceConflicts;
+        statistics::Scalar dvrHelperIssueCycles;
         statistics::Scalar dvrDiscoveredInstructions;
         statistics::Scalar dvrTaintedInstructions;
         statistics::Scalar dvrDependentLoads;
@@ -922,6 +924,10 @@ class CPU : public BaseCPU
 
         bool active() const { return state != State::Idle; }
     } dvrHelperThread;
+    // Main O3 stages run first every cycle.  Helpers may consume at most one
+    // residual issue/LSU slot after IEW has completed.
+    unsigned dvrHelperIssuesThisCycle = 0;
+    static constexpr unsigned DvrHelperIssueWidth = 1;
     std::deque<DVRPrefetchAddress> dvrPrefetchQueue;
     struct DVRAddressRelation
     {
@@ -953,6 +959,9 @@ class CPU : public BaseCPU
         InstSeqNum sequence = 0;
         Addr address = 0;
         int64_t stride = 0;
+        // Addresses of distinct outer-loop invocations collected by NDM.
+        std::array<Addr, 8> outerInvocationBases = {};
+        unsigned outerInvocationCount = 0;
     } dvrPendingNestedCandidate;
     DVRPendingNestedCandidate dvrCommittedNestedCandidate;
 
@@ -985,6 +994,8 @@ class CPU : public BaseCPU
             triggerPC = 0;
             triggerAddress = 0;
             stride = 0;
+            outerInvocationBases = {};
+            outerInvocationCount = 0;
             initiatingValue = 0;
             taint.reset();
             loopBound.reset();
