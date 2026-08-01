@@ -1585,19 +1585,12 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                                 dvrPendingNestedCandidate.address;
                             dvrNestedContext.stride =
                                 dvrPendingNestedCandidate.stride;
-                            // Seed the outer-invocation table with the
-                            // committed outer instance and adjacent
-                            // invocations.  Subsequent committed outer
-                            // candidates may replace these bases.
-                            dvrNestedContext.outerInvocationCount = 4;
-                            for (unsigned i = 0; i <
-                                     dvrNestedContext.outerInvocationCount;
-                                 ++i) {
-                                dvrNestedContext.outerInvocationBases[i] =
-                                    dvrNestedContext.triggerAddress +
-                                    dvrNestedContext.stride *
-                                    static_cast<int64_t>(i * 16);
-                            }
+                            // This table contains observed, committed dynamic
+                            // invocations only.  Do not manufacture adjacent
+                            // outer-loop bases from the learned stride.
+                            dvrNestedContext.outerInvocationCount = 1;
+                            dvrNestedContext.outerInvocationBases[0] =
+                                dvrNestedContext.triggerAddress;
                             dvrNestedContext.taint.begin(inst);
                             dvrNestedContext.loopBound.begin(
                                 dvrNestedContext.triggerPC);
@@ -2053,6 +2046,24 @@ CPU::completeDVRNestedContext(
 {
     if (!dvrNestedContext.active)
         return;
+
+    // The recurrence which closes the child is the next real invocation of
+    // its trigger.  Preserve that committed effective address as a distinct
+    // outer instance before flattening the collected invocations.
+    if (committing_inst->effAddrValid() &&
+        dvrNestedContext.outerInvocationCount <
+            dvrNestedContext.outerInvocationBases.size()) {
+        const Addr address = committing_inst->effAddr;
+        bool duplicate = false;
+        for (unsigned i = 0;
+             i < dvrNestedContext.outerInvocationCount; ++i) {
+            duplicate |= dvrNestedContext.outerInvocationBases[i] == address;
+        }
+        if (!duplicate) {
+            dvrNestedContext.outerInvocationBases[
+                dvrNestedContext.outerInvocationCount++] = address;
+        }
+    }
 
     const auto inference = dvrNestedContext.loopBound.infer(
         dvrNestedContext.startRegs, finish_regs, dvrMaxLanes);
@@ -2970,9 +2981,15 @@ CPU::observeDVRLoad(const DynInstPtr &inst, Addr address)
         if ((dvrDiscovery.isDiscovering() &&
              candidate->pc != dvrCurrentTriggerPC) ||
             dvrNestedDiscoveryMode.active()) {
-            dvrPendingNestedCandidate = {
-                true, candidate->pc, inst->seqNum,
-                candidate->address, candidate->stride};
+            // IEW can observe several younger loads before the oldest
+            // candidate reaches commit.  Retain that oldest candidate;
+            // replacing it here made the commit-side child trigger vanish.
+            if (!dvrPendingNestedCandidate.valid ||
+                inst->seqNum < dvrPendingNestedCandidate.sequence) {
+                dvrPendingNestedCandidate = {
+                    true, candidate->pc, inst->seqNum,
+                    candidate->address, candidate->stride};
+            }
         } else {
             dvrDiscovery.arm(*candidate, inst->seqNum);
         }
