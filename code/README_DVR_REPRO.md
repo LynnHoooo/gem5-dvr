@@ -863,3 +863,23 @@ export LIBRARY_PATH=/nix/store/61a1nwx3w6rqyaisj5rn1sal1981apm7-zlib-1.3.2/lib
 
 该组合已完成一次从空 `build/RISCV` 开始的完整构建并通过 Stage 15。若未来出现
 Python ABI 变化，必须重新清理 `build/RISCV`，不能复用其他 ABI 的生成物。
+
+### 11.2 residual resource model 验证结果
+
+提交 `1cea464d` 在 helper 发射前统计主线程实际执行的 issue、ALU 和 LSU 使用量，
+并增加 issue/ALU/LSU 三类 residual-budget conflict。服务器增量编译和 Stage 15
+通过：
+
+```text
+DVR_STAGE15_RESOURCE_PASSED cycles=2462727 helper_issue_cycles=9
+conflicts=0 issue_conflicts=0 alu_conflicts=0 lsu_conflicts=0
+main_issue=1656847 main_thread_suppressed=1 dvr_issued=9
+```
+
+同一二进制的 Stage 9 性能门槛没有通过：Baseline 和 DVR 均为 2462727 cycles，
+data misses 分别为 250819 和 250821。当前 helper 只发出 9 个请求，因此不能把该
+微基准写成性能收益。严格 L1D listener 的独立 tracker/event/predicate smoke 均通过；
+在 `dvr_dependent.riscv` workload 上观察到 9 issued/9 completed，但没有 DVR fill，
+所以 fill accuracy 和 timeliness 为 `nan`、coverage 为 0。该结果表明下一步必须先
+提高有效 helper traffic 并把 CPU issue/completion stream 与 L1D listener 合并，
+再运行正式消融，不能用此前的代理质量计数器替代。
