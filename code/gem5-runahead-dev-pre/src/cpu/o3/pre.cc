@@ -568,12 +568,6 @@ DVRVectorInstructionRegister::execute(
                 if (op.destination >= 0)
                     vectorRegs[op.destination][lane] = value;
                 ++active_in_chunk;
-                ++result.helperUops;
-                if (result.helperUops >= max_helper_uops) {
-                    result.timedOut = uop + 1 < program.size() ||
-                        lane + 1 < last;
-                    return result;
-                }
             }
             if (active_in_chunk == 0)
                 continue;
@@ -581,6 +575,15 @@ DVRVectorInstructionRegister::execute(
             executedChunks |= uint16_t(1) << chunk;
             ++result.chunkIssues;
             ++result.chunkExecutions;
+            // The helper budget is expressed in issued vector micro-ops.
+            // Charging once per scalar lane made every useful 128-lane
+            // program exceed a 200-uop budget before its first replay.
+            ++result.helperUops;
+            if (result.helperUops >= max_helper_uops) {
+                result.timedOut = uop + 1 < program.size() ||
+                    chunk + 1 < chunks;
+                return result;
+            }
         }
 
     }
