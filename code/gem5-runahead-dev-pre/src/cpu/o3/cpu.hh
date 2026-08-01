@@ -959,9 +959,6 @@ class CPU : public BaseCPU
         InstSeqNum sequence = 0;
         Addr address = 0;
         int64_t stride = 0;
-        // Addresses of distinct outer-loop invocations collected by NDM.
-        std::array<Addr, 8> outerInvocationBases = {};
-        unsigned outerInvocationCount = 0;
     } dvrPendingNestedCandidate;
     DVRPendingNestedCandidate dvrCommittedNestedCandidate;
 
@@ -985,6 +982,9 @@ class CPU : public BaseCPU
         DVRVectorRenameTable vrat;
         DVRVectorInstructionRegister vir;
         DVRLoopBoundDetector::RegisterSnapshot startRegs = {};
+        // Distinct outer-loop invocation bases collected by Nested DVR.
+        std::array<Addr, 8> outerInvocationBases = {};
+        unsigned outerInvocationCount = 0;
 
         void reset()
         {
