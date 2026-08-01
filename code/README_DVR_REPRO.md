@@ -883,3 +883,31 @@ data misses 分别为 250819 和 250821。当前 helper 只发出 9 个请求，
 所以 fill accuracy 和 timeliness 为 `nan`、coverage 为 0。该结果表明下一步必须先
 提高有效 helper traffic 并把 CPU issue/completion stream 与 L1D listener 合并，
 再运行正式消融，不能用此前的代理质量计数器替代。
+
+### 11.3 helper budget 修复与 Stage 9/quality 复验
+
+提交 `92d6e82b` 将 VIR 的 200-uop helper 预算从“每个 scalar lane 操作”改为
+“每个已发射 vector chunk uop”计费；提交 `188d4fea` 将 branch target、fall-through
+和 reconvergence PC 放回真正的 recorder `Uop`，而不是 stride-table entry。服务器
+复验结果：
+
+```text
+DVR_STAGE9_COMPARE_PASSED baseline_cycles=2462727 dvr_cycles=2462631
+speedup=1.000039 baseline_misses=250819 dvr_misses=215054
+miss_reduction_pct=14.26
+```
+
+helper timeout/suppression 均从 3874 降为 0，generated/issued 分别为
+300184/107725；资源模型观察到 48871 次冲突，其中 issue 9856、LSU 39015。
+
+真实 L1D listener 的 workload 结果：
+
+```text
+fills=18698 usefulTimely=14561 coveredMisses=13973 unusedEvictions=4123
+pollutionEvictions=8651 pollutionMisses=0 fillAccuracy=0.778746
+coverage=0.092193 averageLeadTime=179511.95 timeliness=1.000000
+```
+
+`timeliness=1.0` 仍需谨慎解释：cache fill/use stream 已接通，但 CPU issue stream
+尚未注入 listener，因此 `usefulLate=0`。其余 fill accuracy、coverage、lead time 和
+unused/pollution eviction 来自指定 L1D 的真实事件。
