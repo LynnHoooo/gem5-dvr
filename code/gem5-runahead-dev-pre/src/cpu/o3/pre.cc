@@ -490,6 +490,48 @@ DVRVectorInstructionRegister::execute(
     const unsigned chunks = (lanes + 15) / 16;
     result.activeLanes = lanes;
     for (unsigned uop = 0; uop < program.size(); ++uop) {
+        const auto &op = program[uop];
+
+        // Execute a conditional uop as a SIMT control-flow operation.  The
+        // recorder currently provides the predicate source and direction but
+        // not a full branch target/reconvergence PC, so the deferred path is
+        // restored at the end of this branch operation.  This still exercises
+        // the lane mask and reconvergence stack rather than fabricating a
+        // single scalar path.
+        bool restore_deferred = false;
+        if (op.conditional) {
+            std::array<uint64_t, 2> taken = {};
+            std::array<uint64_t, 2> deferred = {};
+            for (unsigned lane = 0; lane < lanes; ++lane) {
+                const uint64_t bit = uint64_t(1) << (lane % 64);
+                const auto word = lane / 64;
+                if (!(activeMask[word] & bit))
+                    continue;
+                const RegVal predicate = op.source0 >= 0 ?
+                    vectorRegs[op.source0][lane] : 0;
+                const bool value_taken = predicate != 0;
+                const bool lane_taken = value_taken == op.branchTaken;
+                (lane_taken ? taken : deferred)[word] |= bit;
+            }
+
+            const bool has_taken = taken[0] || taken[1];
+            const bool has_deferred = deferred[0] || deferred[1];
+            if (has_taken && has_deferred) {
+                if (stackDepth >= ReconvergenceEntries) {
+                    result.stackOverflow = true;
+                    return result;
+                }
+                stack[stackDepth++].deferredMask = deferred;
+                ++result.divergentBranches;
+                activeMask = taken;
+                restore_deferred = true;
+            } else if (has_deferred) {
+                activeMask = deferred;
+            } else {
+                activeMask = taken;
+            }
+        }
+
         for (unsigned chunk = 0; chunk < chunks; ++chunk) {
             unsigned active_in_chunk = 0;
             const unsigned first = chunk * 16;
@@ -499,7 +541,6 @@ DVRVectorInstructionRegister::execute(
                     continue;
                 RegVal lhs = 0;
                 RegVal rhs = 0;
-                const auto &op = program[uop];
                 if (op.source0 >= 0)
                     lhs = vectorRegs[op.source0][lane];
                 if (op.source1 >= 0)
@@ -523,6 +564,14 @@ DVRVectorInstructionRegister::execute(
             executedChunks |= uint16_t(1) << chunk;
             ++result.chunkIssues;
             ++result.chunkExecutions;
+        }
+
+        if (restore_deferred) {
+            const auto deferred = stack[stackDepth - 1].deferredMask;
+            activeMask[0] |= deferred[0];
+            activeMask[1] |= deferred[1];
+            --stackDepth;
+            ++result.reconvergences;
         }
     }
     return result;
