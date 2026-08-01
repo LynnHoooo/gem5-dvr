@@ -2329,10 +2329,20 @@ CPU::serviceDVRPrefetchQueue()
 
     const auto prefetch = dvrPrefetchQueue.front();
     dvrPrefetchQueue.pop_front();
+    constexpr unsigned SourceBytes = sizeof(RegVal);
+    const unsigned line_offset = prefetch.address & (cacheLineSize() - 1);
+    if (prefetch.source && line_offset + SourceBytes > cacheLineSize()) {
+        // The helper packet bypasses the architectural load-splitting path.
+        // Never consume a partial scalar as a trigger value.
+        ++cpuStats.dvrPrefetchesDropped;
+        retireDVRPredicateLane(prefetch.predicate, prefetch.lane, false);
+        return;
+    }
     Request::Flags flags;
     flags.set(Request::PREFETCH | Request::DVR_PREFETCH);
     RequestPtr req = std::make_shared<Request>(
-        prefetch.address, 8, flags, dataRequestorId(), prefetch.pc,
+        prefetch.address, prefetch.source ? SourceBytes : 1,
+        flags, dataRequestorId(), prefetch.pc,
         thread[prefetch.tid]->contextId());
     req->taskId(context_switch_task_id::Prefetcher);
 

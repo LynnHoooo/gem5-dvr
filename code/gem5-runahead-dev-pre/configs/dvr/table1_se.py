@@ -183,6 +183,10 @@ def main():
         ),
         fetchWidth=5, decodeWidth=5, renameWidth=5, dispatchWidth=5,
         issueWidth=5, wbWidth=5, commitWidth=5, squashWidth=5,
+        # Long graph workloads can return enough independent misses in one
+        # cycle to queue writebacks beyond gem5's default five future slots.
+        # This is transport storage only; wbWidth still limits retirement.
+        forwardComSize=64,
         numROBEntries=350, numIQEntries=128, LQEntries=128, SQEntries=72,
         numPhysIntRegs=256, numPhysFloatRegs=256, numPhysVecRegs=128,
         branchPred=TAGE_SC_L_8KB(), fuPool=DVRFUPool(),

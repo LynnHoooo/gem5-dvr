@@ -30,6 +30,7 @@
 
 #include "arch/riscv/linux/se_workload.hh"
 
+#include <cerrno>
 #include <sys/syscall.h>
 
 #include "arch/riscv/process.hh"
@@ -77,6 +78,18 @@ LinuxLoader linuxLoader;
 
 namespace RiscvISA
 {
+
+/**
+ * Newer RISC-V glibc probes ISA extensions and registers restartable
+ * sequences during static startup.  gem5 22 models neither optional ABI, so
+ * report the kernel-standard ENOSYS fallback instead of terminating SE mode
+ * before main().
+ */
+static SyscallReturn
+optionalKernelFeatureFunc(SyscallDesc *desc, ThreadContext *tc)
+{
+    return -ENOSYS;
+}
 
 void
 EmuLinux::syscall(ThreadContext *tc)
@@ -371,6 +384,7 @@ SyscallDescTable<SEWorkload::SyscallABI> EmuLinux::syscallDescs64 = {
     { 241,  "perf_event_open" },
     { 242,  "accept4" },
     { 243,  "recvmmsg" },
+    { 258,  "riscv_hwprobe", optionalKernelFeatureFunc },
     { 260,  "wait4", wait4Func<RiscvLinux64> },
     { 261,  "prlimit64", prlimitFunc<RiscvLinux64> },
     { 262,  "fanotify_init" },
@@ -399,6 +413,7 @@ SyscallDescTable<SEWorkload::SyscallABI> EmuLinux::syscallDescs64 = {
     { 285,  "copy_file_range" },
     { 286,  "preadv2" },
     { 287,  "pwritev2" },
+    { 293,  "rseq", optionalKernelFeatureFunc },
     { 1024, "open", openFunc<RiscvLinux64> },
     { 1025, "link", linkFunc },
     { 1026, "unlink", unlinkFunc },
@@ -710,6 +725,7 @@ SyscallDescTable<SEWorkload::SyscallABI> EmuLinux::syscallDescs32 = {
     { 241,  "perf_event_open" },
     { 242,  "accept4" },
     { 243,  "recvmmsg" },
+    { 258,  "riscv_hwprobe", optionalKernelFeatureFunc },
     { 260,  "wait4", wait4Func<RiscvLinux32> },
     { 261,  "prlimit64", prlimitFunc<RiscvLinux32> },
     { 262,  "fanotify_init" },
@@ -738,6 +754,7 @@ SyscallDescTable<SEWorkload::SyscallABI> EmuLinux::syscallDescs32 = {
     { 285,  "copy_file_range" },
     { 286,  "preadv2" },
     { 287,  "pwritev2" },
+    { 293,  "rseq", optionalKernelFeatureFunc },
     { 1024, "open", openFunc<RiscvLinux32> },
     { 1025, "link", linkFunc },
     { 1026, "unlink", unlinkFunc },

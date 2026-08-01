@@ -1019,3 +1019,54 @@ DVR_PREDICATE_SMOKE_PASSED
 
 至此“每个已完成 outer invocation 独立保存 inner bound 并参与 flatten”已验证；仍未
 完成的是 GAP workload 级性能验证，以及任意长、多分支 trigger-to-FLR 路径覆盖。
+
+## 14. GAP BFS scale-10 workload smoke
+
+脚本 `scripts/run_remote_dvr_gap_bfs_smoke.sh` 固定使用官方 GAPBS 提交
+`2972aeb2703165bafd921222f4ed7196f542d3a8`，以 GCC 15.2.0、`SERIAL=1` 和
+`-std=c++11 -O3 -static -fno-tree-vectorize` 构建 RV64GC BFS。ELF SHA-256：
+
+```text
+cc568ed7fb349ca3f927cc639d1df2cfd0aabd15a105f381fe798bec6cd83059
+```
+
+新 glibc 在静态启动时调用 `riscv_hwprobe(258)` 和 `rseq(293)`；gem5 22 原表缺少
+这两个入口。`se_workload.cc` 现在为二者返回 Linux 标准 `-ENOSYS`，使 glibc 使用
+非 hwprobe/rseq fallback，而不是伪报成功。长图 workload 还暴露默认 5-slot
+IEW→commit transport buffer 不足；Table-1 配置将 `forwardComSize` 增至 64，但
+`wbWidth=5`、issue/commit width 和其余核心资源不变。
+
+DVR helper 原来始终构造 8-byte Packet，未经过架构 load-splitting，跨 cache line
+时会触发 L1D 断言。现在 source helper 仅在完整 8 bytes 位于同一 line 时读取，跨线
+lane 安全终止；只需要 cache 副作用的 dependent `SoftPFReq` 使用 1-byte Packet。
+
+服务器命令：
+
+```bash
+bash ~/dvr-repro/scripts/run_remote_dvr_gap_bfs_smoke.sh
+```
+
+输入固定为 `-g 10 -n 1`，输出确认 1024 nodes、10496 undirected edges。结果：
+
+| Mode | Ticks | IPC | L1D demand misses | Helper issued | Conflicts | Nested batches |
+|---|---:|---:|---:|---:|---:|---:|
+| Baseline | 2741965500 | 0.929941 | 101921 | 0 | 0 | 0 |
+| Full DVR | 2730218500 | 0.933944 | 103505 | 274544 | 24749 | 0 |
+| Nested DVR | 2730218500 | 0.933944 | 103505 | 274544 | 24749 | 0 |
+
+Full 相对 Baseline 的 ticks 下降约 0.43%，但 demand misses 增加约 1.55%；quality
+listener 报告 fill accuracy 1.0、coverage 0.028553、timeliness 0.997672 和 678 次
+pollution eviction。图规模很小且未形成 Nested batch，因此这些数据只证明真实 GAP
+二进制、输入、统计和 DVR 路径可运行，不能作为性能收益或 Nested 有效性的结论。
+
+证据路径：
+
+```text
+~/dvr-repro/results/gap-bfs-s10/manifest.txt
+~/dvr-repro/results/gap-bfs-s10/summary.csv
+~/dvr-repro/results/gap-bfs-s10/{baseline,full,nested}/stdout.log
+```
+
+同一二进制随后通过 Stage15 和变长 Nested 数据面回归；后者仍得到非零
+`variable_lane_batches`。下一步是构建 bc/cc/pr/sssp，并选择超过 LLC、但仿真时间
+可接受的固定图输入，再执行六模式消融。
