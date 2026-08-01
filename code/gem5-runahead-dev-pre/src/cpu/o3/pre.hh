@@ -44,9 +44,6 @@ class DVRStrideDetector
     {
         bool valid = false;
         Addr pc = 0;
-        Addr branchTargetPC = 0;
-        Addr fallthroughPC = 0;
-        Addr reconvergencePC = 0;
         Addr lastAddress = 0;
         int64_t stride = 0;
         uint8_t confidence = 0;
@@ -158,6 +155,9 @@ class DVRInstructionRecorder
         };
 
         Addr pc = 0;
+        Addr branchTargetPC = 0;
+        Addr fallthroughPC = 0;
+        Addr reconvergencePC = 0;
         uint32_t intSources = 0;
         uint32_t intDestinations = 0;
         uint32_t encoding = 0;
