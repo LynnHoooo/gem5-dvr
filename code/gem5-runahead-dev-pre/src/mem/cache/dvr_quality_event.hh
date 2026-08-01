@@ -18,7 +18,7 @@ namespace gem5
  */
 struct DVRCacheQualityEvent
 {
-    enum class Kind { DemandLookup, Fill, Remove };
+    enum class Kind { Issue, Complete, DemandLookup, Fill, Remove };
     enum class Origin { Demand, DVR, OtherPrefetch };
 
     struct Victim

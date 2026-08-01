@@ -87,6 +87,7 @@ class DVRQualityTracker
     void generated() { ++counts.generated; }
     void issued(RequestId id, Line line, uint64_t bytes, Time now);
     void completed(RequestId id, Time now);
+    void completedLine(Line line, Time now);
     void dropped(RequestId id);
 
     /** Address-only observation; does not claim a cache hit or miss. */

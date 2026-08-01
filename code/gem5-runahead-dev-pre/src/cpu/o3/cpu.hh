@@ -674,6 +674,10 @@ class CPU : public BaseCPU
         statistics::Scalar dvrNestedReplayTargetsGenerated;
         statistics::Scalar dvrNestedReplayFallbacks;
         statistics::Scalar dvrNestedDependentGenerated;
+        statistics::Scalar dvrNestedFlattenBatches;
+        statistics::Scalar dvrNestedOuterInstances;
+        statistics::Scalar dvrNestedInnerLanes;
+        statistics::Scalar dvrNestedFlattenedLanes;
         statistics::Scalar dvrNDMAttempts;
         statistics::Scalar dvrNDMOuterFound;
         statistics::Scalar dvrNDMFallbacks;

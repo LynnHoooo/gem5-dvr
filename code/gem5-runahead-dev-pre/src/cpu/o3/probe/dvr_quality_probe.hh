@@ -52,6 +52,7 @@ class DVRQualityProbe : public ProbeListenerObject
     }
 
     DVRQualityTracker tracker;
+    DVRQualityTracker::RequestId nextRequestId = 1;
 
     struct DVRQualityProbeStats : public statistics::Group
     {
@@ -64,6 +65,8 @@ class DVRQualityProbe : public ProbeListenerObject
         const DVRQualityTracker &tracker;
 
         statistics::Scalar demandAccesses;
+        statistics::Scalar issued;
+        statistics::Scalar completed;
         statistics::Scalar actualDemandMisses;
         statistics::Scalar shadowDemandMisses;
         statistics::Scalar fills;

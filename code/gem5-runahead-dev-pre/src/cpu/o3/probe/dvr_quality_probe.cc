@@ -33,6 +33,14 @@ DVRQualityProbe::handleEvent(const DVRCacheQualityEvent &event)
     const auto now = static_cast<DVRQualityTracker::Time>(curTick());
 
     switch (event.kind) {
+      case DVRCacheQualityEvent::Kind::Issue:
+        tracker.issued(nextRequestId++, event.line, 0, now);
+        break;
+
+      case DVRCacheQualityEvent::Kind::Complete:
+        tracker.completedLine(event.line, now);
+        break;
+
       case DVRCacheQualityEvent::Kind::DemandLookup:
         tracker.demandLookup(event.line, event.hit, now);
         break;
@@ -52,6 +60,8 @@ DVRQualityProbe::handleEvent(const DVRCacheQualityEvent &event)
                                     toFillOrigin(event.victims[i].origin));
             }
         }
+        if (event.origin == DVRCacheQualityEvent::Origin::DVR)
+            tracker.completedLine(event.line, now);
         break;
 
       case DVRCacheQualityEvent::Kind::Remove:
@@ -66,6 +76,10 @@ DVRQualityProbe::DVRQualityProbeStats::DVRQualityProbeStats(
       tracker(_tracker),
       ADD_STAT(demandAccesses, statistics::units::Count::get(),
                "Demand tag lookups observed in the measured L1D"),
+      ADD_STAT(issued, statistics::units::Count::get(),
+               "DVR requests observed at the measured L1D"),
+      ADD_STAT(completed, statistics::units::Count::get(),
+               "DVR request lines completed at the measured L1D"),
       ADD_STAT(actualDemandMisses, statistics::units::Count::get(),
                "Demand lookups that actually missed"),
       ADD_STAT(shadowDemandMisses, statistics::units::Count::get(),
@@ -120,6 +134,8 @@ DVRQualityProbe::DVRQualityProbeStats::preDumpStats()
     // assign rather than accumulate.
     const auto &c = tracker.counters();
     demandAccesses = c.demandAccesses;
+    issued = c.issued;
+    completed = c.completed;
     actualDemandMisses = c.actualDemandMisses;
     shadowDemandMisses = c.shadowDemandMisses;
     fills = c.fills;

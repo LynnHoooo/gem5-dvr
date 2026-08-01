@@ -402,6 +402,12 @@ BaseCache::handleTimingReqMiss(PacketPtr pkt, MSHR *mshr, CacheBlk *blk,
 void
 BaseCache::recvTimingReq(PacketPtr pkt)
 {
+    if (pkt->req->isDVRPrefetch()) {
+        ppDVRQuality->notify(DVRQualityEvent{
+            DVRQualityEvent::Kind::Issue, pkt->getBlockAddr(blkSize),
+            pkt->req->requestorId(), false,
+            DVRQualityEvent::Origin::DVR, pkt->isSecure(), {}});
+    }
     // anything that is merely forwarded pays for the forward latency and
     // the delay provided by the crossbar
     Tick forward_time = clockEdge(forwardLatency) + pkt->headerDelay;
@@ -445,6 +451,12 @@ BaseCache::recvTimingReq(PacketPtr pkt)
     pkt->headerDelay = pkt->payloadDelay = 0;
 
     if (satisfied) {
+        if (pkt->req->isDVRPrefetch()) {
+            ppDVRQuality->notify(DVRQualityEvent{
+                DVRQualityEvent::Kind::Complete,
+                pkt->getBlockAddr(blkSize), pkt->req->requestorId(), true,
+                DVRQualityEvent::Origin::DVR, pkt->isSecure(), {}});
+        }
         if (!pkt->req->isDVRPrefetch() && !pkt->req->isPrefetch() &&
             pkt->isRequest() && (pkt->isRead() || pkt->isWrite())) {
             ppDVRQuality->notify(DVRQualityEvent{

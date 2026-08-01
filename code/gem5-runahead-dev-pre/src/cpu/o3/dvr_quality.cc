@@ -85,6 +85,17 @@ DVRQualityTracker::completed(RequestId id, Time now)
 }
 
 void
+DVRQualityTracker::completedLine(Line line, Time now)
+{
+    std::vector<RequestId> ids;
+    const auto range = outstandingByLine.equal_range(line);
+    for (auto it = range.first; it != range.second; ++it)
+        ids.push_back(it->second);
+    for (const auto id : ids)
+        completed(id, now);
+}
+
+void
 DVRQualityTracker::dropped(RequestId id)
 {
     auto it = outstanding.find(id);
