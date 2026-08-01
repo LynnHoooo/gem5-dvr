@@ -982,3 +982,40 @@ DVR_NESTED_DATA_PASSED
 batch 各 2 个真实 invocation、每批 128 个 inner lanes。该 smoke 证明真实动态地址
 已进入 `outer_instances × inner_lanes` flatten 路径，但还不是 GAP benchmark 的性能
 结论，也尚未证明每个 outer invocation 可拥有不同的独立 inner bound。
+
+### 13.1 逐 outer invocation 独立 inner bound
+
+提交 `3436d330` 修正了上一版仍然共享 inner bound 的问题：关闭 child 的 recurrence
+不再被提前计作一个“已完成”的 invocation；每次 child completion 只提交已经完整
+观察的 `base + innerLanes`，跨 completion 收集至少两个实例后才生成 Nested batch。
+`dvrNestedVariableLaneBatches` 只在同一 batch 中存在不同 lane count 时递增。
+
+新增 `dvr_nested_variable.c`，让动态 outer invocation 在 16/32 次 inner loop 间
+交替。服务器使用 2026-08-01 17:41 编译的 Python 3.11 ABI 二进制运行：
+
+```text
+ndm batches=0 outer_instances=0 inner_lanes=0 flattened_lanes=0
+nested batches=3 outer_instances=6 inner_lanes=768 flattened_lanes=384
+variable batches=5 outer_instances=10 inner_lanes=152 flattened_lanes=152
+         variable_lane_batches=5 generated=152 issued=218
+DVR_NESTED_DATA_PASSED
+```
+
+`ndm` 只有一个满足数据面条件的 child completion，因此严格语义下不能组合两个
+已完成 invocation；其零 batch 是预期结果，而不是再用未知 bound 制造假阳性。
+固定 256-inner workload 的每批总 lane 数超过 128，所以 768 个推断 inner lanes
+实际 flatten 为 384。变长 workload 中 5 批全部包含独立且不同的 bound，且未触及
+上限时 `flattened_lanes == inner_lanes == 152`。
+
+同一新二进制的非 Nested 回归也通过：
+
+```text
+DVR_STAGE15_RESOURCE_PASSED cycles=2462523 helper_issue_cycles=108851
+conflicts=47604 issue_conflicts=9352 alu_conflicts=0 lsu_conflicts=38252
+main_thread_suppressed=281494 dvr_issued=108851
+DVR_CACHE_QUALITY_EVENT_SMOKE_PASSED
+DVR_PREDICATE_SMOKE_PASSED
+```
+
+至此“每个已完成 outer invocation 独立保存 inner bound 并参与 flatten”已验证；仍未
+完成的是 GAP workload 级性能验证，以及任意长、多分支 trigger-to-FLR 路径覆盖。
