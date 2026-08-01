@@ -14,9 +14,13 @@ stats="$OUT/stats.txt"
 cycles="$(read_stat "$stats" system.cpu.numCycles)"
 issued="$(read_stat "$stats" system.cpu.dvrHelperIssueCycles)"
 conflicts="$(read_stat "$stats" system.cpu.dvrResourceConflicts)"
+issue_conflicts="$(read_stat "$stats" system.cpu.dvrIssueBudgetConflicts)"
+alu_conflicts="$(read_stat "$stats" system.cpu.dvrALUBudgetConflicts)"
+lsu_conflicts="$(read_stat "$stats" system.cpu.dvrLSUBudgetConflicts)"
+main_issue="$(read_stat "$stats" system.cpu.dvrMainIssueSlotsUsed)"
 main_suppress="$(read_stat "$stats" system.cpu.dvrPrefetchesSuppressedMainThread)"
 dvr_issued="$(read_stat "$stats" system.cpu.dvrPrefetchesIssued)"
-for pair in cycles:$cycles issued:$issued conflicts:$conflicts main_suppress:$main_suppress dvr_issued:$dvr_issued; do
+for pair in cycles:$cycles issued:$issued conflicts:$conflicts issue_conflicts:$issue_conflicts alu_conflicts:$alu_conflicts lsu_conflicts:$lsu_conflicts main_issue:$main_issue main_suppress:$main_suppress dvr_issued:$dvr_issued; do
   test -n "${pair#*:}"
 done
 if (( cycles <= 0 || issued <= 0 || dvr_issued <= 0 )); then
@@ -25,5 +29,6 @@ fi
 if (( issued > cycles )); then
   echo "error: helper issue cycles exceed CPU cycles" >&2; exit 1
 fi
-printf 'DVR_STAGE15_RESOURCE_PASSED cycles=%s helper_issue_cycles=%s conflicts=%s main_thread_suppressed=%s dvr_issued=%s\n' \
-  "$cycles" "$issued" "$conflicts" "$main_suppress" "$dvr_issued"
+printf 'DVR_STAGE15_RESOURCE_PASSED cycles=%s helper_issue_cycles=%s conflicts=%s issue_conflicts=%s alu_conflicts=%s lsu_conflicts=%s main_issue=%s main_thread_suppressed=%s dvr_issued=%s\n' \
+  "$cycles" "$issued" "$conflicts" "$issue_conflicts" "$alu_conflicts" \
+  "$lsu_conflicts" "$main_issue" "$main_suppress" "$dvr_issued"

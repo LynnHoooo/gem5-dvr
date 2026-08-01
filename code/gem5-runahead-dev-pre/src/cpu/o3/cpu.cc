@@ -162,6 +162,12 @@ CPU::CPU(const BaseO3CPUParams &params)
       dvrMaxLanes(params.dvrMaxLanes),
       dvrHelperMaxUops(params.dvrHelperMaxUops)
 {
+    dvrIssueWidth = params.issueWidth;
+    dvrFetchWidth = params.fetchWidth;
+    dvrDecodeWidth = params.decodeWidth;
+    // Table-1 has two load/store pipelines.  Demand memory operations consume
+    // these first; DVR may use only the residual capacity.
+    dvrLSUWidth = 2;
     fatal_if(FullSystem && params.numThreads > 1,
             "SMT is not supported in O3 in full system mode currently.");
 
@@ -485,8 +491,24 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "NDM control generations reaching the commit budget"),
       ADD_STAT(dvrResourceConflicts, statistics::units::Count::get(),
                "DVR attempts blocked by main-thread resource ownership"),
+      ADD_STAT(dvrIssueBudgetConflicts, statistics::units::Count::get(),
+               "DVR attempts blocked because no residual issue slot exists"),
+      ADD_STAT(dvrALUBudgetConflicts, statistics::units::Count::get(),
+               "DVR attempts blocked because address ALU capacity is full"),
+      ADD_STAT(dvrLSUBudgetConflicts, statistics::units::Count::get(),
+               "DVR attempts blocked because demand loads used all LSU slots"),
       ADD_STAT(dvrHelperIssueCycles, statistics::units::Count::get(),
                "Cycles in which a residual DVR issue slot was consumed"),
+      ADD_STAT(dvrMainIssueSlotsUsed, statistics::units::Count::get(),
+               "Demand instructions executed before DVR arbitration"),
+      ADD_STAT(dvrMainALUSlotsUsed, statistics::units::Count::get(),
+               "Demand non-memory instructions executed before DVR"),
+      ADD_STAT(dvrMainLSUSlotsUsed, statistics::units::Count::get(),
+               "Demand memory instructions executed before DVR"),
+      ADD_STAT(dvrFetchActiveCycles, statistics::units::Cycle::get(),
+               "Cycles with demand fetch activity"),
+      ADD_STAT(dvrDecodeActiveCycles, statistics::units::Cycle::get(),
+               "Cycles with demand decode activity"),
       ADD_STAT(dvrDiscoveredInstructions, statistics::units::Count::get(),
                "Committed instructions recorded by completed discoveries"),
       ADD_STAT(dvrTaintedInstructions, statistics::units::Count::get(),
@@ -694,6 +716,9 @@ CPU::tick()
     ++baseStats.numCycles;
     updateCycleCounters(BaseCPU::CPU_STATE_ON);
     dvrHelperIssuesThisCycle = 0;
+    dvrMainIssuesThisCycle = 0;
+    dvrMainALUIssuesThisCycle = 0;
+    dvrMainLSUIssuesThisCycle = 0;
 
 //    activity = false;
 
@@ -705,6 +730,14 @@ CPU::tick()
     rename.tick();
 
     iew.tick();
+
+    cpuStats.dvrMainIssueSlotsUsed += dvrMainIssuesThisCycle;
+    cpuStats.dvrMainALUSlotsUsed += dvrMainALUIssuesThisCycle;
+    cpuStats.dvrMainLSUSlotsUsed += dvrMainLSUIssuesThisCycle;
+    if (dvrMainIssuesThisCycle != 0) {
+        ++cpuStats.dvrFetchActiveCycles;
+        ++cpuStats.dvrDecodeActiveCycles;
+    }
 
     // The main thread gets the first opportunity to use the LSQ data port.
     // A DVR helper probes the port only after IEW has issued this cycle's
@@ -2214,6 +2247,22 @@ CPU::serviceDVRPrefetchQueue()
         return;
     if (dvrHelperIssuesThisCycle >= DvrHelperIssueWidth) {
         ++cpuStats.dvrResourceConflicts;
+        ++cpuStats.dvrIssueBudgetConflicts;
+        return;
+    }
+    if (dvrMainIssuesThisCycle + dvrHelperIssuesThisCycle >= dvrIssueWidth) {
+        ++cpuStats.dvrResourceConflicts;
+        ++cpuStats.dvrIssueBudgetConflicts;
+        return;
+    }
+    if (dvrMainALUIssuesThisCycle >= dvrIssueWidth) {
+        ++cpuStats.dvrResourceConflicts;
+        ++cpuStats.dvrALUBudgetConflicts;
+        return;
+    }
+    if (dvrMainLSUIssuesThisCycle >= dvrLSUWidth) {
+        ++cpuStats.dvrResourceConflicts;
+        ++cpuStats.dvrLSUBudgetConflicts;
         return;
     }
 

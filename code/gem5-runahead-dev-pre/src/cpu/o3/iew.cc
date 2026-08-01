@@ -1218,6 +1218,11 @@ IEW::executeInsts()
             continue;
         }
 
+        // Demand instructions own shared backend resources first.  The DVR
+        // helper observes only the residual issue/ALU/LSU budget later in the
+        // CPU tick, after IEW has completed.
+        cpu->recordDVRMainThreadIssue(inst->isMemRef());
+
         if (inst->isPRE()) {
             std::stringstream s;
 #define INST_IS(x) do { if (inst->is##x()) s << " " #x; } while (0)

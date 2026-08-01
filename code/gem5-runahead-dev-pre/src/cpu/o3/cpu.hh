@@ -679,7 +679,15 @@ class CPU : public BaseCPU
         statistics::Scalar dvrNDMFallbacks;
         statistics::Scalar dvrNDMTimeouts;
         statistics::Scalar dvrResourceConflicts;
+        statistics::Scalar dvrIssueBudgetConflicts;
+        statistics::Scalar dvrALUBudgetConflicts;
+        statistics::Scalar dvrLSUBudgetConflicts;
         statistics::Scalar dvrHelperIssueCycles;
+        statistics::Scalar dvrMainIssueSlotsUsed;
+        statistics::Scalar dvrMainALUSlotsUsed;
+        statistics::Scalar dvrMainLSUSlotsUsed;
+        statistics::Scalar dvrFetchActiveCycles;
+        statistics::Scalar dvrDecodeActiveCycles;
         statistics::Scalar dvrDiscoveredInstructions;
         statistics::Scalar dvrTaintedInstructions;
         statistics::Scalar dvrDependentLoads;
@@ -927,6 +935,13 @@ class CPU : public BaseCPU
     // Main O3 stages run first every cycle.  Helpers may consume at most one
     // residual issue/LSU slot after IEW has completed.
     unsigned dvrHelperIssuesThisCycle = 0;
+    unsigned dvrMainIssuesThisCycle = 0;
+    unsigned dvrMainALUIssuesThisCycle = 0;
+    unsigned dvrMainLSUIssuesThisCycle = 0;
+    unsigned dvrIssueWidth = 1;
+    unsigned dvrFetchWidth = 1;
+    unsigned dvrDecodeWidth = 1;
+    unsigned dvrLSUWidth = 1;
     static constexpr unsigned DvrHelperIssueWidth = 1;
     std::deque<DVRPrefetchAddress> dvrPrefetchQueue;
     struct DVRAddressRelation
@@ -1020,6 +1035,19 @@ class CPU : public BaseCPU
         unsigned lanes,
         const DVRLoopBoundDetector::RegisterSnapshot &finish_regs);
     void serviceDVRPrefetchQueue();
+
+  public:
+    /** IEW reports demand execution before the lower-priority helper runs. */
+    void recordDVRMainThreadIssue(bool memory)
+    {
+        ++dvrMainIssuesThisCycle;
+        if (memory)
+            ++dvrMainLSUIssuesThisCycle;
+        else
+            ++dvrMainALUIssuesThisCycle;
+    }
+
+  private:
     void startDVRHelper(Addr trigger_pc, unsigned program_uops,
                         unsigned lanes);
     Addr dvrPrefetchLine(Addr address) const;
