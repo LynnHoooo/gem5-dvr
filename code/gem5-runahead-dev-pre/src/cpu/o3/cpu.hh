@@ -678,6 +678,7 @@ class CPU : public BaseCPU
         statistics::Scalar dvrNestedOuterInstances;
         statistics::Scalar dvrNestedInnerLanes;
         statistics::Scalar dvrNestedFlattenedLanes;
+        statistics::Scalar dvrNestedVariableLaneBatches;
         statistics::Scalar dvrNDMAttempts;
         statistics::Scalar dvrNDMOuterFound;
         statistics::Scalar dvrNDMFallbacks;
@@ -1002,10 +1003,6 @@ class CPU : public BaseCPU
         DVRVectorRenameTable vrat;
         DVRVectorInstructionRegister vir;
         DVRLoopBoundDetector::RegisterSnapshot startRegs = {};
-        // Distinct outer-loop invocation bases collected by Nested DVR.
-        std::array<Addr, 8> outerInvocationBases = {};
-        unsigned outerInvocationCount = 0;
-
         void reset()
         {
             active = false;
@@ -1014,8 +1011,6 @@ class CPU : public BaseCPU
             triggerPC = 0;
             triggerAddress = 0;
             stride = 0;
-            outerInvocationBases = {};
-            outerInvocationCount = 0;
             initiatingValue = 0;
             taint.reset();
             loopBound.reset();
@@ -1025,6 +1020,27 @@ class CPU : public BaseCPU
             startRegs = {};
         }
     } dvrNestedContext;
+
+    /**
+     * Completed dynamic outer invocations waiting to be flattened.  An
+     * invocation is added only after its closing recurrence has committed,
+     * so every base has an independently inferred inner-lane count.
+     */
+    struct DVRNestedInvocationBatch
+    {
+        Addr triggerPC = 0;
+        std::array<Addr, 8> bases = {};
+        std::array<unsigned, 8> innerLanes = {};
+        unsigned count = 0;
+
+        void reset()
+        {
+            triggerPC = 0;
+            bases = {};
+            innerLanes = {};
+            count = 0;
+        }
+    } dvrNestedInvocationBatch;
 
     void captureDVRRegisterSnapshot(
         ThreadID tid, const DynInstPtr &committing_inst,
@@ -1039,7 +1055,6 @@ class CPU : public BaseCPU
         const DynInstPtr &committing_inst,
         const DVRLoopBoundDetector::RegisterSnapshot &finish_regs);
     void launchDVRNestedPrefetches(
-        unsigned lanes,
         const DVRLoopBoundDetector::RegisterSnapshot &finish_regs);
     void serviceDVRPrefetchQueue();
 

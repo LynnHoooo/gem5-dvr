@@ -490,6 +490,9 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Inner lanes inferred across nested flatten batches"),
       ADD_STAT(dvrNestedFlattenedLanes, statistics::units::Count::get(),
                "Actual flattened nested lanes, capped at 128 per batch"),
+      ADD_STAT(dvrNestedVariableLaneBatches,
+               statistics::units::Count::get(),
+               "Nested batches containing independently different bounds"),
       ADD_STAT(dvrNDMAttempts, statistics::units::Count::get(),
                "Completed short inner loops entering NDM control"),
       ADD_STAT(dvrNDMOuterFound, statistics::units::Count::get(),
@@ -1588,9 +1591,6 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                             // This table contains observed, committed dynamic
                             // invocations only.  Do not manufacture adjacent
                             // outer-loop bases from the learned stride.
-                            dvrNestedContext.outerInvocationCount = 1;
-                            dvrNestedContext.outerInvocationBases[0] =
-                                dvrNestedContext.triggerAddress;
                             dvrNestedContext.taint.begin(inst);
                             dvrNestedContext.loopBound.begin(
                                 dvrNestedContext.triggerPC);
@@ -2047,24 +2047,6 @@ CPU::completeDVRNestedContext(
     if (!dvrNestedContext.active)
         return;
 
-    // The recurrence which closes the child is the next real invocation of
-    // its trigger.  Preserve that committed effective address as a distinct
-    // outer instance before flattening the collected invocations.
-    if (committing_inst->effAddrValid() &&
-        dvrNestedContext.outerInvocationCount <
-            dvrNestedContext.outerInvocationBases.size()) {
-        const Addr address = committing_inst->effAddr;
-        bool duplicate = false;
-        for (unsigned i = 0;
-             i < dvrNestedContext.outerInvocationCount; ++i) {
-            duplicate |= dvrNestedContext.outerInvocationBases[i] == address;
-        }
-        if (!duplicate) {
-            dvrNestedContext.outerInvocationBases[
-                dvrNestedContext.outerInvocationCount++] = address;
-        }
-    }
-
     const auto inference = dvrNestedContext.loopBound.infer(
         dvrNestedContext.startRegs, finish_regs, dvrMaxLanes);
     bool helper_allowed = dvrNestedContext.recorder.size() > 1 &&
@@ -2081,8 +2063,25 @@ CPU::completeDVRNestedContext(
         helper_allowed = !vir_result.timedOut &&
             !vir_result.stackOverflow;
     }
-    if (helper_allowed && committing_inst->effAddrValid())
-        launchDVRNestedPrefetches(inference.lanes, finish_regs);
+    if (helper_allowed) {
+        if (dvrNestedInvocationBatch.triggerPC != 0 &&
+            dvrNestedInvocationBatch.triggerPC !=
+                dvrNestedContext.triggerPC) {
+            dvrNestedInvocationBatch.reset();
+        }
+        dvrNestedInvocationBatch.triggerPC = dvrNestedContext.triggerPC;
+        if (dvrNestedInvocationBatch.count <
+            dvrNestedInvocationBatch.bases.size()) {
+            const unsigned slot = dvrNestedInvocationBatch.count++;
+            dvrNestedInvocationBatch.bases[slot] =
+                dvrNestedContext.triggerAddress;
+            dvrNestedInvocationBatch.innerLanes[slot] = inference.lanes;
+        }
+        // A single completed invocation is not Nested DVR.  Wait until at
+        // least two independently bounded invocations can be combined.
+        if (dvrNestedInvocationBatch.count >= 2)
+            launchDVRNestedPrefetches(finish_regs);
+    }
 
     DPRINTF(O3CPU,
             "Nested DVR context complete id=%llu trigger=%#x flr=%#x "
@@ -2096,10 +2095,8 @@ CPU::completeDVRNestedContext(
 
 void
 CPU::launchDVRNestedPrefetches(
-    unsigned lanes,
     const DVRLoopBoundDetector::RegisterSnapshot &finish_regs)
 {
-    lanes = std::min(lanes, DVRLanePredicateTracker::MaxLanes);
     auto replay = std::make_shared<DVRReplayTemplate>();
     replay->count = 0;
     for (unsigned index = 1;
@@ -2165,22 +2162,38 @@ CPU::launchDVRNestedPrefetches(
         }
     }
 
-    const unsigned invocations = std::max(1u,
-        std::min<unsigned>(dvrNestedContext.outerInvocationCount, 8));
-    const unsigned flattened = std::min<unsigned>(lanes * invocations,
-        DVRLanePredicateTracker::MaxLanes);
+    const unsigned invocations = std::min<unsigned>(
+        dvrNestedInvocationBatch.count,
+        dvrNestedInvocationBatch.bases.size());
+    unsigned flattened = 0;
+    unsigned total_inner_lanes = 0;
+    bool variable_lanes = false;
+    for (unsigned invocation = 0; invocation < invocations; ++invocation) {
+        const unsigned invocation_lanes = std::min(
+            dvrNestedInvocationBatch.innerLanes[invocation],
+            DVRLanePredicateTracker::MaxLanes);
+        total_inner_lanes += invocation_lanes;
+        if (invocation != 0 && invocation_lanes !=
+            dvrNestedInvocationBatch.innerLanes[0]) {
+            variable_lanes = true;
+        }
+        flattened += std::min(invocation_lanes,
+            DVRLanePredicateTracker::MaxLanes - flattened);
+    }
     ++cpuStats.dvrNestedFlattenBatches;
     cpuStats.dvrNestedOuterInstances += invocations;
-    cpuStats.dvrNestedInnerLanes += lanes;
+    cpuStats.dvrNestedInnerLanes += total_inner_lanes;
     cpuStats.dvrNestedFlattenedLanes += flattened;
+    if (variable_lanes)
+        ++cpuStats.dvrNestedVariableLaneBatches;
     startDVRHelper(dvrNestedContext.triggerPC, replay->count,
                    flattened);
     unsigned flat_lane = 0;
     for (unsigned invocation = 0; invocation < invocations; ++invocation) {
-      const Addr base = dvrNestedContext.outerInvocationCount != 0 ?
-          dvrNestedContext.outerInvocationBases[invocation] :
-          dvrNestedContext.triggerAddress;
-      for (unsigned lane = 1; lane <= lanes && flat_lane <
+      const Addr base = dvrNestedInvocationBatch.bases[invocation];
+      const unsigned invocation_lanes =
+          dvrNestedInvocationBatch.innerLanes[invocation];
+      for (unsigned lane = 1; lane <= invocation_lanes && flat_lane <
                DVRLanePredicateTracker::MaxLanes; ++lane, ++flat_lane) {
         DVRPrefetchAddress prefetch;
         prefetch.address = base +
@@ -2201,6 +2214,7 @@ CPU::launchDVRNestedPrefetches(
         ++cpuStats.dvrNestedHelpersGenerated;
       }
     }
+    dvrNestedInvocationBatch.reset();
     updateDVRPrefetchQueuePeak();
 }
 

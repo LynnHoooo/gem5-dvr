@@ -13,19 +13,22 @@ run_one() {
         "$ROOT/configs/dvr/table1_se.py" --cmd="$ROOT/benchmarks/$bench" \
         --dvr --dvr-mode=nested
     local stats="$out/stats.txt"
-    local batches outer inner flat generated issued
+    local batches outer inner flat variable generated issued
     batches="$(read_stat "$stats" system.cpu.dvrNestedFlattenBatches)"
     outer="$(read_stat "$stats" system.cpu.dvrNestedOuterInstances)"
     inner="$(read_stat "$stats" system.cpu.dvrNestedInnerLanes)"
     flat="$(read_stat "$stats" system.cpu.dvrNestedFlattenedLanes)"
+    variable="$(read_stat "$stats" system.cpu.dvrNestedVariableLaneBatches)"
     generated="$(read_stat "$stats" system.cpu.dvrNestedHelpersGenerated)"
     issued="$(read_stat "$stats" system.cpu.dvrNestedHelpersIssued)"
-    printf '%s batches=%s outer_instances=%s inner_lanes=%s flattened_lanes=%s generated=%s issued=%s\n' \
-        "$name" "$batches" "$outer" "$inner" "$flat" "$generated" "$issued"
+    printf '%s batches=%s outer_instances=%s inner_lanes=%s flattened_lanes=%s variable_lane_batches=%s generated=%s issued=%s\n' \
+        "$name" "$batches" "$outer" "$inner" "$flat" "$variable" \
+        "$generated" "$issued"
     test "$batches" -gt 0
     test "$outer" -ge "$batches"
     test "$inner" -ge "$batches"
     test "$flat" -gt 0
+    test "$flat" -le "$inner"
     test "$flat" -le $((128 * batches))
     test "$generated" -ge "$flat"
 }
