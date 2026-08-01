@@ -911,3 +911,37 @@ coverage=0.092193 averageLeadTime=179511.95 timeliness=1.000000
 `timeliness=1.0` 仍需谨慎解释：cache fill/use stream 已接通，但 CPU issue stream
 尚未注入 listener，因此 `usefulLate=0`。其余 fill accuracy、coverage、lead time 和
 unused/pollution eviction 来自指定 L1D 的真实事件。
+
+## 12. 六组消融实验（服务器实测）
+
+提交 `c2dbe36e` 增加显式 `--dvr-mode`，避免用互不等价的参数冒充消融机制：
+
+- `vr`：只对稳定 stride 做 128-lane vector runahead，不进行依赖发现；
+- `offload`：动态 Discovery + 单 lane helper；
+- `discovery`：只运行 Discovery/VIR 分析，不发 helper；
+- `full`：Discovery + 128-lane helper，禁用 Nested controller；
+- `nested`：Full DVR + Nested controller/NDM。
+
+服务器命令：
+
+```bash
+bash ~/dvr-repro/scripts/run_remote_dvr_ablation.sh
+```
+
+结果路径：`~/dvr-repro/results/dvr-ablation/summary.csv`。在
+`dvr_dependent.riscv` 上的实测结果如下：
+
+| Mode | Cycles | IPC | Demand misses | Helper issued | Conflicts | Fill accuracy | Coverage | Pollution evictions |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Baseline | 2462727 | 0.545546 | 250819 | 0 | 0 | n/a | 0 | 0 |
+| PRE/VR-like | 2471851 | 0.543533 | 148911 | 413896 | 260565 | 0.438777 | 0.139764 | 10754 |
+| Offload | 2462727 | 0.545546 | 250819 | 1911 | 0 | n/a | 0 | 0 |
+| Discovery | 2462727 | 0.545546 | 250819 | 0 | 0 | n/a | 0 | 0 |
+| Full DVR | 2462631 | 0.545568 | 215054 | 107725 | 48871 | 0.778746 | 0.092193 | 8651 |
+| Nested DVR | 2462631 | 0.545568 | 215054 | 107725 | 48871 | 0.778746 | 0.092193 | 8651 |
+
+该微基准中 Full DVR 的 demand misses 下降 14.26%，cycles 只下降 96（约
+0.0039%）。VR-like 虽进一步降低 misses，但过量 helper traffic 和资源冲突使 cycles
+增加约 0.37%。Full 与 Nested 相同不是 Nested 已证明无效，而是该 dependent
+workload 没有形成可利用的 outer × inner 数据面；Nested 效果必须在 NDM/nested
+workload 和后续 GAP workload 上单独报告。
