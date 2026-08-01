@@ -19,6 +19,7 @@ cache_event_output=${TMPDIR:-/tmp}/dvr_cache_quality_event_smoke
   "${source_root}/src/mem/cache/dvr_quality_event_smoke.cc" \
   -o "${cache_event_output}"
 "${cache_event_output}"
+printf 'DVR_CACHE_QUALITY_EVENT_SMOKE_PASSED\n'
 
 "${compiler}" -std=c++17 -Wall -Wextra -Werror \
   -I "${source_root}/src" \

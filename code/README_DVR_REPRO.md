@@ -248,8 +248,9 @@ Nested 专用验收：
 ~/dvr-repro/scripts/run_remote_dvr_stage13_nested.sh
 ```
 
-当前证据为 `contexts=440, programs=2, vrat=80, vir=80,
-generated/issued/completed=256/251/251`。child 独立持有 taint、recorder、
+服务器最新证据为 `contexts=440, programs=2, vrat=80, vir=80,
+generated/issued/completed=256/251/251`，并且真实 child replay 为
+`attempts=210, targets=210, fallbacks=0, nested_dependent=210`。child 独立持有 taint、recorder、
 loop-bound、register snapshots、VRAT、VIR 和 replay template；relation predictor
 与物理 helper queue 仍由 root/child 共享。
 
@@ -257,8 +258,16 @@ loop-bound、register snapshots、VRAT、VIR 和 replay template；relation pred
 
 ```text
 DVR_REGRESSION_PASSED quick=0
-summary=/home/lynnhoo/dvr-repro/results/dvr-regression-logs/20260730T102004Z.summary
+summary=/home/lynnhoo/dvr-repro/results/dvr-regression-logs/20260730T151859Z.summary
 ```
+
+随后在服务器单独验证了 Stage 14 的缓存质量事件接口：
+
+```text
+DVR_CACHE_QUALITY_EVENT_SMOKE_PASSED
+```
+这只验证事件载荷、origin 三态和多 victim 传递；尚未宣称 workload 级
+accuracy/coverage/timeliness/pollution 已接入。
 
 因此当前不能写“faithfully reproduce the DVR paper”。推荐表述：
 
