@@ -908,9 +908,8 @@ pollutionEvictions=8651 pollutionMisses=0 fillAccuracy=0.778746
 coverage=0.092193 averageLeadTime=179511.95 timeliness=1.000000
 ```
 
-`timeliness=1.0` 仍需谨慎解释：cache fill/use stream 已接通，但 CPU issue stream
-尚未注入 listener，因此 `usefulLate=0`。其余 fill accuracy、coverage、lead time 和
-unused/pollution eviction 来自指定 L1D 的真实事件。
+这里的 `timeliness=1.0` 是接通 issue/completion 生命周期之前的旧结果，已由
+第 13 节的新验证取代；不能继续把它作为最终及时性数据引用。
 
 ## 12. 六组消融实验（服务器实测）
 
@@ -945,3 +944,41 @@ bash ~/dvr-repro/scripts/run_remote_dvr_ablation.sh
 增加约 0.37%。Full 与 Nested 相同不是 Nested 已证明无效，而是该 dependent
 workload 没有形成可利用的 outer × inner 数据面；Nested 效果必须在 NDM/nested
 workload 和后续 GAP workload 上单独报告。
+
+## 13. Quality 生命周期与 Nested 数据面验证
+
+提交 `bef3f354` 为 L1D quality listener 增加 DVR request 的 Issue/Complete 事件，
+并按 cache line 完成 outstanding request；因此 demand miss 可以区分 fill 后使用的
+`usefulTimely` 和请求尚未完成时发生的 `usefulLate`。服务器在
+`dvr_dependent.riscv` 上的结果为：
+
+```text
+issued=107725 completed=105962 fills=18698
+usefulTimely=13973 usefulLate=36790
+fillAccuracy=0.747299 coverage=0.092193 timeliness=0.275260
+```
+
+`completed < issued` 表示模拟结束时仍可能存在未观察到 hit/fill completion 的请求，
+不能把两者差值解释成有用或无用请求。关键验证点是 `usefulLate` 已不再恒为零，且
+timeliness 由真实 issue/fill/demand 时序计算。
+
+提交 `cdd26cd8` 修复单一 speculative nested-candidate 槽被年轻 load 覆盖的问题，
+并删除通过 `trigger + stride × i × 16` 合成四个 outer base 的近似。Nested context
+现在只保存实际提交的首次 trigger 地址和关闭该 child 的 recurrence 地址。运行：
+
+```bash
+bash ~/dvr-repro/scripts/run_remote_dvr_nested_data_smoke.sh
+```
+
+2026-08-01 固定 Python 3.11 ABI 二进制的服务器实测：
+
+```text
+ndm batches=1 outer_instances=2 inner_lanes=15 flattened_lanes=30 generated=30 issued=60
+nested batches=4 outer_instances=8 inner_lanes=512 flattened_lanes=512 generated=512 issued=145
+DVR_NESTED_DATA_PASSED
+```
+
+每个 batch 的 flattened lane 数受 128-lane 上限约束；`nested` 的累计值为 4 个
+batch 各 2 个真实 invocation、每批 128 个 inner lanes。该 smoke 证明真实动态地址
+已进入 `outer_instances × inner_lanes` flatten 路径，但还不是 GAP benchmark 的性能
+结论，也尚未证明每个 outer invocation 可拥有不同的独立 inner bound。
