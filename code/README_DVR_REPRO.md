@@ -1070,3 +1070,31 @@ pollution eviction。图规模很小且未形成 Nested batch，因此这些数�
 同一二进制随后通过 Stage15 和变长 Nested 数据面回归；后者仍得到非零
 `variable_lane_batches`。下一步是构建 bc/cc/pr/sssp，并选择超过 LLC、但仿真时间
 可接受的固定图输入，再执行六模式消融。
+
+### 14.1 GAP 五 workload 的三模式流程验证
+
+同一固定 GAPBS 提交、编译器、`-g 10 -n 1` 输入和新 gem5 二进制完成了
+BC/BFS/CC/PR/SSSP 的 Baseline、Full、Nested 共 15 次全程序运行。校验脚本：
+
+```bash
+bash ~/dvr-repro/scripts/collect_remote_dvr_gap5_smoke.sh
+```
+
+汇总位于 `~/dvr-repro/results/gap5-s10/summary.csv`，并通过
+`DVR_GAP5_S10_RESULTS_VALIDATED`。关键结果：
+
+| Workload | Baseline ticks | Full ticks | Nested ticks | Baseline misses | Full misses | Nested batches/outer/lanes |
+|---|---:|---:|---:|---:|---:|---:|
+| BC | 2886148250 | 2874269250 | 2875078250 | 114667 | 119356 | 57 / 114 / 2702 |
+| BFS | 2741965500 | 2730218500 | 2730218500 | 101921 | 103505 | 0 / 0 / 0 |
+| CC | 2722113750 | 2709197750 | 2709197750 | 100814 | 102885 | 10 / 20 / 1280 |
+| PR | 3122066000 | 3107696000 | 3108382000 | 145919 | 169727 | 4283 / 8566 / 285973 |
+| SSSP | 3308999500 | 3248807250 | 3248902250 | 224112 | 230784 | 15 / 30 / 320 |
+
+Full 在五个 scale-10 workload 上的 ticks 均低于 Baseline，幅度约 0.4%–1.9%，但
+L1D demand misses 也均增加；这说明当前小图收益不能解释为 miss reduction，可能来自
+执行时序变化，必须结合更大图、MLP 和带宽统计再判断。Nested 在 BC/CC/PR/SSSP
+形成真实 batch，其中 PR 的 Nested traffic 明显增加且略慢于 Full；BFS 未触发。
+
+这仍是三模式流程验证，不是论文要求的六模式正式消融。下一步必须运行 VR-like、
+Offload、Discovery，并把图规模提高到能够超过 LLC，同时控制仿真时间。
