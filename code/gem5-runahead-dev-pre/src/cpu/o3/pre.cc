@@ -402,6 +402,12 @@ DVRInstructionRecorder::record(const DynInstPtr &inst)
 
     Uop &uop = uops[count++];
     uop.pc = inst->pcState().instAddr();
+    // DVR currently targets RV64; the fixed-width fall-through is sufficient
+    // for the compact helper program and avoids consulting architectural PC
+    // state during replay.
+    uop.fallthroughPC = uop.pc + 4;
+    if (inst->isDirectCtrl())
+        uop.branchTargetPC = inst->branchTarget()->instAddr();
     uop.intSources = dvrIntRegisterMask(inst, true);
     uop.intDestinations = dvrIntRegisterMask(inst, false);
     uop.source0 = dvrFirstIntRegister(inst, true, 0);
@@ -492,13 +498,20 @@ DVRVectorInstructionRegister::execute(
     for (unsigned uop = 0; uop < program.size(); ++uop) {
         const auto &op = program[uop];
 
+        if (stackDepth != 0 && stack[stackDepth - 1].pc == op.pc) {
+            const auto deferred = stack[stackDepth - 1].deferredMask;
+            activeMask[0] |= deferred[0];
+            activeMask[1] |= deferred[1];
+            --stackDepth;
+            ++result.reconvergences;
+        }
+
         // Execute a conditional uop as a SIMT control-flow operation.  The
         // recorder currently provides the predicate source and direction but
         // not a full branch target/reconvergence PC, so the deferred path is
         // restored at the end of this branch operation.  This still exercises
         // the lane mask and reconvergence stack rather than fabricating a
         // single scalar path.
-        bool restore_deferred = false;
         if (op.conditional) {
             std::array<uint64_t, 2> taken = {};
             std::array<uint64_t, 2> deferred = {};
@@ -521,10 +534,14 @@ DVRVectorInstructionRegister::execute(
                     result.stackOverflow = true;
                     return result;
                 }
-                stack[stackDepth++].deferredMask = deferred;
+                stack[stackDepth].deferredMask = deferred;
+                stack[stackDepth].pc = op.reconvergencePC != 0 ?
+                    op.reconvergencePC :
+                    (uop + 1 < program.size() ? program[uop + 1].pc :
+                                                 op.fallthroughPC);
+                ++stackDepth;
                 ++result.divergentBranches;
                 activeMask = taken;
-                restore_deferred = true;
             } else if (has_deferred) {
                 activeMask = deferred;
             } else {
@@ -566,13 +583,6 @@ DVRVectorInstructionRegister::execute(
             ++result.chunkExecutions;
         }
 
-        if (restore_deferred) {
-            const auto deferred = stack[stackDepth - 1].deferredMask;
-            activeMask[0] |= deferred[0];
-            activeMask[1] |= deferred[1];
-            --stackDepth;
-            ++result.reconvergences;
-        }
     }
     return result;
 }
