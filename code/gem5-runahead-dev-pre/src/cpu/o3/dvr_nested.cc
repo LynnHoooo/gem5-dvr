@@ -152,7 +152,8 @@ DVRNestedDiscoveryMode::Result
 DVRNestedDiscoveryMode::snapshot(Event event) const
 {
     return {event, currentState, innerLoadPC, increment, innerLanes,
-            outerLoadPC, outerAddress, outerStride, committedInstructions};
+            outerLoadPC, outerAddress, outerStride, committedInstructions,
+            control};
 }
 
 DVRNestedDiscoveryMode::Result
@@ -169,8 +170,81 @@ DVRNestedDiscoveryMode::start(
     innerLoadPC = inner_load_pc;
     increment = loop_increment;
     innerLanes = inner_lanes;
+    control = {};
+    control.inductionIncrement = loop_increment;
     ++counters.attempts;
     return snapshot(Event::Started);
+}
+
+void
+DVRNestedDiscoveryMode::captureLoopRegisters(
+    int8_t induction_register, int8_t bound_register,
+    RegVal induction_value, RegVal bound_value,
+    uint64_t remaining_iterations)
+{
+    if (!active())
+        return;
+    control.inductionRegister = induction_register;
+    control.boundRegister = bound_register;
+    control.inductionValue = induction_value;
+    control.boundValue = bound_value;
+    control.remainingIterations = remaining_iterations;
+    control.inductionIncrement = increment;
+    if (induction_register >= 0)
+        ++counters.ilrCaptures;
+    if (bound_register >= 0)
+        ++counters.lcrCaptures;
+}
+
+bool
+DVRNestedDiscoveryMode::observeInnerBranch(
+    Addr branch_pc, Addr branch_target, Addr fallthrough_pc, bool taken)
+{
+    if (!active() || branch_pc == 0 || branch_target >= branch_pc)
+        return false;
+    if (control.valid)
+        return false;
+
+    control.innerBranchPC = branch_pc;
+    control.innerBranchTarget = branch_target;
+    control.innerFallthrough = fallthrough_pc;
+    // NDM executes the loop body once more, then redirects the helper to the
+    // outer-loop search path.  The recorded direction is retained for
+    // auditing; the inverted branch is independent of the main-thread
+    // predictor outcome.
+    control.branchTaken = taken;
+    control.branchInverted = true;
+    control.reconvergencePC = fallthrough_pc;
+    control.valid = true;
+    ++counters.irCaptures;
+    ++counters.branchInversions;
+    return true;
+}
+
+bool
+DVRNestedDiscoveryMode::recordOuterInvocation(Addr base, unsigned lanes)
+{
+    if (currentState != State::OuterFound || base == 0 || lanes == 0)
+        return false;
+    ++counters.outerInvocations;
+    if (invocationCount < MaxOuterInvocations) {
+        invocationBases[invocationCount] = base;
+        invocationLanes[invocationCount] = lanes;
+        ++invocationCount;
+    }
+    // NDM needs at least two distinct outer invocations before flattening;
+    // the CPU-side invocation batch remains bounded by the same eight-entry
+    // hardware structure.
+    if (invocationCount >= 2)
+        currentState = State::Vectorizing;
+    return true;
+}
+
+void
+DVRNestedDiscoveryMode::finishVectorization()
+{
+    if (currentState == State::Vectorizing)
+        reset();
 }
 
 DVRNestedDiscoveryMode::Result
@@ -230,6 +304,10 @@ DVRNestedDiscoveryMode::reset()
     outerLoadPC = 0;
     outerAddress = 0;
     outerStride = 0;
+    invocationBases = {};
+    invocationLanes = {};
+    invocationCount = 0;
+    control = {};
 }
 
 void

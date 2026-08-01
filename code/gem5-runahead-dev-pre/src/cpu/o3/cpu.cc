@@ -448,6 +448,8 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "因指令数上限结束的 DVR 发现阶段数"),
       ADD_STAT(dvrDiscoveryAbandons, statistics::units::Count::get(),
                "DVR armed triggers discarded after speculative squash"),
+      ADD_STAT(dvrDiscoveryRollbacks, statistics::units::Count::get(),
+               "Discovery checkpoints discarded by an O3 squash"),
       ADD_STAT(dvrNestedRootStarts, statistics::units::Count::get(),
                "Root discoveries mirrored into the nested controller"),
       ADD_STAT(dvrNestedStarts, statistics::units::Count::get(),
@@ -502,6 +504,16 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "NDM control generations returning to ordinary inner DVR"),
       ADD_STAT(dvrNDMTimeouts, statistics::units::Count::get(),
                "NDM control generations reaching the commit budget"),
+      ADD_STAT(dvrNDMBranchInversions, statistics::units::Count::get(),
+               "NDM inner backward branches inverted for outer search"),
+      ADD_STAT(dvrNDMIRCaptures, statistics::units::Count::get(),
+               "NDM instruction-register branch captures"),
+      ADD_STAT(dvrNDMILRCaptures, statistics::units::Count::get(),
+               "NDM inner-loop-register captures"),
+      ADD_STAT(dvrNDMLCRCaptures, statistics::units::Count::get(),
+               "NDM loop-control-register captures"),
+      ADD_STAT(dvrNDMOuterInvocations, statistics::units::Count::get(),
+               "NDM outer invocations accepted after branch inversion"),
       ADD_STAT(dvrResourceConflicts, statistics::units::Count::get(),
                "DVR attempts blocked by main-thread resource ownership"),
       ADD_STAT(dvrIssueBudgetConflicts, statistics::units::Count::get(),
@@ -512,6 +524,12 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "DVR attempts blocked because demand loads used all LSU slots"),
       ADD_STAT(dvrHelperIssueCycles, statistics::units::Count::get(),
                "Cycles in which a residual DVR issue slot was consumed"),
+      ADD_STAT(dvrHelperFetchCycles, statistics::units::Cycle::get(),
+               "Cycles in which the DVR helper fetched captured uops"),
+      ADD_STAT(dvrHelperDecodeCycles, statistics::units::Cycle::get(),
+               "Cycles in which the DVR helper decoded captured uops"),
+      ADD_STAT(dvrHelperReadyUops, statistics::units::Count::get(),
+               "Captured helper uops made ready for issue"),
       ADD_STAT(dvrMainIssueSlotsUsed, statistics::units::Count::get(),
                "Demand instructions executed before DVR arbitration"),
       ADD_STAT(dvrMainALUSlotsUsed, statistics::units::Count::get(),
@@ -743,6 +761,21 @@ CPU::tick()
     rename.tick();
 
     iew.tick();
+
+    // The helper has an independent front-end.  It advances after the
+    // demand pipeline so the main thread retains priority for shared
+    // fetch/decode/issue resources, while its own ready queue is visible to
+    // the residual issue arbitration below.
+    const unsigned helper_frontend_work =
+        dvrHelperThread.advanceFrontend(dvrFetchWidth, dvrDecodeWidth);
+    if (helper_frontend_work != 0) {
+        if (dvrHelperThread.fetchRemaining != 0 ||
+            dvrHelperThread.decodeRemaining != 0)
+            ++cpuStats.dvrHelperFetchCycles;
+        if (dvrHelperThread.readyUops != 0)
+            ++cpuStats.dvrHelperDecodeCycles;
+        cpuStats.dvrHelperReadyUops += dvrHelperThread.readyUops;
+    }
 
     cpuStats.dvrMainIssueSlotsUsed += dvrMainIssuesThisCycle;
     cpuStats.dvrMainALUSlotsUsed += dvrMainALUIssuesThisCycle;
@@ -1554,6 +1587,24 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
             const auto nested_result = dvrNestedController.observeCommit(
                 inst->pcState().instAddr(), inst->seqNum);
             const auto ndm_result = dvrNestedDiscoveryMode.observeCommit();
+            if (dvrNestedDiscoveryMode.active() && inst->isCondCtrl() &&
+                inst->isDirectCtrl()) {
+                const bool captured =
+                    dvrNestedDiscoveryMode.observeInnerBranch(
+                        inst->pcState().instAddr(),
+                        inst->branchTarget()->instAddr(),
+                        // The generic PCState interface does not expose the
+                        // ISA-specific npc accessor.  RV64C is decoded into
+                        // the recorder with a fixed-width fall-through, so
+                        // use the same conservative architectural next-PC
+                        // model for the NDM control record.
+                        inst->pcState().instAddr() + 4,
+                        inst->pcState().branching());
+                if (captured) {
+                    ++cpuStats.dvrNDMBranchInversions;
+                    ++cpuStats.dvrNDMIRCaptures;
+                }
+            }
             if (was_discovering &&
                 inst->seqNum == dvrDiscovery.triggerSeq()) {
                 for (int dest = 0; dest < inst->numDestRegs(); ++dest) {
@@ -1602,9 +1653,16 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                     if (ndm_outer.event ==
                         DVRNestedDiscoveryMode::Event::OuterAccepted) {
                         ++cpuStats.dvrNDMOuterFound;
-                        if (dvrNestedDiscoveryMode.fallback().event ==
-                            DVRNestedDiscoveryMode::Event::Fallback) {
-                            ++cpuStats.dvrNDMFallbacks;
+                        // The outer stride is committed before the child
+                        // context begins.  NDM can therefore place this
+                        // invocation in its outer plan immediately, using
+                        // the bound captured from the short inner loop;
+                        // helper completion is still responsible for
+                        // launching the flattened requests.
+                        if (dvrNestedDiscoveryMode.recordOuterInvocation(
+                                dvrPendingNestedCandidate.address,
+                                dvrNestedDiscoveryMode.innerLaneCount())) {
+                            ++cpuStats.dvrNDMOuterInvocations;
                         }
                     }
                 }
@@ -1702,7 +1760,12 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 dvrTaintTracker.begin(inst);
                 dvrLoopBoundDetector.begin(result.triggerPC);
                 dvrInstructionRecorder.begin(inst);
-                dvrNestedDiscoveryMode.reset();
+                // NDM is an outer-loop generation and may span several
+                // ordinary discovery generations.  Starting the next
+                // dispatch-time Discovery must not erase its captured
+                // IR/ILR/LCR or outer-invocation plan.
+                if (!dvrNestedDiscoveryMode.active())
+                    dvrNestedDiscoveryMode.reset();
                 dvrCommittedNestedCandidate = {};
                 dvrCurrentTriggerPC = result.triggerPC;
                 dvrInitiatingLoadValue = 0;
@@ -1736,6 +1799,34 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 if (ndm_started.event ==
                     DVRNestedDiscoveryMode::Event::Started) {
                     ++cpuStats.dvrNDMAttempts;
+                    int8_t induction_reg = -1;
+                    int8_t bound_reg = -1;
+                    RegVal induction_value = 0;
+                    RegVal bound_value = 0;
+                    if (dvrLoopBoundDetector.boundSource0Reg() >= 0 &&
+                        dvrLoopBoundDetector.boundSource1Reg() >= 0) {
+                        const unsigned source0 =
+                            dvrLoopBoundDetector.boundSource0Reg();
+                        const unsigned source1 =
+                            dvrLoopBoundDetector.boundSource1Reg();
+                        if (dvrDiscoveryStartRegs[source0] ==
+                            finish_regs[source0]) {
+                            bound_reg = static_cast<int8_t>(source0);
+                            induction_reg = static_cast<int8_t>(source1);
+                        } else {
+                            bound_reg = static_cast<int8_t>(source1);
+                            induction_reg = static_cast<int8_t>(source0);
+                        }
+                        bound_value = finish_regs[bound_reg];
+                        induction_value = finish_regs[induction_reg];
+                    }
+                    dvrNestedDiscoveryMode.captureLoopRegisters(
+                        induction_reg, bound_reg, induction_value,
+                        bound_value, inference.remaining);
+                    if (induction_reg >= 0)
+                        ++cpuStats.dvrNDMILRCaptures;
+                    if (bound_reg >= 0)
+                        ++cpuStats.dvrNDMLCRCaptures;
                     if (dvrCommittedNestedCandidate.valid) {
                         const auto ndm_outer =
                             dvrNestedDiscoveryMode.acceptOuter(
@@ -1745,10 +1836,6 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                         if (ndm_outer.event ==
                             DVRNestedDiscoveryMode::Event::OuterAccepted) {
                             ++cpuStats.dvrNDMOuterFound;
-                            if (dvrNestedDiscoveryMode.fallback().event ==
-                                DVRNestedDiscoveryMode::Event::Fallback) {
-                                ++cpuStats.dvrNDMFallbacks;
-                            }
                         }
                     }
                 }
@@ -1760,6 +1847,8 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                     ++cpuStats.dvrLoopBoundFallbacks;
                 cpuStats.dvrRecordedUops += dvrInstructionRecorder.size();
                 bool helper_allowed = dvrMode != "discovery" &&
+                                      inference.matched &&
+                                      inference.lanes != 0 &&
                                       dvrInstructionRecorder.size() > 1 &&
                                       dvrTaintTracker.flr() != 0 &&
                                       !dvrInstructionRecorder.overflow();
@@ -1780,6 +1869,10 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                         vir_result.chunkIssues;
                     cpuStats.dvrVIRChunkExecutions +=
                         vir_result.chunkExecutions;
+                    cpuStats.dvrDivergentBranches +=
+                        vir_result.divergentBranches;
+                    cpuStats.dvrReconvergences +=
+                        vir_result.reconvergences;
                     if (vir_result.timedOut) {
                         ++cpuStats.dvrHelperTimeouts;
                         helper_allowed = false;
@@ -1835,7 +1928,8 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 dvrTaintTracker.reset();
                 dvrLoopBoundDetector.reset();
                 dvrInstructionRecorder.reset();
-                dvrNestedDiscoveryMode.reset();
+                if (!dvrNestedDiscoveryMode.active())
+                    dvrNestedDiscoveryMode.reset();
                 dvrCommittedNestedCandidate = {};
                 if (dvrNestedController.active()) {
                     ++cpuStats.dvrNestedParentResets;
@@ -1848,7 +1942,8 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 dvrTaintTracker.reset();
                 dvrLoopBoundDetector.reset();
                 dvrInstructionRecorder.reset();
-                dvrNestedDiscoveryMode.reset();
+                if (!dvrNestedDiscoveryMode.active())
+                    dvrNestedDiscoveryMode.reset();
                 dvrCommittedNestedCandidate = {};
                 if (dvrNestedController.active()) {
                     ++cpuStats.dvrNestedParentResets;
@@ -2072,6 +2167,20 @@ CPU::completeDVRNestedContext(
 
     const auto inference = dvrNestedContext.loopBound.infer(
         dvrNestedContext.startRegs, finish_regs, dvrMaxLanes);
+    // NDM records a completed outer invocation from its independently
+    // inferred inner bound.  This control-plane event must not depend on
+    // whether the captured helper program later passes VIR/issue/resource
+    // checks; otherwise a resource miss would incorrectly erase an
+    // invocation from the paper's outer-vector construction.
+    const unsigned ndm_invocation_lanes = inference.matched ?
+        inference.lanes : dvrNestedDiscoveryMode.innerLaneCount();
+    if (dvrNestedDiscoveryMode.state() ==
+            DVRNestedDiscoveryMode::State::OuterFound &&
+        ndm_invocation_lanes != 0 &&
+        dvrNestedDiscoveryMode.recordOuterInvocation(
+            dvrNestedContext.triggerAddress, ndm_invocation_lanes)) {
+        ++cpuStats.dvrNDMOuterInvocations;
+    }
     bool helper_allowed = dvrNestedContext.recorder.size() > 1 &&
         dvrNestedContext.taint.flr() != 0 && inference.matched &&
         !dvrNestedContext.recorder.overflow();
@@ -2083,10 +2192,16 @@ CPU::completeDVRNestedContext(
             dvrNestedContext.recorder, inference.lanes,
             dvrHelperMaxUops);
         cpuStats.dvrNestedVIRExecutions += vir_result.chunkExecutions;
+        cpuStats.dvrDivergentBranches += vir_result.divergentBranches;
+        cpuStats.dvrReconvergences += vir_result.reconvergences;
         helper_allowed = !vir_result.timedOut &&
             !vir_result.stackOverflow;
     }
     if (helper_allowed) {
+        // When NDM has accepted an outer stride, every child completion is
+        // one independently bounded outer invocation.  Do not flatten until
+        // NDM has observed at least two such invocations; this is the point
+        // at which the paper's outer-loop vector is formed.
         if (dvrNestedInvocationBatch.triggerPC != 0 &&
             dvrNestedInvocationBatch.triggerPC !=
                 dvrNestedContext.triggerPC) {
@@ -2099,11 +2214,18 @@ CPU::completeDVRNestedContext(
             dvrNestedInvocationBatch.bases[slot] =
                 dvrNestedContext.triggerAddress;
             dvrNestedInvocationBatch.innerLanes[slot] = inference.lanes;
+            dvrNestedInvocationBatch.innerStrides[slot] = inference.increment;
         }
         // A single completed invocation is not Nested DVR.  Wait until at
         // least two independently bounded invocations can be combined.
-        if (dvrNestedInvocationBatch.count >= 2)
+        const bool ndm_allows_flatten =
+            !dvrNestedDiscoveryMode.active() ||
+            dvrNestedDiscoveryMode.readyToVectorize();
+        if (dvrNestedInvocationBatch.count >= 2 && ndm_allows_flatten) {
             launchDVRNestedPrefetches(finish_regs);
+            if (dvrNestedDiscoveryMode.readyToVectorize())
+                dvrNestedDiscoveryMode.finishVectorization();
+        }
     }
 
     DPRINTF(O3CPU,
@@ -2185,19 +2307,35 @@ CPU::launchDVRNestedPrefetches(
         }
     }
 
-    const unsigned invocations = std::min<unsigned>(
-        dvrNestedInvocationBatch.count,
-        dvrNestedInvocationBatch.bases.size());
+    // Once NDM has completed its inner-loop control capture, its bounded
+    // outer-invocation plan is authoritative.  The legacy CPU batch remains
+    // a compatibility path for ordinary multi-invocation mode, but it must
+    // never replace the NDM plan.  In particular, the address delta inside
+    // each invocation is the inferred inner induction increment, not the
+    // stride of the outer discovery candidate.
+    const bool use_ndm_plan = dvrNestedDiscoveryMode.readyToVectorize();
+    const unsigned invocations = use_ndm_plan ?
+        std::min<unsigned>(dvrNestedDiscoveryMode.outerInvocationCount(),
+                           dvrNestedDiscoveryMode.outerBases().size()) :
+        std::min<unsigned>(dvrNestedInvocationBatch.count,
+                           dvrNestedInvocationBatch.bases.size());
+    const auto &plan_bases = use_ndm_plan ?
+        dvrNestedDiscoveryMode.outerBases() : dvrNestedInvocationBatch.bases;
+    const auto &plan_lanes = use_ndm_plan ?
+        dvrNestedDiscoveryMode.outerLanes() :
+        dvrNestedInvocationBatch.innerLanes;
+    const int64_t ndm_inner_stride =
+        dvrNestedDiscoveryMode.innerIncrement();
     unsigned flattened = 0;
     unsigned total_inner_lanes = 0;
     bool variable_lanes = false;
     for (unsigned invocation = 0; invocation < invocations; ++invocation) {
         const unsigned invocation_lanes = std::min(
-            dvrNestedInvocationBatch.innerLanes[invocation],
+            plan_lanes[invocation],
             DVRLanePredicateTracker::MaxLanes);
         total_inner_lanes += invocation_lanes;
         if (invocation != 0 && invocation_lanes !=
-            dvrNestedInvocationBatch.innerLanes[0]) {
+            plan_lanes[0]) {
             variable_lanes = true;
         }
         flattened += std::min(invocation_lanes,
@@ -2213,14 +2351,14 @@ CPU::launchDVRNestedPrefetches(
                    flattened);
     unsigned flat_lane = 0;
     for (unsigned invocation = 0; invocation < invocations; ++invocation) {
-      const Addr base = dvrNestedInvocationBatch.bases[invocation];
-      const unsigned invocation_lanes =
-          dvrNestedInvocationBatch.innerLanes[invocation];
+      const Addr base = plan_bases[invocation];
+      const unsigned invocation_lanes = plan_lanes[invocation];
+      const int64_t inner_stride = use_ndm_plan ? ndm_inner_stride :
+          dvrNestedInvocationBatch.innerStrides[invocation];
       for (unsigned lane = 1; lane <= invocation_lanes && flat_lane <
                DVRLanePredicateTracker::MaxLanes; ++lane, ++flat_lane) {
         DVRPrefetchAddress prefetch;
-        prefetch.address = base +
-            dvrNestedContext.stride * lane;
+        prefetch.address = base + inner_stride * lane;
         prefetch.pc = dvrNestedContext.triggerPC;
         prefetch.tid = dvrNestedContext.tid;
         prefetch.source = true;
@@ -2743,6 +2881,25 @@ CPU::squashInstIt(const ListIt &instIt, ThreadID tid)
                 (*instIt)->seqNum,
                 (*instIt)->pcState());
 
+        // Discovery opens at dispatch.  If the trigger is later removed by
+        // an O3 squash, commit cannot observe its abandonment; restore the
+        // speculative DVR state at this boundary instead.
+        if (enableDVR && dvrDiscovery.rollback((*instIt)->seqNum)) {
+            ++cpuStats.dvrDiscoveryRollbacks;
+            dvrTaintTracker.reset();
+            dvrLoopBoundDetector.reset();
+            dvrInstructionRecorder.reset();
+            dvrVectorRenameTable.reset();
+            dvrVectorInstructionRegister.reset();
+            dvrNestedController.reset();
+            dvrNestedDiscoveryMode.reset();
+            dvrNestedContext.reset();
+            dvrPendingNestedCandidate = {};
+            dvrCommittedNestedCandidate = {};
+            dvrDispatchTainted.clear();
+            dvrDispatchDependentLoads.clear();
+        }
+
         // Mark it as squashed.
         (*instIt)->setSquashed();
 
@@ -3061,12 +3218,25 @@ CPU::observeDVRDispatch(const DynInstPtr &inst)
             } else {
                 dvrDiscovery.arm(*candidate, inst->seqNum);
                 ++cpuStats.dvrDiscoveryStarts;
+                // Discovery is a dispatch-time mechanism.  Mirror the
+                // root generation here as well, so nested child contexts
+                // can be attached to the same speculative stream before
+                // the trigger load commits.  The old commit-side hook is
+                // retained only as a compatibility path for controllers
+                // that report an explicit Started event.
+                if (dvrMode == "nested" &&
+                    dvrNestedController.startRoot(
+                        candidate->pc, inst->seqNum).event ==
+                        DVRNestedController::Event::Started) {
+                    ++cpuStats.dvrNestedRootStarts;
+                }
                 dvrTaintTracker.begin(inst);
                 dvrLoopBoundDetector.begin(candidate->pc);
                 dvrInstructionRecorder.begin(inst);
                 dvrDispatchTainted.clear();
                 dvrDispatchDependentLoads.clear();
-                dvrNestedDiscoveryMode.reset();
+                if (!dvrNestedDiscoveryMode.active())
+                    dvrNestedDiscoveryMode.reset();
                 dvrCommittedNestedCandidate = {};
                 dvrCurrentTriggerPC = candidate->pc;
                 dvrInitiatingLoadValue = 0;

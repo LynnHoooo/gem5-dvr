@@ -124,8 +124,34 @@ class DVRNestedController
 class DVRNestedDiscoveryMode
 {
   public:
-    enum class State { Idle, SeekingOuter, OuterFound };
-    enum class Event { None, Started, OuterAccepted, TimedOut, Fallback };
+    enum class State { Idle, SeekingOuter, OuterFound, Vectorizing };
+    enum class Event
+    {
+        None,
+        Started,
+        OuterAccepted,
+        VectorizeReady,
+        TimedOut,
+        Fallback
+    };
+
+    /** The NDM control registers described by the paper's IR/ILR/LCR. */
+    struct ControlState
+    {
+        Addr innerBranchPC = 0;       // IR: branch instruction
+        Addr innerBranchTarget = 0;   // IR: taken/backward target
+        Addr innerFallthrough = 0;    // IR: exit path
+        Addr reconvergencePC = 0;     // LCR: first post-inner PC
+        int8_t inductionRegister = -1; // ILR
+        int8_t boundRegister = -1;     // LCR
+        RegVal inductionValue = 0;
+        RegVal boundValue = 0;
+        int64_t inductionIncrement = 0;
+        uint64_t remainingIterations = 0;
+        bool branchTaken = false;
+        bool branchInverted = false;
+        bool valid = false;
+    };
 
     struct Result
     {
@@ -138,6 +164,7 @@ class DVRNestedDiscoveryMode
         Addr outerAddress = 0;
         int64_t outerStride = 0;
         unsigned committedInstructions = 0;
+        ControlState control = {};
     };
 
     struct Statistics
@@ -146,6 +173,11 @@ class DVRNestedDiscoveryMode
         uint64_t outerFound = 0;
         uint64_t fallbacks = 0;
         uint64_t timeouts = 0;
+        uint64_t branchInversions = 0;
+        uint64_t irCaptures = 0;
+        uint64_t ilrCaptures = 0;
+        uint64_t lcrCaptures = 0;
+        uint64_t outerInvocations = 0;
     };
 
   private:
@@ -159,6 +191,11 @@ class DVRNestedDiscoveryMode
     Addr outerLoadPC = 0;
     Addr outerAddress = 0;
     int64_t outerStride = 0;
+    static constexpr unsigned MaxOuterInvocations = 8;
+    std::array<Addr, MaxOuterInvocations> invocationBases = {};
+    std::array<unsigned, MaxOuterInvocations> invocationLanes = {};
+    unsigned invocationCount = 0;
+    ControlState control = {};
     Statistics counters = {};
 
     Result snapshot(Event event) const;
@@ -170,6 +207,37 @@ class DVRNestedDiscoveryMode
     /** Start NDM only for a trusted, non-empty lane count below threshold. */
     Result start(Addr inner_load_pc, int64_t loop_increment,
                  unsigned inner_lanes);
+
+    /** Capture IR/ILR/LCR after the inner loop bound is inferred. */
+    void captureLoopRegisters(int8_t induction_register,
+                              int8_t bound_register,
+                              RegVal induction_value, RegVal bound_value,
+                              uint64_t remaining_iterations);
+
+    /** Invert the observed inner backward branch and save its exit PC. */
+    bool observeInnerBranch(Addr branch_pc, Addr branch_target,
+                            Addr fallthrough_pc, bool taken);
+
+    /** Record one independently bounded outer invocation. */
+    bool recordOuterInvocation(Addr base, unsigned lanes);
+
+    /** True after enough independent outer invocations are available. */
+    bool readyToVectorize() const
+    {
+        return currentState == State::Vectorizing;
+    }
+    unsigned outerInvocationCount() const { return invocationCount; }
+    const std::array<Addr, MaxOuterInvocations> &outerBases() const
+    {
+        return invocationBases;
+    }
+    const std::array<unsigned, MaxOuterInvocations> &outerLanes() const
+    {
+        return invocationLanes;
+    }
+
+    /** Consume the current NDM plan after the nested vector is launched. */
+    void finishVectorization();
 
     /** Age an active NDM generation by one committed instruction. */
     Result observeCommit();
@@ -184,7 +252,12 @@ class DVRNestedDiscoveryMode
     bool active() const { return currentState != State::Idle; }
     State state() const { return currentState; }
     unsigned threshold() const { return laneThreshold; }
+    unsigned innerLaneCount() const { return innerLanes; }
+    int64_t innerIncrement() const { return increment; }
+    Addr outerBaseAddress() const { return outerAddress; }
+    int64_t outerStrideValue() const { return outerStride; }
     const Statistics &statistics() const { return counters; }
+    const ControlState &controlState() const { return control; }
     void reset();
     void clear();
 };

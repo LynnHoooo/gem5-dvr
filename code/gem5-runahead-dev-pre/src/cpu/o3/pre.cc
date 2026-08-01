@@ -171,6 +171,15 @@ DVRDiscoveryController::observeCommit(Addr pc, InstSeqNum sequence)
     return {};
 }
 
+bool
+DVRDiscoveryController::rollback(InstSeqNum squash_sequence)
+{
+    if (state == State::Idle || triggerSequence < squash_sequence)
+        return false;
+    finish();
+    return true;
+}
+
 void
 DVRDiscoveryController::finish()
 {
@@ -387,6 +396,14 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
         return;
     }
 
+    if (opcode == 0x3b) {
+        if (funct3 == 0 && funct7 == 0)
+            uop.semantic = Semantic::AddWord;
+        else if (funct3 == 0 && funct7 == 0x20)
+            uop.semantic = Semantic::SubWord;
+        return;
+    }
+
     if (opcode == 0x13) {
         if (funct3 == 0) {
             uop.semantic = Semantic::AddImmediate;
@@ -409,6 +426,23 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
         } else if (funct3 == 5 && ((uop.encoding >> 26) == 0x10)) {
             uop.semantic = Semantic::ShiftRightArithmeticImmediate;
             uop.immediate = (uop.encoding >> 20) & 0x3f;
+        }
+        return;
+    }
+
+    if (opcode == 0x1b) {
+        if (funct3 == 0) {
+            uop.semantic = Semantic::AddWordImmediate;
+            uop.immediate = dvrSignExtend(uop.encoding >> 20, 12);
+        } else if (funct3 == 1 && (uop.encoding >> 25) == 0) {
+            uop.semantic = Semantic::ShiftLeftWordImmediate;
+            uop.immediate = (uop.encoding >> 20) & 0x1f;
+        } else if (funct3 == 5 && (uop.encoding >> 25) == 0) {
+            uop.semantic = Semantic::ShiftRightLogicalWordImmediate;
+            uop.immediate = (uop.encoding >> 20) & 0x1f;
+        } else if (funct3 == 5 && (uop.encoding >> 25) == 0x20) {
+            uop.semantic = Semantic::ShiftRightArithmeticWordImmediate;
+            uop.immediate = (uop.encoding >> 20) & 0x1f;
         }
         return;
     }
@@ -455,12 +489,32 @@ DVRInstructionRecorder::Uop::evaluate(
       case Semantic::Multiply:
         result = source0_value * source1_value;
         return true;
+      case Semantic::AddWord:
+        result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
+            static_cast<uint32_t>(source0_value) +
+            static_cast<uint32_t>(source1_value))));
+        return true;
+      case Semantic::SubWord:
+        result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
+            static_cast<uint32_t>(source0_value) -
+            static_cast<uint32_t>(source1_value))));
+        return true;
       case Semantic::AddImmediate:
       case Semantic::LoadAddress:
         result = source0_value + static_cast<RegVal>(immediate);
         return true;
+      case Semantic::AddWordImmediate:
+        result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
+            static_cast<uint32_t>(source0_value) +
+            static_cast<uint32_t>(immediate))));
+        return true;
       case Semantic::ShiftLeftImmediate:
         result = source0_value << (static_cast<unsigned>(immediate) & 0x3f);
+        return true;
+      case Semantic::ShiftLeftWordImmediate:
+        result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
+            static_cast<uint32_t>(source0_value) <<
+            (static_cast<unsigned>(immediate) & 0x1f))));
         return true;
       case Semantic::AndImmediate:
         result = source0_value & static_cast<RegVal>(immediate);
@@ -478,6 +532,16 @@ DVRInstructionRecorder::Uop::evaluate(
         result = static_cast<RegVal>(static_cast<int64_t>(source0_value) >>
             (static_cast<unsigned>(immediate) & 0x3f));
         return true;
+      case Semantic::ShiftRightLogicalWordImmediate:
+        result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
+            static_cast<uint32_t>(source0_value) >>
+            (static_cast<unsigned>(immediate) & 0x1f))));
+        return true;
+      case Semantic::ShiftRightArithmeticWordImmediate:
+        result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
+            static_cast<int32_t>(source0_value) >>
+            (static_cast<unsigned>(immediate) & 0x1f))));
+        return true;
       case Semantic::Unsupported:
         return false;
     }
@@ -494,6 +558,14 @@ DVRInstructionRecorder::begin(const DynInstPtr &trigger)
 bool
 DVRInstructionRecorder::record(const DynInstPtr &inst)
 {
+    // The first instruction observed after a conditional branch is the
+    // committed reconvergence boundary for this captured path.  Preserve it
+    // in the branch uop instead of making VIR infer a boundary from the next
+    // array slot at execution time.
+    if (count != 0 && uops[count - 1].conditional &&
+        uops[count - 1].reconvergencePC == 0)
+        uops[count - 1].reconvergencePC = inst->pcState().instAddr();
+
     // 记录有限数量的 uop；超出容量后禁止使用该模板。
     if (count >= MaxUops) {
         overflowed = true;
@@ -574,16 +646,166 @@ DVRVectorRenameTable::lookup(unsigned architectural, unsigned chunk) const
 }
 
 DVRVectorInstructionRegister::Result
+DVRVectorInstructionRegister::executeLanePC(
+    const DVRInstructionRecorder &program, unsigned lanes,
+    unsigned max_helper_uops)
+{
+    reset();
+    Result result;
+    lanes = std::min(lanes, 128U);
+    if (program.size() == 0 || lanes == 0 || max_helper_uops == 0)
+        return result;
+
+    std::array<bool, 128> lane_active = {};
+    std::array<bool, DVRInstructionRecorder::MaxUops> pending_reconvergence =
+        {};
+    const Addr entry = program[0].pc;
+    for (unsigned lane = 0; lane < lanes; ++lane) {
+        lane_active[lane] = true;
+        lanePC[lane] = entry;
+        activeMask[lane / 64] |= uint64_t(1) << (lane % 64);
+        for (unsigned reg = 0;
+             reg < DVRVectorRenameTable::NumArchitecturalRegs; ++reg) {
+            // The asynchronous source response replaces the trigger value in
+            // replay; VIR uses the lane ordinal for pre-response scalar state.
+            vectorRegs[reg][lane] = lane;
+        }
+    }
+    result.activeLanes = lanes;
+
+    const unsigned chunks = (lanes + 15) / 16;
+    for (unsigned step = 0; step < max_helper_uops; ++step) {
+        int op_index = -1;
+        Addr group_pc = 0;
+        for (unsigned lane = 0; lane < lanes; ++lane) {
+            if (!lane_active[lane])
+                continue;
+            for (unsigned candidate = 0; candidate < program.size();
+                 ++candidate) {
+                if (program[candidate].pc == lanePC[lane]) {
+                    op_index = candidate;
+                    group_pc = lanePC[lane];
+                    break;
+                }
+            }
+            if (op_index >= 0)
+                break;
+            lane_active[lane] = false;
+            activeMask[lane / 64] &= ~(uint64_t(1) << (lane % 64));
+        }
+        if (op_index < 0)
+            break;
+
+        const auto &op = program[op_index];
+        if (pending_reconvergence[op_index]) {
+            ++result.reconvergences;
+            pending_reconvergence[op_index] = false;
+            if (stackDepth != 0)
+                --stackDepth;
+        }
+
+        std::array<bool, 128> executing = {};
+        bool has_taken = false;
+        bool has_fallthrough = false;
+        for (unsigned lane = 0; lane < lanes; ++lane) {
+            if (!lane_active[lane] || lanePC[lane] != group_pc)
+                continue;
+            executing[lane] = true;
+            const RegVal lhs = op.source0 >= 0 ?
+                vectorRegs[op.source0][lane] : 0;
+            const RegVal rhs = op.source1 >= 0 ?
+                vectorRegs[op.source1][lane] : 0;
+            if (op.conditional) {
+                const bool lane_taken = (lhs != 0) == op.branchTaken;
+                const Addr next = lane_taken ? op.branchTargetPC :
+                    (op.fallthroughPC != 0 ? op.fallthroughPC :
+                     (op_index + 1 < program.size() ?
+                      program[op_index + 1].pc : 0));
+                lanePC[lane] = next;
+                has_taken |= lane_taken;
+                has_fallthrough |= !lane_taken;
+                continue;
+            }
+
+            RegVal value = 0;
+            if (!op.evaluate(lhs, rhs, value)) {
+                lane_active[lane] = false;
+                activeMask[lane / 64] &= ~(uint64_t(1) << (lane % 64));
+                continue;
+            }
+            if (op.destination >= 0)
+                vectorRegs[op.destination][lane] = value;
+            lanePC[lane] = op_index + 1 < program.size() ?
+                program[op_index + 1].pc : 0;
+        }
+
+        if (has_taken && has_fallthrough) {
+            ++result.divergentBranches;
+            if (stackDepth >= ReconvergenceEntries) {
+                result.stackOverflow = true;
+                return result;
+            }
+            const Addr reconvergence = op.reconvergencePC != 0 ?
+                op.reconvergencePC : op.fallthroughPC;
+            for (unsigned candidate = 0; candidate < program.size();
+                 ++candidate) {
+                if (program[candidate].pc == reconvergence) {
+                    pending_reconvergence[candidate] = true;
+                    break;
+                }
+            }
+            ++stackDepth;
+        }
+
+        for (unsigned chunk = 0; chunk < chunks; ++chunk) {
+            const unsigned first = chunk * 16;
+            const unsigned last = std::min(first + 16, lanes);
+            unsigned active_in_chunk = 0;
+            for (unsigned lane = first; lane < last; ++lane)
+                active_in_chunk += executing[lane] && lane_active[lane];
+            if (active_in_chunk == 0)
+                continue;
+            issuedChunks |= uint16_t(1) << chunk;
+            executedChunks |= uint16_t(1) << chunk;
+            ++result.chunkIssues;
+            ++result.chunkExecutions;
+        }
+        ++result.helperUops;
+
+        bool any_active = false;
+        for (unsigned lane = 0; lane < lanes; ++lane)
+            any_active |= lane_active[lane] && lanePC[lane] != 0;
+        if (!any_active)
+            break;
+    }
+
+    if (result.helperUops >= max_helper_uops) {
+        bool any_active = false;
+        for (unsigned lane = 0; lane < lanes; ++lane)
+            any_active |= lane_active[lane] && lanePC[lane] != 0;
+        result.timedOut = any_active;
+    }
+    return result;
+}
+
+DVRVectorInstructionRegister::Result
 DVRVectorInstructionRegister::execute(
     const DVRInstructionRecorder &program, unsigned lanes,
     unsigned max_helper_uops)
 {
+    return executeLanePC(program, lanes, max_helper_uops);
+
+    // Legacy mask-only implementation retained below as a reference while
+    // the lane-PC executor is validated against existing VIR counters.
     // 建立 active mask 和私有向量寄存器文件，再按 uop/lane 实际执行。
     reset();
     Result result;
     lanes = std::min(lanes, 128U);
+    if (program.size() == 0 || lanes == 0 || max_helper_uops == 0)
+        return result;
     for (unsigned lane = 0; lane < lanes; ++lane) {
         activeMask[lane / 64] |= uint64_t(1) << (lane % 64);
+        lanePC[lane] = program[0].pc;
         // lane ordinal is the only value known before asynchronous source
         // loads return; it provides a deterministic seed for address-only
         // instructions.  Real load values are consumed by the helper request
@@ -606,24 +828,24 @@ DVRVectorInstructionRegister::execute(
             ++result.reconvergences;
         }
 
-        // Execute a conditional uop as a SIMT control-flow operation.  The
-        // recorder currently provides the predicate source and direction but
-        // not a full branch target/reconvergence PC, so the deferred path is
-        // restored at the end of this branch operation.  This still exercises
-        // the lane mask and reconvergence stack rather than fabricating a
-        // single scalar path.
+        // Execute a conditional uop as a SIMT control-flow operation.  Each
+        // lane now records its selected target/fall-through PC; the deferred
+        // mask remains available at the recorded reconvergence boundary.
         if (op.conditional) {
             std::array<uint64_t, 2> taken = {};
             std::array<uint64_t, 2> deferred = {};
             for (unsigned lane = 0; lane < lanes; ++lane) {
                 const uint64_t bit = uint64_t(1) << (lane % 64);
                 const auto word = lane / 64;
-                if (!(activeMask[word] & bit))
+                if (!(activeMask[word] & bit) || lanePC[lane] != op.pc)
                     continue;
                 const RegVal predicate = op.source0 >= 0 ?
                     vectorRegs[op.source0][lane] : 0;
                 const bool value_taken = predicate != 0;
                 const bool lane_taken = value_taken == op.branchTaken;
+                lanePC[lane] = lane_taken ? op.branchTargetPC :
+                    (op.reconvergencePC != 0 ? op.reconvergencePC :
+                     op.fallthroughPC);
                 (lane_taken ? taken : deferred)[word] |= bit;
             }
 
@@ -654,7 +876,8 @@ DVRVectorInstructionRegister::execute(
             const unsigned first = chunk * 16;
             const unsigned last = std::min(first + 16, lanes);
             for (unsigned lane = first; lane < last; ++lane) {
-                if (!(activeMask[lane / 64] & (uint64_t(1) << (lane % 64))))
+                if (!(activeMask[lane / 64] & (uint64_t(1) << (lane % 64))) ||
+                    lanePC[lane] != op.pc)
                     continue;
                 RegVal lhs = 0;
                 RegVal rhs = 0;
@@ -667,6 +890,8 @@ DVRVectorInstructionRegister::execute(
                     continue;
                 if (op.destination >= 0)
                     vectorRegs[op.destination][lane] = value;
+                lanePC[lane] = uop + 1 < program.size() ?
+                    program[uop + 1].pc : 0;
                 ++active_in_chunk;
             }
             if (active_in_chunk == 0)
@@ -704,6 +929,7 @@ DVRVectorInstructionRegister::reset()
     activeMask = {};
     stack = {};
     vectorRegs = {};
+    lanePC = {};
     stackDepth = 0;
     issuedChunks = 0;
     executedChunks = 0;
@@ -799,7 +1025,11 @@ DVRLoopBoundDetector::infer(const RegisterSnapshot &start,
 {
     // 一个寄存器应保持不变作为 bound，另一个应按固定步幅变化。
     Inference inference;
-    inference.lanes = max_lanes;
+    // A bound that cannot be proven must not silently become a 128-lane
+    // prefetch.  The paper's discovery path only vectorizes after a valid
+    // loop-control relation is established; callers treat lanes==0 as an
+    // explicit no-helper fallback.
+    inference.lanes = 0;
     if (!seenBranch || boundSource0 < 0 || boundSource1 < 0 ||
         boundSource0 >= MaxArchitecturalIntRegs ||
         boundSource1 >= MaxArchitecturalIntRegs)

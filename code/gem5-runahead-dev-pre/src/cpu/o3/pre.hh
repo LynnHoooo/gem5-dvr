@@ -105,6 +105,7 @@ class DVRDiscoveryController
              InstSeqNum sequence);
     bool observeDispatch(Addr pc, InstSeqNum sequence);
     Result observeCommit(Addr pc, InstSeqNum sequence);
+    bool rollback(InstSeqNum squash_sequence);
     bool isDiscovering() const { return state == State::Discovering; }
     InstSeqNum triggerSeq() const { return triggerSequence; }
     void reset();
@@ -161,13 +162,19 @@ class DVRInstructionRecorder
             ShiftRightLogical,
             ShiftRightArithmetic,
             Multiply,
+            AddWord,
+            SubWord,
             AddImmediate,
+            AddWordImmediate,
             ShiftLeftImmediate,
+            ShiftLeftWordImmediate,
             AndImmediate,
             OrImmediate,
             XorImmediate,
             ShiftRightLogicalImmediate,
             ShiftRightArithmeticImmediate,
+            ShiftRightLogicalWordImmediate,
+            ShiftRightArithmeticWordImmediate,
             LoadAddress
         };
 
@@ -253,9 +260,11 @@ class DVRVectorInstructionRegister
     // private to the DVR context and are never copied to architectural regs.
     std::array<std::array<RegVal, 128>,
                DVRVectorRenameTable::NumArchitecturalRegs> vectorRegs = {};
+    std::array<Addr, 128> lanePC = {};
     unsigned stackDepth = 0;
     uint16_t issuedChunks = 0;
     uint16_t executedChunks = 0;
+
 
   public:
     struct Result
@@ -269,6 +278,12 @@ class DVRVectorInstructionRegister
         bool timedOut = false;
         bool stackOverflow = false;
     };
+
+  private:
+    Result executeLanePC(const DVRInstructionRecorder &program,
+                         unsigned lanes, unsigned max_helper_uops);
+
+  public:
 
     Result execute(const DVRInstructionRecorder &program, unsigned lanes,
                    unsigned max_helper_uops = 200);
@@ -319,6 +334,8 @@ class DVRLoopBoundDetector
     bool hasBound() const { return seenBranch; }
     Addr branchPC() const { return loopBranchPC; }
     Addr targetPC() const { return loopTargetPC; }
+    int8_t boundSource0Reg() const { return boundSource0; }
+    int8_t boundSource1Reg() const { return boundSource1; }
     int source0() const { return boundSource0; }
     int source1() const { return boundSource1; }
 };

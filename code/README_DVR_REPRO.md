@@ -22,13 +22,18 @@ code/gem5-runahead-dev-pre/
 3. `src/cpu/o3/dvr_predicate.hh/.cc`：由真实 source response 构造逐 lane
    path mask。
 4. `src/cpu/o3/dvr_quality.hh/.cc`：严格质量指标的事件驱动 tracker。
-5. `src/cpu/o3/cpu.cc` 中的 `CPU::instDone()`：在 commit 阶段把上述结构串起来。
-6. `src/cpu/o3/cpu.cc` 中的 `launchDVRStridePrefetches()`、
+5. `src/cpu/o3/iew.cc` 中的 `IEW::dispatchInsts()` 和 `src/cpu/o3/cpu.cc`
+   中的 `CPU::observeDVRDispatch()`：在 O3 dispatch 阶段观察 RPT/stride
+   candidate、启动 Discovery，并推进 VTT/FLR 观测。
+6. `src/cpu/o3/cpu.cc` 中的 `CPU::instDone()`：在 commit 阶段完成
+   Discovery 生命周期，用已记录的 committed slice 生成 helper/replay。
+7. `src/cpu/o3/cpu.cc` 中的 `launchDVRStridePrefetches()`、
    `serviceDVRPrefetchQueue()`、`completeDVRPrefetch()`：128-lane helper 和
    dependent prefetch 的真实 cache timing 路径。
-7. `src/cpu/o3/lsq_unit.cc`：主线程 load 在 LSQ 发射时训练 RPT。
-8. `src/cpu/o3/lsq.cc`：截获并消费 DVR 的 cache response。
-9. `configs/dvr/table1_se.py`：论文 Table 1 风格的 gem5 配置和 DVR 参数。
+8. `src/cpu/o3/lsq_unit.cc`：主线程 load 在 LSQ 发射时报告真实地址，
+   更新 RPT/quality 观测。
+9. `src/cpu/o3/lsq.cc`：截获并消费 DVR helper 的 cache response。
+10. `configs/dvr/table1_se.py`：论文 Table 1 风格的 gem5 配置和 DVR 参数。
 
 如果只想看本次新增代码，可在源码根目录执行：
 
@@ -75,6 +80,10 @@ prefetch/
 │   ├── run_remote_dvr_stage10_smoke.sh
 │   ├── run_remote_dvr_stage11_control_flow.sh
 │   ├── run_remote_dvr_stage12_quality.sh
+│   ├── run_remote_dvr_stage14_ndm_control.sh
+│   ├── run_remote_dvr_stage15_resource_smoke.sh
+│   ├── run_remote_dvr_stage16_algorithm_smoke.sh
+│   ├── run_remote_dvr_stage17_quality_workload.sh
 │   └── run_remote_dvr_regression.sh     # QUICK/full 一键回归
 └── docs/
     ├── 02_reproduction_status.md
@@ -112,10 +121,20 @@ dvrDiscoveryMaxInsts=512
 
 - `DVRStrideDetector`：32-entry、LRU replacement、signed stride、2-bit
   confidence。
-- `DVRDiscoveryController`：`Idle → Armed → Discovering`。
-- discovery 在下一次相同 trigger PC commit 时完成。
+- `DVRDiscoveryController`：当前主路径为 `Idle → Discovering`。
+- O3 dispatch 看到训练好的 stride load 后立即启动 Discovery；不等待该
+  dynamic load commit。
+- dispatch 看到下一次相同 trigger PC 时记录 stop boundary；commit 再按顺序
+  完成 Discovery、统计并生成 helper。
 - 最多记录 512 条 committed instruction。
 - `Abandoned` 路径用于释放由 speculative/squashed load 产生的 armed trigger。
+
+`Armed` 状态仍保留在控制器中，用于兼容旧的 commit-side 生命周期和放弃路径，
+但当前 dispatch 主路径不再通过 `Armed` 延迟启动。
+
+NDM 控制器现在额外保存论文所说的控制状态：inner backward branch 的 IR、
+induction/bound register 的 ILR/LCR、branch inversion 标志、出口/重汇合 PC 和
+剩余迭代数；O3 squash 会回滚尚未提交的 Discovery trigger。
 
 ### 3.3 VTT、FLR 和 Loop Bound
 
@@ -138,9 +157,10 @@ dvrDiscoveryMaxInsts=512
 - 8-entry reconvergence stack。
 - 200-helper-uop termination budget。
 
-这里的 VRAT/VIR 已有真实状态和运行统计，但尚未成为任意 RISC-V 指令的完整
-逐 lane 数据执行后端；当前真实 dependent address 执行仍以 discovery 学习出的
-仿射关系为主要 fast path。
+这里的 VRAT/VIR 已有真实状态和运行统计。VIR 的 recorder 分支现在保存实际的
+branch target 和 committed reconvergence boundary；helper 前端也按
+`fetch → decode → ready → issue → drain` 推进。仍未覆盖任意 RISC-V 指令，
+真实 dependent address 执行对 unsupported 链仍保留显式 affine fallback。
 
 ### 3.5 真实 cache timing 路径
 
@@ -159,6 +179,47 @@ discovery complete
 
 这些请求进入 gem5 timing memory system，不是只增加统计计数。
 
+### 3.6 模块到代码位置映射
+
+下表给出每个 DVR 模块的主要实现文件、运行时入口和对应的验证入口。除特别
+说明外，路径均相对于 `code/gem5-runahead-dev-pre/`。
+
+| 模块 | 主要代码位置 | 关键运行时入口 | 验证入口 |
+|---|---|---|---|
+| 参数与配置 | `src/cpu/o3/BaseO3CPU.py`；`configs/dvr/table1_se.py` | `enableDVR`、`dvrEnableDependentPrefetch`、`--dvr-mode` | Stage 2；Figure 8 |
+| RPT / Stride Detector | `src/cpu/o3/pre.hh/.cc` | `DVRStrideDetector::observe()`（真实 load 地址）；`observeDispatch()`（dispatch 侧 candidate） | Stage 1、3 |
+| O3 dispatch 接入 | `src/cpu/o3/iew.cc`；`src/cpu/o3/cpu.cc` | `IEW::dispatchInsts()` → `CPU::observeDVRDispatch()` | Stage 1、3、4 |
+| Discovery | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `arm()`、`observeDispatch()`、`observeCommit()`；`CPU::instDone()` | Stage 3 |
+| VTT / FLR | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `DVRVectorTaintTracker::observe()`、`classify()`；dispatch 侧 taint/dependent 记录 | Stage 4 |
+| Loop-Bound Detector | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `begin()`、`updateFinalLoad()`、`observe()`、`infer()` | Stage 5、6 |
+| Instruction Recorder | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `DVRInstructionRecorder::begin()`、`record()`；`instDone()` 保存 committed slice | Stage 8、10 |
+| VRAT / VIR | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `DVRVectorRenameTable::build()`；`DVRVectorInstructionRegister::execute()` | Stage 10 |
+| Source prefetch | `src/cpu/o3/cpu.cc` | `launchDVRStridePrefetches()`、`serviceDVRPrefetchQueue()` | Stage 7 |
+| Dependent replay | `src/cpu/o3/cpu.cc` | `replayDVRSource()`、`completeDVRPrefetch()`；`lsq.cc` 完成 response 回调 | Stage 8 |
+| Predicate / reconvergence | `src/cpu/o3/dvr_predicate.hh/.cc`；`cpu.cc` | `DVRLanePredicateTracker`；`retireDVRPredicateLane()` | Stage 11、12 |
+| Nested / Multiple | `src/cpu/o3/dvr_nested.hh/.cc`；`cpu.cc` | `DVRNestedController`、`DVRNestedDiscoveryMode`；`completeDVRNestedContext()`、`launchDVRNestedPrefetches()` | Stage 13、14 |
+| Quality metrics | `src/cpu/o3/dvr_quality.hh/.cc`；cache/LSQ 接线处 | `DVRQualityTracker::issued()`、`completed()`、`demandLookup()`、`cacheFill()` | Stage 12、15 |
+| Cache / LSQ timing | `src/cpu/o3/lsq_unit.cc`；`src/cpu/o3/lsq.cc`；`cpu.cc` | load address observation、helper packet response、prefetch queue service | Stage 7、8、9 |
+| Figure 8 消融 | `scripts/run_remote_dvr_figure8.sh` | `run_case()`；VR / Offload / Discovery / Multiple 映射 | Figure 8 |
+| NDM algorithm state | `src/cpu/o3/dvr_nested.hh/.cc`；`src/cpu/o3/dvr_nested_smoke.cc` | IR/ILR/LCR、branch inversion、outer invocation gate | Stage 16 |
+
+Stage 7/14/15/17 脚本默认从脚本位置解析仓库根目录，使用
+`code/gem5-runahead-dev-pre` 的最新构建；如果该 checkout 没有 benchmark，会自动回退
+到相邻的 `gem5-runahead-dev-pre/benchmarks`。也可以通过 `ROOT`、`BENCH`、`GEM5`
+覆盖默认路径。
+
+NDM 和 helper 前端的专项统计也可由以下入口检查：
+
+- `dvrNDMIRCaptures`、`dvrNDMILRCaptures`、`dvrNDMLCRCaptures`、
+  `dvrNDMOuterInvocations`：NDM 控制状态是否真实建立。
+- `dvrHelperFetchCycles`、`dvrHelperDecodeCycles`：helper 是否实际经过独立
+  fetch/decode 阶段。
+- `scripts/run_remote_dvr_stage14_ndm_control.sh`：NDM 控制状态 smoke。
+- `scripts/run_remote_dvr_stage15_resource_smoke.sh`：helper 前端和共享资源
+  smoke。
+- `scripts/run_remote_dvr_stage16_algorithm_smoke.sh`：不依赖 gem5 workload，
+  直接验证 NDM 控制状态和两 invocation flatten gate。
+
 ## 4. 当前验证状态
 
 | Stage | 内容 | 当前状态 | 已获得的证据 |
@@ -169,12 +230,16 @@ discovery complete
 | 4 | VTT/FLR | 当前树通过 | 12401 tainted、2396 dependent loads/FLR |
 | 5 | Loop Bound | 当前树通过 | 2396 bounds / discoveries |
 | 6 | Lane inference | 当前树通过 | 2396 matches，665909 total active lanes |
-| 7 | 128-lane cache injection | 当前树通过 | 110005 timing requests completed；source/dependent translation faults 均为 0 |
-| 8 | 真实逐 lane dependent replay | 当前树通过 | 97419 replay attempts/targets，0 fallback；12586 dependent requests completed |
+| 7 | 128-lane cache injection | source-only 通过 | `--dvr-no-dependent-prefetch`：generated=18123，issued/completed=10666，faults=0 |
+| 8 | 真实逐 lane dependent replay | 需单独复核 | 代码已有 dispatch sequence tracking、地址有效性保护和 replay 统计；不要用 Stage 7 结果替代 Stage 8 证据 |
 | 9 | Baseline vs DVR | 当前树通过 | demand L1D miss 降低 11.56% |
 | 10 | 8-uop recorder/VRAT/VIR | 当前树通过 | 2396 programs，95470 VIR executions；真实 replay 守恒断言通过 |
 | 11 | actual-value predicate/reconvergence/timeout | 当前树完整通过 | divergent=3019，reconverged=604，abandoned=2415；forced timeout=1965/generated=0 |
 | 12 | predicate/quality 独立严格 smoke | 当前树通过 | actual-value mask 与质量计数器 `-Werror` smoke |
+| 14 | NDM 控制与 timeout | 通过 | dispatch Discovery、IR/ILR/LCR、outer candidate、timeout/fallback |
+| 15 | helper 前端与资源竞争 | 通过 | fetch/decode/issue、主线程优先资源统计 |
+| 16 | NDM IR/ILR/LCR 与 outer invocation gate | 通过 | branch inversion、两个 outer invocation 后 Vectorizing、timeout fallback |
+| 17 | L1D workload 级 quality 事件 | 通过 | demand=294915，DVR issued=11306，timely=1653，coverage=0.010906，timeliness=0.541080 |
 
 Stage 9 的当前稳定结果：
 
@@ -189,7 +254,7 @@ miss_reduction=11.56%
 
 该微基准证明了 cache miss coverage，但不代表已经复现论文的 2.4× 绝对结果。
 
-Stage 8/10 对真实 trigger-to-FLR replay 的最新硬断言结果：
+此前 Stage 8/10 测试曾获得真实 trigger-to-FLR replay 的硬断言结果：
 
 ```text
 replay_supported=7188 replay_unsupported=0
@@ -197,7 +262,7 @@ replay_unstable_inputs=0
 replay_attempts=97419 replay_targets=97419 replay_fallbacks=0
 ```
 
-该测试中的 RVC 链为 `load → C.SLLI → C.ADD → C.LD`。模板在 FLR 截断，
+该历史测试中的 RVC 链为 `load → C.SLLI → C.ADD → C.LD`。模板在 FLR 截断，
 source response 的真实 64-bit load value 被写入每个 lane 的寄存器快照，再依次
 执行地址生成 uop。`targets == attempts` 且 `fallbacks == 0`，因此这里的
 dependent target 已不再由仿射 fast path 产生。
@@ -231,16 +296,20 @@ accuracy、coverage、timeliness 和 pollution 需要 L1 tag lookup/fill/victim
 
 按重要程度排列：
 
-1. 将已验证的逐 lane evaluator 扩展到更多 RV64/RVC 整数、比较和地址生成 opcode；
+1. 将已验证的逐 lane evaluator 扩展到更多 RV64/RVC 整数、比较、load-value 和地址生成 opcode；
    仿射逻辑仅保留为 unsupported 链的显式 fallback。
 2. 将已验证的实际 value-predicate 路径选择进一步扩展到任意 branch opcode，
-   并让 replay 直接执行逐 lane predicate。
-3. 将当前主线程优先 cache-port 节流扩展为执行端口级资源竞争模型。
-4. 将已完成的严格质量 tracker 接到 L1 tag lookup/fill/victim/invalidate，
-   使 accuracy、coverage、timeliness 和 pollution 可用于 workload 报告。
+   并让 VIR 使用独立 lane PC 执行 branch target/fall-through，而不仅是
+   recorder 内的有限路径。
+3. 将当前已加入 fetch/decode/issue 状态的 helper 继续扩展为执行端口级资源
+   竞争模型。
+4. 将已接通的严格质量 tracker 扩展到更多 workload，并统一论文的 accuracy、
+   coverage、timeliness 和 pollution 报告口径。
 5. 缩小版 GAP workload。
 6. Baseline、PRE、Offload/Discovery、Nested DVR 消融。
-7. 最终实验报告（Stage 1–13 验收入口已经补齐）。
+7. 最终实验报告；Stage 7 source-only、Stage 14 NDM control 和 Stage 15
+   helper resource smoke 已通过，Stage 8 dependent replay 和
+   后续 workload 级结果仍需按当前二进制重新归档。
 
 Nested 专用验收：
 
@@ -254,7 +323,7 @@ generated/issued/completed=256/251/251`，并且真实 child replay 为
 loop-bound、register snapshots、VRAT、VIR 和 replay template；relation predictor
 与物理 helper queue 仍由 root/child 共享。
 
-最新完整回归已经通过：
+此前一次完整回归的摘要为：
 
 ```text
 DVR_REGRESSION_PASSED quick=0
@@ -822,12 +891,14 @@ speedup，也无法判断收益来自 DVR、仿射 predictor，还是 cache traf
 运行：
 
 ```bash
-~/dvr-repro/scripts/run_remote_dvr_stage14_ndm_control.sh
+bash scripts/run_remote_dvr_stage14_ndm_control.sh
 ```
 
-当前 Stage 14 是控制语义和可观测性骨架，尚未实现论文要求的 branch-direction
-inversion、outer-lane vectorization、每个 outer invocation 的 inner bound 收集和
-flatten-to-128。服务器完成构建与回归前，其状态应写为“已实现，待远端验证”。
+Stage 14 当前已通过服务器验证，并实现了 branch-direction 控制记录、IR/ILR/LCR
+捕获、outer candidate commit 过滤、bounded outer plan 和 timeout/fallback。仍未达到
+论文完整 NDM 的部分是：helper 必须自主反转 inner branch 后搜索 outer striding load，
+跨多个动态 outer invocation 收集各自 bound，并由该计划统一驱动真实 flatten-to-128；
+当前模型仍以已提交 child context 和 event-driven helper 为主。
 
 ## 11. Stage 15：资源竞争统计与固定构建环境
 
@@ -835,7 +906,7 @@ Stage 15 已加入回归脚本，统计 `dvrHelperIssueCycles`、`dvrResourceCon
 `dvrPrefetchesSuppressedMainThread` 和 `dvrPrefetchesIssued`。运行：
 
 ```bash
-bash ~/dvr-repro/scripts/run_remote_dvr_stage15_resource_smoke.sh
+bash scripts/run_remote_dvr_stage15_resource_smoke.sh
 ```
 
 通过条件是模拟周期、helper issue 周期和 DVR 请求均大于零，且 helper issue 周期不
