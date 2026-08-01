@@ -828,3 +828,32 @@ speedup，也无法判断收益来自 DVR、仿射 predictor，还是 cache traf
 当前 Stage 14 是控制语义和可观测性骨架，尚未实现论文要求的 branch-direction
 inversion、outer-lane vectorization、每个 outer invocation 的 inner bound 收集和
 flatten-to-128。服务器完成构建与回归前，其状态应写为“已实现，待远端验证”。
+
+## 11. Stage 15：资源竞争统计与固定构建环境
+
+Stage 15 已加入回归脚本，统计 `dvrHelperIssueCycles`、`dvrResourceConflicts`、
+`dvrPrefetchesSuppressedMainThread` 和 `dvrPrefetchesIssued`。运行：
+
+```bash
+bash ~/dvr-repro/scripts/run_remote_dvr_stage15_resource_smoke.sh
+```
+
+通过条件是模拟周期、helper issue 周期和 DVR 请求均大于零，且 helper issue 周期不
+超过总周期。代码和脚本已经提交并同步远端；在新二进制完成前，旧二进制不包含这些
+统计项，不能宣称 Stage 15 已通过。
+
+服务器构建统一使用 Nix 的 Python 3.13 ABI。首次 bootstrap 前清理旧生成物，避免
+Python 3.11/3.13 混用：
+
+```bash
+cd ~/dvr-repro/source/gem5-runahead-dev-pre
+rm -rf build/RISCV
+export PYTHON_CONFIG=/nix/store/0r6k8xa2kgqyp3r4v2w7yrb80ma2iawm-python3-3.13.12/bin/python3.13-config
+export CCFLAGS_EXTRA=-I/nix/store/h7ik0g1xxayy0z8h27zbvrgmac63irgs-zlib-1.3.2-dev/include
+export LINKFLAGS_EXTRA=-L/nix/store/61a1nwx3w6rqyaisj5rn1sal1981apm7-zlib-1.3.2/lib
+export LIBRARY_PATH=/nix/store/61a1nwx3w6rqyaisj5rn1sal1981apm7-zlib-1.3.2/lib
+/home/lynnhoo/buckyball/result/bin/python -m SCons build/RISCV/gem5.opt -j1
+```
+
+首次 bootstrap 成功后才使用 `-j32` 增量编译；若生成器段错误，必须重新清理
+`build/RISCV`，不能继续使用旧 ABI 生成物。
