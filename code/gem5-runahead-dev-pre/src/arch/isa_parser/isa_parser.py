@@ -778,7 +778,7 @@ class ISAParser(Grammar):
     # String literal.  Note that these use only single quotes, and
     # can span multiple lines.
     def t_STRLIT(self, t):
-        r"(?m)'([^'])+'"
+        r"'([^'])+'"
         # strip off quotes
         t.value = t.value[1:-1]
         t.lexer.lineno += t.value.count('\n')
@@ -788,7 +788,7 @@ class ISAParser(Grammar):
     # "Code literal"... like a string literal, but delimiters are
     # '{{' and '}}' so they get formatted nicely under emacs c-mode
     def t_CODELIT(self, t):
-        r"(?m)\{\{([^\}]|}(?!\}))+\}\}"
+        r"\{\{([^\}]|}(?!\}))+\}\}"
         # strip off {{ & }}
         t.value = t.value[2:-2]
         t.lexer.lineno += t.value.count('\n')

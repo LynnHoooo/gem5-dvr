@@ -25,6 +25,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import os
+import re
 
 import ply.lex
 import ply.yacc
@@ -38,6 +39,7 @@ class Grammar(object):
     def setupLexerFactory(self, **kwargs):
         if 'module' in kwargs:
             raise AttributeError("module is an illegal attribute")
+        kwargs.setdefault('reflags', re.MULTILINE | re.VERBOSE)
         self.lex_kwargs = kwargs
 
     def setupParserFactory(self, **kwargs):
