@@ -1942,6 +1942,7 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
             ++cpuStats.dvrReplayUnstableInputs;
     }
 
+    startDVRHelper(pc, replay->count, lanes);
     for (unsigned lane = 1; lane <= lanes; ++lane) {
         const Addr address = current_address + stride * lane;
         DVRPrefetchAddress prefetch;
@@ -2071,6 +2072,7 @@ CPU::launchDVRNestedPrefetches(
         }
     }
 
+    startDVRHelper(dvrNestedContext.triggerPC, replay->count, lanes);
     for (unsigned lane = 1; lane <= lanes; ++lane) {
         DVRPrefetchAddress prefetch;
         prefetch.address = dvrNestedContext.triggerAddress +
@@ -2179,7 +2181,7 @@ CPU::retireDVRPredicateLane(
 void
 CPU::serviceDVRPrefetchQueue()
 {
-    if (dvrPrefetchQueue.empty())
+    if (dvrPrefetchQueue.empty() || !dvrHelperThread.canIssue())
         return;
 
     const auto prefetch = dvrPrefetchQueue.front();
@@ -2241,6 +2243,7 @@ CPU::serviceDVRPrefetchQueue()
         return;
     }
     ++cpuStats.dvrPrefetchesIssued;
+    dvrHelperThread.issue();
     dvrQualityTracker.issued(
         reinterpret_cast<uintptr_t>(pkt), dvrPrefetchLine(req->getPaddr()),
         pkt->getSize(), curTick());
@@ -2320,9 +2323,24 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
     }
     if (state->nested)
         ++cpuStats.dvrNestedHelpersCompleted;
+    dvrHelperThread.complete();
     delete state;
     pkt->senderState = nullptr;
     delete pkt;
+}
+
+void
+CPU::startDVRHelper(Addr trigger_pc, unsigned program_uops, unsigned lanes)
+{
+    if (program_uops == 0 || lanes == 0)
+        return;
+
+    dvrHelperThread.begin(dvrNextHelperId++, trigger_pc, program_uops,
+                          lanes, dvrHelperMaxUops);
+    DPRINTF(O3CPU,
+            "DVR helper start id=%llu trigger=%#x uops=%u lanes=%u budget=%u\n",
+            static_cast<unsigned long long>(dvrHelperThread.id), trigger_pc,
+            program_uops, lanes, dvrHelperMaxUops);
 }
 
 bool

@@ -850,6 +850,78 @@ class CPU : public BaseCPU
         std::shared_ptr<DVRPredicateGeneration> predicate;
         unsigned lane = 0;
     };
+
+    /**
+     * Event-driven model of the decoupled DVR helper thread.
+     *
+     * The helper has its own program/lane progress and is stepped once per
+     * CPU cycle after the main thread has used the LSQ data port.  It does
+     * not modify the architectural register state; only its memory requests
+     * are allowed to enter the shared cache hierarchy.
+     */
+    struct DVRHelperThread
+    {
+        enum class State { Idle, Running, Draining };
+        State state = State::Idle;
+        uint64_t id = 0;
+        Addr triggerPC = 0;
+        unsigned programUops = 0;
+        unsigned maxUops = 0;
+        unsigned laneCount = 0;
+        unsigned nextLane = 0;
+        unsigned issuedUops = 0;
+        unsigned outstanding = 0;
+
+        void reset()
+        {
+            state = State::Idle;
+            id = 0;
+            triggerPC = 0;
+            programUops = 0;
+            maxUops = 0;
+            laneCount = 0;
+            nextLane = 0;
+            issuedUops = 0;
+            outstanding = 0;
+        }
+
+        void begin(uint64_t helper_id, Addr pc, unsigned uops,
+                   unsigned lanes, unsigned budget)
+        {
+            id = helper_id;
+            triggerPC = pc;
+            programUops = uops;
+            maxUops = budget;
+            laneCount = lanes;
+            nextLane = 0;
+            issuedUops = 0;
+            outstanding = 0;
+            state = State::Running;
+        }
+
+        bool canIssue() const
+        {
+            return state == State::Running && issuedUops < maxUops;
+        }
+
+        void issue()
+        {
+            ++issuedUops;
+            ++outstanding;
+            if (issuedUops >= maxUops)
+                state = State::Draining;
+        }
+
+        void complete()
+        {
+            if (outstanding != 0)
+                --outstanding;
+            if (state == State::Draining && outstanding == 0)
+                state = State::Idle;
+        }
+
+        bool active() const { return state != State::Idle; }
+    } dvrHelperThread;
     std::deque<DVRPrefetchAddress> dvrPrefetchQueue;
     struct DVRAddressRelation
     {
@@ -869,6 +941,7 @@ class CPU : public BaseCPU
     std::unordered_map<Addr, Tick> dvrCompletedPrefetchLines;
     uint64_t dvrPrefetchQueuePeak = 0;
     uint64_t dvrNextPredicateGeneration = 1;
+    uint64_t dvrNextHelperId = 1;
     std::shared_ptr<DVRPredicateGeneration> dvrActivePredicateGeneration;
     Addr dvrCurrentTriggerPC = 0;
     uint8_t dvrSelectedRelationSlots = 0;
@@ -936,6 +1009,8 @@ class CPU : public BaseCPU
         unsigned lanes,
         const DVRLoopBoundDetector::RegisterSnapshot &finish_regs);
     void serviceDVRPrefetchQueue();
+    void startDVRHelper(Addr trigger_pc, unsigned program_uops,
+                        unsigned lanes);
     Addr dvrPrefetchLine(Addr address) const;
     void accountDVRDemand(Addr address);
     void updateDVRPrefetchQueuePeak();
