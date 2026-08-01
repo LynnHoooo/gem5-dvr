@@ -332,8 +332,16 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
     const uint32_t funct3 = (uop.encoding >> 12) & 0x7;
     const uint32_t funct7 = (uop.encoding >> 25) & 0x7f;
 
-    if (opcode == 0x33 && funct3 == 0 && funct7 == 0) {
-        uop.semantic = Semantic::Add;
+    if (opcode == 0x33) {
+        if (funct3 == 0 && funct7 == 0) uop.semantic = Semantic::Add;
+        else if (funct3 == 0 && funct7 == 0x20) uop.semantic = Semantic::Sub;
+        else if (funct3 == 7 && funct7 == 0) uop.semantic = Semantic::And;
+        else if (funct3 == 6 && funct7 == 0) uop.semantic = Semantic::Or;
+        else if (funct3 == 4 && funct7 == 0) uop.semantic = Semantic::Xor;
+        else if (funct3 == 1 && funct7 == 0) uop.semantic = Semantic::ShiftLeft;
+        else if (funct3 == 5 && funct7 == 0) uop.semantic = Semantic::ShiftRightLogical;
+        else if (funct3 == 5 && funct7 == 0x20) uop.semantic = Semantic::ShiftRightArithmetic;
+        else if (funct3 == 0 && funct7 == 1) uop.semantic = Semantic::Multiply;
         return;
     }
 
@@ -347,6 +355,18 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
         } else if (funct3 == 7) {
             uop.semantic = Semantic::AndImmediate;
             uop.immediate = dvrSignExtend(uop.encoding >> 20, 12);
+        } else if (funct3 == 6) {
+            uop.semantic = Semantic::OrImmediate;
+            uop.immediate = dvrSignExtend(uop.encoding >> 20, 12);
+        } else if (funct3 == 4) {
+            uop.semantic = Semantic::XorImmediate;
+            uop.immediate = dvrSignExtend(uop.encoding >> 20, 12);
+        } else if (funct3 == 5 && ((uop.encoding >> 26) == 0)) {
+            uop.semantic = Semantic::ShiftRightLogicalImmediate;
+            uop.immediate = (uop.encoding >> 20) & 0x3f;
+        } else if (funct3 == 5 && ((uop.encoding >> 26) == 0x10)) {
+            uop.semantic = Semantic::ShiftRightArithmeticImmediate;
+            uop.immediate = (uop.encoding >> 20) & 0x3f;
         }
         return;
     }
@@ -368,6 +388,31 @@ DVRInstructionRecorder::Uop::evaluate(
       case Semantic::Add:
         result = source0_value + source1_value;
         return true;
+      case Semantic::Sub:
+        result = source0_value - source1_value;
+        return true;
+      case Semantic::And:
+        result = source0_value & source1_value;
+        return true;
+      case Semantic::Or:
+        result = source0_value | source1_value;
+        return true;
+      case Semantic::Xor:
+        result = source0_value ^ source1_value;
+        return true;
+      case Semantic::ShiftLeft:
+        result = source0_value << (source1_value & 0x3f);
+        return true;
+      case Semantic::ShiftRightLogical:
+        result = source0_value >> (source1_value & 0x3f);
+        return true;
+      case Semantic::ShiftRightArithmetic:
+        result = static_cast<RegVal>(static_cast<int64_t>(source0_value) >>
+            (source1_value & 0x3f));
+        return true;
+      case Semantic::Multiply:
+        result = source0_value * source1_value;
+        return true;
       case Semantic::AddImmediate:
       case Semantic::LoadAddress:
         result = source0_value + static_cast<RegVal>(immediate);
@@ -377,6 +422,19 @@ DVRInstructionRecorder::Uop::evaluate(
         return true;
       case Semantic::AndImmediate:
         result = source0_value & static_cast<RegVal>(immediate);
+        return true;
+      case Semantic::OrImmediate:
+        result = source0_value | static_cast<RegVal>(immediate);
+        return true;
+      case Semantic::XorImmediate:
+        result = source0_value ^ static_cast<RegVal>(immediate);
+        return true;
+      case Semantic::ShiftRightLogicalImmediate:
+        result = source0_value >> (static_cast<unsigned>(immediate) & 0x3f);
+        return true;
+      case Semantic::ShiftRightArithmeticImmediate:
+        result = static_cast<RegVal>(static_cast<int64_t>(source0_value) >>
+            (static_cast<unsigned>(immediate) & 0x3f));
         return true;
       case Semantic::Unsupported:
         return false;

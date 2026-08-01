@@ -1133,3 +1133,27 @@ VR-like 的 cycles 明显更低、misses 也更低，但它在 BFS/BC/CC/PR/SSSP
 Nested flatten 统计：BC `57/114/2702`、BFS `0/0/0`、CC `10/20/1280`、PR
 `4283/8566/285973`、SSSP `15/30/320`（分别为 batches/outer instances/
 flattened lanes）。
+
+## 16. P0 evaluator 进展
+
+服务器最新提交上已扩展 `DVRInstructionRecorder::Semantic` 和逐 lane evaluator，
+新增 RV64 常见整数数据流：`SUB`、寄存器 `AND/OR/XOR`、寄存器移位
+`SLL/SRL/SRA`、`MUL`，以及 `ORI/XORI/SRLI/SRAI`。二元语义现在显式读取第二个
+source register；未覆盖指令仍返回 `Unsupported`，不会静默近似。
+
+固定 Python 3.11/Nix 环境重新编译成功，Stage15 资源验证通过：
+
+```text
+DVR_STAGE15_RESOURCE_PASSED cycles=2494131 helper_issue_cycles=94199
+conflicts=51594 issue_conflicts=10290 alu_conflicts=0 lsu_conflicts=41304
+main_issue=2003631 main_thread_suppressed=242974 dvr_issued=94199
+```
+
+这完成了 P0 evaluator 的第一批可审计扩展，但不应写成“全部 opcode 覆盖”：
+`ADDW/SUBW`、word sign-extension、load width/sign-extension、RVC 变体、完整 branch
+path evaluator 和严格的论文 NDM branch inversion 仍然是后续缺口。当前 P0 状态应记录为：
+
+- Stage13 一键回归：已完成；
+- GAP 五 workload 六模式实验：已完成；
+- evaluator 常见整数语义：已扩展并编译/Stage15 验证；
+- 完整论文 NDM 与真实 FU pipeline：尚未完成。

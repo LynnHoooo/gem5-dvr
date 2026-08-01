@@ -148,9 +148,21 @@ class DVRInstructionRecorder
         {
             Unsupported,
             Add,
+            Sub,
+            And,
+            Or,
+            Xor,
+            ShiftLeft,
+            ShiftRightLogical,
+            ShiftRightArithmetic,
+            Multiply,
             AddImmediate,
             ShiftLeftImmediate,
             AndImmediate,
+            OrImmediate,
+            XorImmediate,
+            ShiftRightLogicalImmediate,
+            ShiftRightArithmeticImmediate,
             LoadAddress
         };
 

@@ -2519,7 +2519,23 @@ CPU::replayDVRSource(const DVRPrefetchSenderState &state,
             return false;
         const RegVal source0 = regs[uop.source0];
         RegVal source1 = 0;
-        if (uop.semantic == DVRInstructionRecorder::Uop::Semantic::Add) {
+        if (uop.semantic != DVRInstructionRecorder::Uop::Semantic::Add &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::Sub &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::And &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::Or &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::Xor &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::ShiftLeft &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::ShiftRightLogical &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::ShiftRightArithmetic &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::Multiply &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::AddImmediate &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::AndImmediate &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::OrImmediate &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::XorImmediate &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::ShiftLeftImmediate &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::ShiftRightLogicalImmediate &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::ShiftRightArithmeticImmediate &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::LoadAddress) {
             if (uop.source1 < 0 ||
                 uop.source1 >=
                     DVRLoopBoundDetector::MaxArchitecturalIntRegs)
