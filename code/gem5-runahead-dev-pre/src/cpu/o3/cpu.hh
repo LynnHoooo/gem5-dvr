@@ -829,6 +829,7 @@ class CPU : public BaseCPU
 
     /** DVR 发现开关及其主要状态结构。 */
     bool enableDVR;
+    std::string dvrMode;
     DVRStrideDetector dvrStrideDetector;
     DVRDiscoveryController dvrDiscovery;
     DVRNestedController dvrNestedController;
@@ -1027,7 +1028,9 @@ class CPU : public BaseCPU
     void launchDVRStridePrefetches(ThreadID tid, Addr current_address,
                                    Addr pc, int64_t stride, unsigned lanes,
                                    const DVRLoopBoundDetector::RegisterSnapshot
-                                       &finish_regs);
+                                   &finish_regs);
+    void launchDVRVectorRunahead(ThreadID tid, Addr current_address,
+                                 Addr pc, int64_t stride);
     void completeDVRNestedContext(
         const DynInstPtr &committing_inst,
         const DVRLoopBoundDetector::RegisterSnapshot &finish_regs);

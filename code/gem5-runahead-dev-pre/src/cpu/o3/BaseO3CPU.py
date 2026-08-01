@@ -176,6 +176,8 @@ class BaseO3CPU(BaseCPU):
     enablePREEarlyRecycle = Param.Bool(False, "Enable register early recycle "
                                        "in PRE")
     enableDVR = Param.Bool(False, "启用 DVR 发现阶段")
+    dvrMode = Param.String("nested",
+        "DVR ablation mode: vr, offload, discovery, full, or nested")
     dvrRPTEntries = Param.Unsigned(32, "DVR 步幅检测表项数")
     dvrMaxLanes = Param.Unsigned(128, "DVR 最大等效标量通道数")
     dvrHelperMaxUops = Param.Unsigned(200,

@@ -153,6 +153,7 @@ CPU::CPU(const BaseO3CPUParams &params)
       enablePRE(params.enablePRE),
       inPRE(false),
       enableDVR(params.enableDVR),
+      dvrMode(params.dvrMode),
       dvrStrideDetector(params.dvrRPTEntries),
       dvrDiscovery(params.dvrDiscoveryMaxInsts),
       dvrNestedController(params.dvrDiscoveryMaxInsts),
@@ -1676,7 +1677,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                     dvrNestedController.reset();
                     dvrNestedContext.reset();
                 }
-                if (dvrNestedController.startRoot(
+                if (dvrMode == "nested" && dvrNestedController.startRoot(
                         result.triggerPC, inst->seqNum).event ==
                     DVRNestedController::Event::Started) {
                     ++cpuStats.dvrNestedRootStarts;
@@ -1741,7 +1742,8 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 else
                     ++cpuStats.dvrLoopBoundFallbacks;
                 cpuStats.dvrRecordedUops += dvrInstructionRecorder.size();
-                bool helper_allowed = dvrInstructionRecorder.size() > 1 &&
+                bool helper_allowed = dvrMode != "discovery" &&
+                                      dvrInstructionRecorder.size() > 1 &&
                                       dvrTaintTracker.flr() != 0 &&
                                       inference.matched &&
                                       !dvrInstructionRecorder.overflow();
@@ -2008,6 +2010,27 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
         prefetch.patterns = patterns;
         prefetch.replay = replay;
         prefetch.predicate = predicate;
+        prefetch.lane = lane - 1;
+        dvrPrefetchQueue.push_back(prefetch);
+        ++cpuStats.dvrPrefetchesGenerated;
+    }
+    updateDVRPrefetchQueuePeak();
+}
+
+void
+CPU::launchDVRVectorRunahead(ThreadID tid, Addr current_address,
+                             Addr pc, int64_t stride)
+{
+    const unsigned lanes = std::min(dvrMaxLanes,
+                                    DVRLanePredicateTracker::MaxLanes);
+    dvrPrefetchQueue.clear();
+    startDVRHelper(pc, 1, lanes);
+    for (unsigned lane = 1; lane <= lanes; ++lane) {
+        DVRPrefetchAddress prefetch;
+        prefetch.address = current_address + stride * lane;
+        prefetch.pc = pc;
+        prefetch.tid = tid;
+        prefetch.source = false;
         prefetch.lane = lane - 1;
         dvrPrefetchQueue.push_back(prefetch);
         ++cpuStats.dvrPrefetchesGenerated;
@@ -2926,6 +2949,11 @@ CPU::observeDVRLoad(const DynInstPtr &inst, Addr address)
         inst->pcState().instAddr(), address);
     if (candidate) {
         ++cpuStats.dvrStrideCandidates;
+        if (dvrMode == "vr") {
+            launchDVRVectorRunahead(inst->threadNumber, candidate->address,
+                                    candidate->pc, candidate->stride);
+            return;
+        }
         if ((dvrDiscovery.isDiscovering() &&
              candidate->pc != dvrCurrentTriggerPC) ||
             dvrNestedDiscoveryMode.active()) {
