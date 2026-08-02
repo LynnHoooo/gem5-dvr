@@ -236,10 +236,10 @@ NDM 和 helper 前端的专项统计也可由以下入口检查：
 | 10 | 8-uop recorder/VRAT/VIR | 当前树通过 | 2396 programs，95470 VIR executions；真实 replay 守恒断言通过 |
 | 11 | actual-value predicate/reconvergence/timeout | 当前树完整通过 | divergent=3019，reconverged=604，abandoned=2415；forced timeout=1965/generated=0 |
 | 12 | predicate/quality 独立严格 smoke | 当前树通过 | actual-value mask 与质量计数器 `-Werror` smoke |
-| 14 | NDM 控制与 timeout | 通过 | dispatch Discovery、IR/ILR/LCR、outer candidate、timeout/fallback |
+| 14 | NDM 控制与 timeout | 通过 | dispatch Discovery、IR/ILR/LCR、至少两个 outer invocation、timeout/fallback |
 | 15 | helper 前端与资源竞争 | 通过 | fetch/decode/issue、主线程优先资源统计 |
 | 16 | NDM IR/ILR/LCR 与 outer invocation gate | 通过 | branch inversion、两个 outer invocation 后 Vectorizing、timeout fallback |
-| 17 | L1D workload 级 quality 事件 | 通过 | demand=294915，DVR issued=11306，timely=1653，coverage=0.010906，timeliness=0.541080 |
+| 17 | L1D workload 级 quality 事件 | 通过 | demand=294915，DVR issued=12588，timely=1717，coverage=0.011329，timeliness=0.565733 |
 
 Stage 9 的当前稳定结果：
 

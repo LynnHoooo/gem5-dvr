@@ -1664,6 +1664,19 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                                 dvrNestedDiscoveryMode.innerLaneCount())) {
                             ++cpuStats.dvrNDMOuterInvocations;
                         }
+                    } else if (
+                        dvrNestedDiscoveryMode.state() ==
+                            DVRNestedDiscoveryMode::State::OuterFound &&
+                        dvrPendingNestedCandidate.pc ==
+                            dvrNestedDiscoveryMode.outerLoadPCValue() &&
+                        dvrPendingNestedCandidate.stride ==
+                            dvrNestedDiscoveryMode.outerStrideValue() &&
+                        dvrNestedDiscoveryMode.recordOuterInvocation(
+                            dvrPendingNestedCandidate.address,
+                            dvrNestedDiscoveryMode.innerLaneCount())) {
+                        // The outer stride has already been found. Each later
+                        // committed instance is another NDM invocation.
+                        ++cpuStats.dvrNDMOuterInvocations;
                     }
                 }
                 if (dvrNestedController.depth() == 1) {

@@ -255,6 +255,7 @@ class DVRNestedDiscoveryMode
     unsigned innerLaneCount() const { return innerLanes; }
     int64_t innerIncrement() const { return increment; }
     Addr outerBaseAddress() const { return outerAddress; }
+    Addr outerLoadPCValue() const { return outerLoadPC; }
     int64_t outerStrideValue() const { return outerStride; }
     const Statistics &statistics() const { return counters; }
     const ControlState &controlState() const { return control; }

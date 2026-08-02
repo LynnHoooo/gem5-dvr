@@ -75,6 +75,11 @@ require_nonzero ndm_ilr_captures "$ilr"
 require_nonzero ndm_lcr_captures "$lcr"
 require_nonzero ndm_outer_invocations "$outer_invocations"
 require_nonzero helper_fetch_cycles "$helper_fetch"
+if (( outer_invocations < 2 )); then
+    printf 'error: expected at least two NDM outer invocations, got %s\n' \
+        "$outer_invocations" >&2
+    exit 1
+fi
 
 run_case dvr-stage14-ndm-disabled 1 512
 disabled="$RESULT_ROOT/dvr-stage14-ndm-disabled/stats.txt"
