@@ -732,6 +732,7 @@ class CPU : public BaseCPU
         statistics::Scalar dvrVIRChunkExecutions;
         statistics::Scalar dvrDivergentBranches;
         statistics::Scalar dvrReconvergences;
+        statistics::Scalar dvrVIRUnsupportedControlFlow;
         statistics::Scalar dvrPredicateGenerationAbandons;
         statistics::Scalar dvrHelperTimeouts;
         statistics::Scalar dvrReconvergenceStackOverflows;

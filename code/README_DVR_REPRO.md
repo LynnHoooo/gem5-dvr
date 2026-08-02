@@ -197,6 +197,7 @@ discovery complete
 | Source prefetch | `src/cpu/o3/cpu.cc` | `launchDVRStridePrefetches()`、`serviceDVRPrefetchQueue()` | Stage 7 |
 | Dependent replay | `src/cpu/o3/cpu.cc` | `replayDVRSource()`、`completeDVRPrefetch()`；`lsq.cc` 完成 response 回调 | Stage 8 |
 | Predicate / reconvergence | `src/cpu/o3/dvr_predicate.hh/.cc`；`cpu.cc` | `DVRLanePredicateTracker`；`retireDVRPredicateLane()` | Stage 11、12 |
+| Lane-PC unsupported path audit | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `executeLanePC()`；`unsupportedControlFlow`；`dvrVIRUnsupportedControlFlow` | Stage 11 |
 | Nested / Multiple | `src/cpu/o3/dvr_nested.hh/.cc`；`cpu.cc` | `DVRNestedController`、`DVRNestedDiscoveryMode`；`completeDVRNestedContext()`、`launchDVRNestedPrefetches()` | Stage 13、14 |
 | Quality metrics | `src/cpu/o3/dvr_quality.hh/.cc`；cache/LSQ 接线处 | `DVRQualityTracker::issued()`、`completed()`、`demandLookup()`、`cacheFill()` | Stage 12、15 |
 | Cache / LSQ timing | `src/cpu/o3/lsq_unit.cc`；`src/cpu/o3/lsq.cc`；`cpu.cc` | load address observation、helper packet response、prefetch queue service | Stage 7、8、9 |

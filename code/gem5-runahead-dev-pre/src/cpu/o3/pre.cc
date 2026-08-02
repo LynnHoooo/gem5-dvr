@@ -690,6 +690,8 @@ DVRVectorInstructionRegister::executeLanePC(
             }
             if (op_index >= 0)
                 break;
+            if (lanePC[lane] != 0)
+                result.unsupportedControlFlow = true;
             lane_active[lane] = false;
             activeMask[lane / 64] &= ~(uint64_t(1) << (lane % 64));
         }

@@ -277,6 +277,9 @@ class DVRVectorInstructionRegister
         unsigned helperUops = 0;
         bool timedOut = false;
         bool stackOverflow = false;
+        // A lane selected a nonzero PC outside the captured recorder.
+        // This is unsupported control flow, not normal completion.
+        bool unsupportedControlFlow = false;
     };
 
   private:

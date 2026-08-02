@@ -606,6 +606,10 @@ CPU::CPUStats::CPUStats(CPU *cpu)
       ADD_STAT(dvrReconvergences, statistics::units::Count::get(),
                "Completed divergent DVR predicate generations whose lane "
                "masks reconverged"),
+      ADD_STAT(dvrVIRUnsupportedControlFlow,
+               statistics::units::Count::get(),
+               "VIR programs terminated because a lane target was outside "
+               "the captured recorder"),
       ADD_STAT(dvrPredicateGenerationAbandons,
                statistics::units::Count::get(),
                "DVR predicate generations replaced before all lanes "
@@ -1886,6 +1890,10 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                         vir_result.divergentBranches;
                     cpuStats.dvrReconvergences +=
                         vir_result.reconvergences;
+                    if (vir_result.unsupportedControlFlow) {
+                        ++cpuStats.dvrVIRUnsupportedControlFlow;
+                        helper_allowed = false;
+                    }
                     if (vir_result.timedOut) {
                         ++cpuStats.dvrHelperTimeouts;
                         helper_allowed = false;
@@ -2207,8 +2215,12 @@ CPU::completeDVRNestedContext(
         cpuStats.dvrNestedVIRExecutions += vir_result.chunkExecutions;
         cpuStats.dvrDivergentBranches += vir_result.divergentBranches;
         cpuStats.dvrReconvergences += vir_result.reconvergences;
+        if (vir_result.unsupportedControlFlow) {
+            ++cpuStats.dvrVIRUnsupportedControlFlow;
+            helper_allowed = false;
+        }
         helper_allowed = !vir_result.timedOut &&
-            !vir_result.stackOverflow;
+            !vir_result.stackOverflow && helper_allowed;
     }
     if (helper_allowed) {
         // When NDM has accepted an outer stride, every child completion is
