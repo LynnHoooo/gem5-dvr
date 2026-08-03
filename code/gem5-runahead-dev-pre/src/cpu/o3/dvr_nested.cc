@@ -351,7 +351,10 @@ DVRNestedDiscoveryMode::observeCommit()
         return {};
 
     ++committedInstructions;
-    if (committedInstructions < maxInstructions)
+    const uint64_t budget = currentState == State::SeekingOuter ?
+        maxInstructions :
+        static_cast<uint64_t>(maxInstructions) * MaxOuterInvocations;
+    if (committedInstructions < budget)
         return snapshot(Event::None);
 
     const Result result = snapshot(Event::TimedOut);

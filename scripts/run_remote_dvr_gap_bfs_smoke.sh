@@ -13,8 +13,9 @@ if [[ ! -d "$GAP_ROOT/.git" ]]; then
 fi
 test "$(git -C "$GAP_ROOT" rev-parse HEAD)" = "$GAP_SHA"
 test -x "$GAP_CXX"
-make -C "$GAP_ROOT" SERIAL=1 CXX="$GAP_CXX" \
+make -B -C "$GAP_ROOT" SERIAL=1 CXX="$GAP_CXX" \
     CXX_FLAGS='-std=c++11 -O3 -Wall -static -fno-tree-vectorize' bfs
+file "$GAP_ROOT/bfs" | grep -q 'RISC-V'
 
 mkdir -p "$OUT_ROOT"
 {

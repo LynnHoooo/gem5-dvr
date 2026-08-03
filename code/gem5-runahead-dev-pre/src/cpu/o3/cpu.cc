@@ -1732,6 +1732,14 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 dvrPendingNestedCandidate.sequence == inst->seqNum &&
                 dvrPendingNestedCandidate.pc == inst->pcState().instAddr()) {
                 dvrCommittedNestedCandidate = dvrPendingNestedCandidate;
+                if (dvrNestedDiscoveryMode.active() &&
+                    dvrNestedController.depth() == 0 &&
+                    dvrNestedController.startRoot(
+                        dvrCurrentTriggerPC,
+                        dvrPendingNestedCandidate.sequence).event ==
+                        DVRNestedController::Event::Started) {
+                    ++cpuStats.dvrNestedRootStarts;
+                }
                 if (dvrNestedController.depth() == 1) {
                     const auto parent = dvrNestedController.currentId();
                     if (parent) {

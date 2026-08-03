@@ -68,13 +68,17 @@ outer_invocations="$(read_stat "$normal" system.cpu.dvrNDMOuterInvocations)"
 helper_fetch="$(read_stat "$normal" system.cpu.dvrHelperFetchCycles)"
 require_nonzero ndm_attempts "$attempts"
 require_nonzero ndm_outer_found "$outer"
-require_nonzero ndm_fallbacks "$fallbacks"
 require_nonzero ordinary_helpers "$helpers"
 require_nonzero ndm_ir_captures "$ir"
 require_nonzero ndm_ilr_captures "$ilr"
 require_nonzero ndm_lcr_captures "$lcr"
 require_nonzero ndm_outer_invocations "$outer_invocations"
 require_nonzero helper_fetch_cycles "$helper_fetch"
+if [[ -z "$fallbacks" || "$fallbacks" -ne 0 ]]; then
+    printf 'error: expected successful NDM fallbacks=0, got %s\n' \
+        "${fallbacks:-<missing>}" >&2
+    exit 1
+fi
 if (( outer_invocations < 2 )); then
     printf 'error: expected at least two NDM outer invocations, got %s\n' \
         "$outer_invocations" >&2
