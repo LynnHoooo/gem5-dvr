@@ -229,6 +229,46 @@ NDM 和 helper 前端的专项统计也可由以下入口检查：
 
 ## 4. 当前验证状态
 
+### 4.1 LeAP BFS/Camel 初步 workload 验证
+
+针对 `/home/lynnhoo/gem-test/gem5-leap/leap-bench`，新增脚本
+`scripts/run_remote_dvr_leap_bfs_camel_smoke.sh`。它只覆盖两个初步验证目标：
+
+```text
+gap/src/bfs.cc       -> leap_bfs_qemu-linux
+hpc/camel/camel.c    -> leap_camel_qemu-linux
+```
+
+脚本默认消费已经构建的 RV64 Linux ELF，并分别运行 Baseline 和 Nested DVR，
+检查 BFS 的 `BFS Tree has` 及 verifier 输出、Camel 的 `Result` 输出，以及
+stride candidates、Discovery starts、helper/source request 和 demand address
+统计。若本机有工具链，也可以用 `BUILD=1 LINUX_CC=... LINUX_CXX=...` 直接从
+两个源码构建单进程 ELF。脚本不使用 qemu-linux 的 fork wrapper，因为 gem5
+SE 运行该 wrapper 会在 `fork()` 处退出；脚本也不会把只有源码而没有成功执行
+的情况记为通过。
+
+示例（默认 smoke 输入为 BFS scale 6、Camel `MAX_KEY=1024`）：
+
+```bash
+BENCH_ROOT=/home/lynnhoo/gem-test/gem5-leap/leap-bench \
+BUILD=1 \
+LINUX_CC=/path/to/riscv64-unknown-linux-gnu-gcc \
+LINUX_CXX=/path/to/riscv64-unknown-linux-gnu-g++ \
+scripts/run_remote_dvr_leap_bfs_camel_smoke.sh
+```
+
+当前环境若未提供 RISC-V Linux 交叉编译器或两个 ELF，脚本会明确报告缺失项；
+这属于构建前置条件，不应伪造为 workload 级验证结果。规模可通过
+`BFS_SCALE`、`CAMEL_MAX_KEY` 调整；也可以直接用 `BFS` 和 `CAMEL` 指定已构建的
+单进程 ELF。
+
+在 2026-08-03 的本地临时副本 smoke 中，BFS scale 6 的 verifier 为 `PASS`，
+Nested DVR 产生了 47,652 个 stride candidate、3,062 次 Discovery start 和
+600 个 source request；Camel `MAX_KEY=1024` 产生了 1,355 个 candidate 和
+262 次 Discovery start。gem5-leap 的 qemu-linux wrapper 本身会调用 `fork()`，
+在 gem5 SE 中会因 syscall 不支持而退出，所以脚本构建的是直接 benchmark main，
+这组结果是流程验证，不是论文规模的性能结论。
+
 | Stage | 内容 | 当前状态 | 已获得的证据 |
 |---|---|---|---|
 | 1 | RPT stride detection | 通过 | 174317 loads，173525 candidates |
