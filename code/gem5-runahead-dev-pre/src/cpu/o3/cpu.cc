@@ -2841,7 +2841,14 @@ CPU::replayDVRSource(const DVRPrefetchSenderState &state,
             uop.semantic != DVRInstructionRecorder::Uop::Semantic::ShiftLeftImmediate &&
             uop.semantic != DVRInstructionRecorder::Uop::Semantic::ShiftRightLogicalImmediate &&
             uop.semantic != DVRInstructionRecorder::Uop::Semantic::ShiftRightArithmeticImmediate &&
-            uop.semantic != DVRInstructionRecorder::Uop::Semantic::LoadAddress) {
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::LoadAddress &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::LoadByteSigned &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::LoadHalfSigned &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::LoadWordSigned &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::LoadWordUnsigned &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::LoadDouble &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::AddWord &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::SubWord) {
             if (uop.source1 < 0 ||
                 uop.source1 >=
                     DVRLoopBoundDetector::MaxArchitecturalIntRegs)
@@ -2852,8 +2859,14 @@ CPU::replayDVRSource(const DVRPrefetchSenderState &state,
         if (!uop.evaluate(source0, source1, result))
             return false;
 
-        if (uop.semantic ==
-            DVRInstructionRecorder::Uop::Semantic::LoadAddress) {
+        const bool is_replayed_load =
+            uop.semantic == DVRInstructionRecorder::Uop::Semantic::LoadAddress ||
+            uop.semantic == DVRInstructionRecorder::Uop::Semantic::LoadByteSigned ||
+            uop.semantic == DVRInstructionRecorder::Uop::Semantic::LoadHalfSigned ||
+            uop.semantic == DVRInstructionRecorder::Uop::Semantic::LoadWordSigned ||
+            uop.semantic == DVRInstructionRecorder::Uop::Semantic::LoadWordUnsigned ||
+            uop.semantic == DVRInstructionRecorder::Uop::Semantic::LoadDouble;
+        if (is_replayed_load) {
             DVRPrefetchAddress dependent;
             dependent.address = static_cast<Addr>(result);
             if (dependent.address == 0 ||

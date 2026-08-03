@@ -457,7 +457,14 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
     }
 
     if (opcode == 0x03) {
-        uop.semantic = Semantic::LoadAddress;
+        switch (funct3) {
+          case 0: uop.semantic = Semantic::LoadByteSigned; break;
+          case 1: uop.semantic = Semantic::LoadHalfSigned; break;
+          case 2: uop.semantic = Semantic::LoadWordSigned; break;
+          case 3: uop.semantic = Semantic::LoadDouble; break;
+          case 4: uop.semantic = Semantic::LoadWordUnsigned; break;
+          default: uop.semantic = Semantic::Unsupported; return;
+        }
         uop.immediate = dvrSignExtend(uop.encoding >> 20, 12);
         return;
     }
@@ -539,6 +546,11 @@ DVRInstructionRecorder::Uop::evaluate(
         return true;
       case Semantic::AddImmediate:
       case Semantic::LoadAddress:
+      case Semantic::LoadByteSigned:
+      case Semantic::LoadHalfSigned:
+      case Semantic::LoadWordSigned:
+      case Semantic::LoadWordUnsigned:
+      case Semantic::LoadDouble:
         result = source0_value + static_cast<RegVal>(immediate);
         return true;
       case Semantic::AddWordImmediate:
