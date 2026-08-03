@@ -1,14 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${ROOT:-$HOME/dvr-repro/source/gem5-runahead-dev-pre}"
-BENCH="${BENCH:-$ROOT/benchmarks/dvr_dependent.riscv}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+ROOT="${ROOT:-$REPO_ROOT/code/gem5-runahead-dev-pre}"
+BENCH_ROOT="${BENCH_ROOT:-$ROOT/benchmarks}"
+if [[ ! -d "$BENCH_ROOT" && -d "$REPO_ROOT/../gem5-runahead-dev-pre/benchmarks" ]]; then
+    BENCH_ROOT="$REPO_ROOT/../gem5-runahead-dev-pre/benchmarks"
+fi
+BENCH="${BENCH:-$BENCH_ROOT/dvr_dependent.riscv}"
 OUT="${OUT:-$HOME/dvr-repro/results/dvr-stage7-prefetch}"
+GEM5="${GEM5:-$ROOT/build/RISCV/gem5.opt}"
+CONFIG="${CONFIG:-$ROOT/configs/dvr/table1_se.py}"
 
 rm -rf "$OUT"
 mkdir -p "$OUT"
-"$ROOT/build/RISCV/gem5.opt" --outdir="$OUT" \
-    "$ROOT/configs/dvr/table1_se.py" --cmd="$BENCH" --dvr
+"$GEM5" --outdir="$OUT" \
+    "$CONFIG" --cmd="$BENCH" --dvr \
+    --dvr-no-dependent-prefetch
 
 read_stat() {
     awk -v name="$2" '$1 == name { print $2; exit }' "$1"

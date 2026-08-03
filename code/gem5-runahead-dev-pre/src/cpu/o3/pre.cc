@@ -71,6 +71,20 @@ DVRStrideDetector::observe(Addr pc, Addr address)
     return std::nullopt;
 }
 
+std::optional<DVRStrideDetector::Candidate>
+DVRStrideDetector::observeDispatch(Addr pc) const
+{
+    for (const auto &entry : entries) {
+        if (entry.valid && entry.pc == pc && entry.stride != 0 &&
+            entry.confidence >= 2) {
+            return Candidate{pc, static_cast<Addr>(
+                static_cast<int64_t>(entry.lastAddress) + entry.stride),
+                entry.stride};
+        }
+    }
+    return std::nullopt;
+}
+
 void
 DVRStrideDetector::reset()
 {
@@ -90,15 +104,29 @@ void
 DVRDiscoveryController::arm(
     const DVRStrideDetector::Candidate &candidate, InstSeqNum sequence)
 {
-    // 只允许同时存在一个待启动的 Discovery。
+    // Discovery starts speculatively at dispatch; commit observes its end.
     if (state != State::Idle)
         return;
 
-    state = State::Armed;
+    state = State::Discovering;
     triggerPC = candidate.pc;
     triggerStride = candidate.stride;
     triggerSequence = sequence;
+    stopSequence = 0;
     instructions = 0;
+}
+
+bool
+DVRDiscoveryController::observeDispatch(Addr pc, InstSeqNum sequence)
+{
+    if (state != State::Discovering || sequence <= triggerSequence ||
+        stopSequence != 0)
+        return false;
+    if (pc == triggerPC) {
+        stopSequence = sequence;
+        return true;
+    }
+    return false;
 }
 
 DVRDiscoveryController::Result
@@ -123,7 +151,7 @@ DVRDiscoveryController::observeCommit(Addr pc, InstSeqNum sequence)
     if (state != State::Discovering || sequence <= triggerSequence)
         return {};
 
-    if (pc == triggerPC) {
+    if (stopSequence != 0 && sequence == stopSequence) {
         // 再次提交相同 trigger PC，表示本次 Discovery 到达循环边界。
         const Result result{
             Event::Completed, triggerPC, triggerStride, instructions};
@@ -143,6 +171,15 @@ DVRDiscoveryController::observeCommit(Addr pc, InstSeqNum sequence)
     return {};
 }
 
+bool
+DVRDiscoveryController::rollback(InstSeqNum squash_sequence)
+{
+    if (state == State::Idle || triggerSequence < squash_sequence)
+        return false;
+    finish();
+    return true;
+}
+
 void
 DVRDiscoveryController::finish()
 {
@@ -150,6 +187,7 @@ DVRDiscoveryController::finish()
     triggerPC = 0;
     triggerStride = 0;
     triggerSequence = 0;
+    stopSequence = 0;
     instructions = 0;
 }
 
@@ -215,6 +253,19 @@ DVRVectorTaintTracker::observe(const DynInstPtr &inst)
         setTainted(inst->destRegIdx(idx), source_tainted);
 
     return {source_tainted, dependent_load};
+}
+
+DVRVectorTaintTracker::Observation
+DVRVectorTaintTracker::classify(const DynInstPtr &inst) const
+{
+    bool source_tainted = false;
+    for (int idx = 0; idx < inst->numSrcRegs(); ++idx) {
+        if (isTainted(inst->srcRegIdx(idx))) {
+            source_tainted = true;
+            break;
+        }
+    }
+    return {source_tainted, inst->isLoad() && source_tainted};
 }
 
 void
@@ -325,6 +376,15 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
             uop.semantic = Semantic::Add;
             return;
         }
+
+        // C.BEQZ/C.BNEZ rs1', offset -- quadrant 1.  The second
+        // comparison operand is architectural x0 and is represented by the
+        // absent source1 register, which the VIR evaluator treats as zero.
+        if (quadrant == 1 && (funct3 == 6 || funct3 == 7)) {
+            uop.semantic = funct3 == 6 ? Semantic::BranchEqual :
+                                         Semantic::BranchNotEqual;
+            return;
+        }
         return;
     }
 
@@ -345,11 +405,9 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
         return;
     }
 
-    // RV64I word operations: the architectural result is sign-extended
-    // from 32 bits.  Keep these distinct from ADD/SUB so replay cannot
-    // accidentally preserve the upper half of a 64-bit operand.
     if (opcode == 0x3b) {
-        if (funct3 == 0 && funct7 == 0) uop.semantic = Semantic::AddWord;
+        if (funct3 == 0 && funct7 == 0)
+            uop.semantic = Semantic::AddWord;
         else if (funct3 == 0 && funct7 == 0x20)
             uop.semantic = Semantic::SubWord;
         return;
@@ -381,16 +439,55 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
         return;
     }
 
-    if (opcode == 0x03) {
-        switch (funct3) {
-          case 0: uop.semantic = Semantic::LoadByteSigned; break; // LB
-          case 1: uop.semantic = Semantic::LoadHalfSigned; break; // LH
-          case 2: uop.semantic = Semantic::LoadWordSigned; break; // LW
-          case 3: uop.semantic = Semantic::LoadDouble; break; // LD
-          case 4: uop.semantic = Semantic::LoadWordUnsigned; break; // LWU
-          default: uop.semantic = Semantic::Unsupported; return;
+    if (opcode == 0x1b) {
+        if (funct3 == 0) {
+            uop.semantic = Semantic::AddWordImmediate;
+            uop.immediate = dvrSignExtend(uop.encoding >> 20, 12);
+        } else if (funct3 == 1 && (uop.encoding >> 25) == 0) {
+            uop.semantic = Semantic::ShiftLeftWordImmediate;
+            uop.immediate = (uop.encoding >> 20) & 0x1f;
+        } else if (funct3 == 5 && (uop.encoding >> 25) == 0) {
+            uop.semantic = Semantic::ShiftRightLogicalWordImmediate;
+            uop.immediate = (uop.encoding >> 20) & 0x1f;
+        } else if (funct3 == 5 && (uop.encoding >> 25) == 0x20) {
+            uop.semantic = Semantic::ShiftRightArithmeticWordImmediate;
+            uop.immediate = (uop.encoding >> 20) & 0x1f;
         }
+        return;
+    }
+
+    if (opcode == 0x03) {
+        uop.semantic = Semantic::LoadAddress;
         uop.immediate = dvrSignExtend(uop.encoding >> 20, 12);
+        return;
+    }
+
+    // Preserve the actual RV64 branch comparison for value-driven VIR
+    // continuation; branchTaken only describes the path observed during
+    // discovery and must not be used as the predicate itself.
+    if (opcode == 0x63) {
+        switch (funct3) {
+          case 0:
+            uop.semantic = Semantic::BranchEqual;
+            break;
+          case 1:
+            uop.semantic = Semantic::BranchNotEqual;
+            break;
+          case 4:
+            uop.semantic = Semantic::BranchSignedLess;
+            break;
+          case 5:
+            uop.semantic = Semantic::BranchSignedGreaterEqual;
+            break;
+          case 6:
+            uop.semantic = Semantic::BranchUnsignedLess;
+            break;
+          case 7:
+            uop.semantic = Semantic::BranchUnsignedGreaterEqual;
+            break;
+          default:
+            break;
+        }
     }
 }
 
@@ -431,29 +528,31 @@ DVRInstructionRecorder::Uop::evaluate(
         result = source0_value * source1_value;
         return true;
       case Semantic::AddWord:
-        result = static_cast<RegVal>(static_cast<int64_t>(
-            static_cast<int32_t>(source0_value + source1_value)));
+        result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
+            static_cast<uint32_t>(source0_value) +
+            static_cast<uint32_t>(source1_value))));
         return true;
       case Semantic::SubWord:
-        result = static_cast<RegVal>(static_cast<int64_t>(
-            static_cast<int32_t>(source0_value - source1_value)));
+        result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
+            static_cast<uint32_t>(source0_value) -
+            static_cast<uint32_t>(source1_value))));
         return true;
       case Semantic::AddImmediate:
       case Semantic::LoadAddress:
         result = source0_value + static_cast<RegVal>(immediate);
         return true;
-      case Semantic::LoadByteSigned:
-      case Semantic::LoadHalfSigned:
-      case Semantic::LoadWordSigned:
-      case Semantic::LoadWordUnsigned:
-      case Semantic::LoadDouble:
-        // The memory request and response supply the loaded value.  These
-        // semantics are markers for the next dependent load address; the
-        // address itself is still base+offset.
-        result = source0_value + static_cast<RegVal>(immediate);
+      case Semantic::AddWordImmediate:
+        result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
+            static_cast<uint32_t>(source0_value) +
+            static_cast<uint32_t>(immediate))));
         return true;
       case Semantic::ShiftLeftImmediate:
         result = source0_value << (static_cast<unsigned>(immediate) & 0x3f);
+        return true;
+      case Semantic::ShiftLeftWordImmediate:
+        result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
+            static_cast<uint32_t>(source0_value) <<
+            (static_cast<unsigned>(immediate) & 0x1f))));
         return true;
       case Semantic::AndImmediate:
         result = source0_value & static_cast<RegVal>(immediate);
@@ -471,10 +570,56 @@ DVRInstructionRecorder::Uop::evaluate(
         result = static_cast<RegVal>(static_cast<int64_t>(source0_value) >>
             (static_cast<unsigned>(immediate) & 0x3f));
         return true;
+      case Semantic::ShiftRightLogicalWordImmediate:
+        result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
+            static_cast<uint32_t>(source0_value) >>
+            (static_cast<unsigned>(immediate) & 0x1f))));
+        return true;
+      case Semantic::ShiftRightArithmeticWordImmediate:
+        result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
+            static_cast<int32_t>(source0_value) >>
+            (static_cast<unsigned>(immediate) & 0x1f))));
+        return true;
+      case Semantic::BranchEqual:
+      case Semantic::BranchNotEqual:
+      case Semantic::BranchSignedLess:
+      case Semantic::BranchSignedGreaterEqual:
+      case Semantic::BranchUnsignedLess:
+      case Semantic::BranchUnsignedGreaterEqual:
       case Semantic::Unsupported:
         return false;
     }
     return false;
+}
+
+bool
+DVRInstructionRecorder::Uop::evaluateBranch(
+    RegVal source0_value, RegVal source1_value, bool &taken) const
+{
+    switch (semantic) {
+      case Semantic::BranchEqual:
+        taken = source0_value == source1_value;
+        return true;
+      case Semantic::BranchNotEqual:
+        taken = source0_value != source1_value;
+        return true;
+      case Semantic::BranchSignedLess:
+        taken = static_cast<int64_t>(source0_value) <
+            static_cast<int64_t>(source1_value);
+        return true;
+      case Semantic::BranchSignedGreaterEqual:
+        taken = static_cast<int64_t>(source0_value) >=
+            static_cast<int64_t>(source1_value);
+        return true;
+      case Semantic::BranchUnsignedLess:
+        taken = source0_value < source1_value;
+        return true;
+      case Semantic::BranchUnsignedGreaterEqual:
+        taken = source0_value >= source1_value;
+        return true;
+      default:
+        return false;
+    }
 }
 
 void
@@ -487,6 +632,14 @@ DVRInstructionRecorder::begin(const DynInstPtr &trigger)
 bool
 DVRInstructionRecorder::record(const DynInstPtr &inst)
 {
+    // The first instruction observed after a conditional branch is the
+    // committed reconvergence boundary for this captured path.  Preserve it
+    // in the branch uop instead of making VIR infer a boundary from the next
+    // array slot at execution time.
+    if (count != 0 && uops[count - 1].conditional &&
+        uops[count - 1].reconvergencePC == 0)
+        uops[count - 1].reconvergencePC = inst->pcState().instAddr();
+
     // 记录有限数量的 uop；超出容量后禁止使用该模板。
     if (count >= MaxUops) {
         overflowed = true;
@@ -515,11 +668,55 @@ DVRInstructionRecorder::record(const DynInstPtr &inst)
 }
 
 void
+DVRInstructionRecorder::import(const std::array<Uop, MaxUops> &source,
+                                unsigned size)
+{
+    reset();
+    count = std::min(size, MaxUops);
+    for (unsigned index = 0; index < count; ++index)
+        uops[index] = source[index];
+}
+
+void
 DVRInstructionRecorder::reset()
 {
     uops = {};
     count = 0;
     overflowed = false;
+}
+
+DVRInstructionRecorder::ResourceCounts
+DVRInstructionRecorder::resourceCounts() const
+{
+    ResourceCounts resources;
+    for (unsigned index = 0; index < count; ++index) {
+        const auto &uop = uops[index];
+        if (uop.load || uop.semantic == Uop::Semantic::LoadAddress) {
+            ++resources.lsu;
+            continue;
+        }
+        if (uop.semantic == Uop::Semantic::Multiply) {
+            ++resources.multiply;
+            continue;
+        }
+        switch (uop.semantic) {
+          case Uop::Semantic::ShiftLeft:
+          case Uop::Semantic::ShiftRightLogical:
+          case Uop::Semantic::ShiftRightArithmetic:
+          case Uop::Semantic::ShiftLeftImmediate:
+          case Uop::Semantic::ShiftLeftWordImmediate:
+          case Uop::Semantic::ShiftRightLogicalImmediate:
+          case Uop::Semantic::ShiftRightArithmeticImmediate:
+          case Uop::Semantic::ShiftRightLogicalWordImmediate:
+          case Uop::Semantic::ShiftRightArithmeticWordImmediate:
+            ++resources.shift;
+            break;
+          default:
+            ++resources.alu;
+            break;
+        }
+    }
+    return resources;
 }
 
 DVRVectorRenameTable::DVRVectorRenameTable()
@@ -567,16 +764,190 @@ DVRVectorRenameTable::lookup(unsigned architectural, unsigned chunk) const
 }
 
 DVRVectorInstructionRegister::Result
+DVRVectorInstructionRegister::executeLanePC(
+    const DVRInstructionRecorder &program, unsigned lanes,
+    unsigned max_helper_uops,
+    const std::array<RegVal, 32> &initial_regs, unsigned start_index,
+    int source_destination, RegVal source_value)
+{
+    reset();
+    Result result;
+    lanes = std::min(lanes, 128U);
+    if (program.size() == 0 || start_index >= program.size() ||
+        lanes == 0 || max_helper_uops == 0)
+        return result;
+
+    std::array<bool, 128> lane_active = {};
+    std::array<bool, DVRInstructionRecorder::MaxUops> pending_reconvergence =
+        {};
+    const Addr entry = program[start_index].pc;
+    for (unsigned lane = 0; lane < lanes; ++lane) {
+        lane_active[lane] = true;
+        lanePC[lane] = entry;
+        activeMask[lane / 64] |= uint64_t(1) << (lane % 64);
+        for (unsigned reg = 0;
+             reg < DVRVectorRenameTable::NumArchitecturalRegs; ++reg)
+            vectorRegs[reg][lane] = initial_regs[reg];
+        if (source_destination >= 0 &&
+            source_destination < DVRVectorRenameTable::NumArchitecturalRegs)
+            vectorRegs[source_destination][lane] = source_value;
+    }
+    result.activeLanes = lanes;
+
+    const unsigned chunks = (lanes + 15) / 16;
+    for (unsigned step = 0; step < max_helper_uops; ++step) {
+        int op_index = -1;
+        Addr group_pc = 0;
+        for (unsigned lane = 0; lane < lanes; ++lane) {
+            if (!lane_active[lane])
+                continue;
+            for (unsigned candidate = 0; candidate < program.size();
+                 ++candidate) {
+                if (program[candidate].pc == lanePC[lane]) {
+                    op_index = candidate;
+                    group_pc = lanePC[lane];
+                    break;
+                }
+            }
+            if (op_index >= 0)
+                break;
+            if (lanePC[lane] != 0) {
+                result.unsupportedControlFlow = true;
+                ++result.externalPathLanes;
+            }
+            lane_active[lane] = false;
+            activeMask[lane / 64] &= ~(uint64_t(1) << (lane % 64));
+        }
+        if (op_index < 0)
+            break;
+
+        const auto &op = program[op_index];
+        if (pending_reconvergence[op_index]) {
+            ++result.reconvergences;
+            pending_reconvergence[op_index] = false;
+            if (stackDepth != 0)
+                --stackDepth;
+        }
+
+        std::array<bool, 128> executing = {};
+        bool has_taken = false;
+        bool has_fallthrough = false;
+        for (unsigned lane = 0; lane < lanes; ++lane) {
+            if (!lane_active[lane] || lanePC[lane] != group_pc)
+                continue;
+            executing[lane] = true;
+            const RegVal lhs = op.source0 >= 0 ?
+                vectorRegs[op.source0][lane] : 0;
+            const RegVal rhs = op.source1 >= 0 ?
+                vectorRegs[op.source1][lane] : 0;
+            if (op.conditional) {
+                // The initial vector pass is a control-flow audit and runs
+                // before asynchronous source values exist.  Preserve its
+                // conservative discovered-path behavior.  A response-driven
+                // continuation, in contrast, has a real source value and
+                // must evaluate the decoded architectural comparison.
+                bool lane_taken = (lhs != 0) == op.branchTaken;
+                if (start_index != 0 &&
+                    !op.evaluateBranch(lhs, rhs, lane_taken)) {
+                    result.unsupportedControlFlow = true;
+                    ++result.externalPathLanes;
+                }
+                const Addr next = lane_taken ? op.branchTargetPC :
+                    (op.fallthroughPC != 0 ? op.fallthroughPC :
+                     (op_index + 1 < program.size() ?
+                      program[op_index + 1].pc : 0));
+                lanePC[lane] = next;
+                if (next == 0)
+                    ++result.earlyExitLanes;
+                has_taken |= lane_taken;
+                has_fallthrough |= !lane_taken;
+                continue;
+            }
+
+            RegVal value = 0;
+            if (!op.evaluate(lhs, rhs, value)) {
+                result.unsupportedControlFlow = true;
+                ++result.unsupportedSemanticLanes;
+                lane_active[lane] = false;
+                activeMask[lane / 64] &= ~(uint64_t(1) << (lane % 64));
+                continue;
+            }
+            if (op.destination >= 0)
+                vectorRegs[op.destination][lane] = value;
+            lanePC[lane] = op_index + 1 < program.size() ?
+                program[op_index + 1].pc : 0;
+            if (lanePC[lane] == 0)
+                ++result.normalTerminatedLanes;
+        }
+
+        if (has_taken && has_fallthrough) {
+            ++result.divergentBranches;
+            if (stackDepth >= ReconvergenceEntries) {
+                result.stackOverflow = true;
+                return result;
+            }
+            const Addr reconvergence = op.reconvergencePC != 0 ?
+                op.reconvergencePC : op.fallthroughPC;
+            for (unsigned candidate = 0; candidate < program.size();
+                 ++candidate) {
+                if (program[candidate].pc == reconvergence) {
+                    pending_reconvergence[candidate] = true;
+                    break;
+                }
+            }
+            ++stackDepth;
+        }
+
+        for (unsigned chunk = 0; chunk < chunks; ++chunk) {
+            const unsigned first = chunk * 16;
+            const unsigned last = std::min(first + 16, lanes);
+            unsigned active_in_chunk = 0;
+            for (unsigned lane = first; lane < last; ++lane)
+                active_in_chunk += executing[lane] && lane_active[lane];
+            if (active_in_chunk == 0)
+                continue;
+            issuedChunks |= uint16_t(1) << chunk;
+            executedChunks |= uint16_t(1) << chunk;
+            ++result.chunkIssues;
+            ++result.chunkExecutions;
+        }
+        ++result.helperUops;
+
+        bool any_active = false;
+        for (unsigned lane = 0; lane < lanes; ++lane)
+            any_active |= lane_active[lane] && lanePC[lane] != 0;
+        if (!any_active)
+            break;
+    }
+
+    if (result.helperUops >= max_helper_uops) {
+        bool any_active = false;
+        for (unsigned lane = 0; lane < lanes; ++lane)
+            any_active |= lane_active[lane] && lanePC[lane] != 0;
+        result.timedOut = any_active;
+    }
+    return result;
+}
+
+DVRVectorInstructionRegister::Result
 DVRVectorInstructionRegister::execute(
     const DVRInstructionRecorder &program, unsigned lanes,
-    unsigned max_helper_uops)
+    unsigned max_helper_uops,
+    const std::array<RegVal, 32> &initial_regs)
 {
+    return executeLanePC(program, lanes, max_helper_uops, initial_regs);
+
+    // Legacy mask-only implementation retained below as a reference while
+    // the lane-PC executor is validated against existing VIR counters.
     // 建立 active mask 和私有向量寄存器文件，再按 uop/lane 实际执行。
     reset();
     Result result;
     lanes = std::min(lanes, 128U);
+    if (program.size() == 0 || lanes == 0 || max_helper_uops == 0)
+        return result;
     for (unsigned lane = 0; lane < lanes; ++lane) {
         activeMask[lane / 64] |= uint64_t(1) << (lane % 64);
+        lanePC[lane] = program[0].pc;
         // lane ordinal is the only value known before asynchronous source
         // loads return; it provides a deterministic seed for address-only
         // instructions.  Real load values are consumed by the helper request
@@ -599,24 +970,24 @@ DVRVectorInstructionRegister::execute(
             ++result.reconvergences;
         }
 
-        // Execute a conditional uop as a SIMT control-flow operation.  The
-        // recorder currently provides the predicate source and direction but
-        // not a full branch target/reconvergence PC, so the deferred path is
-        // restored at the end of this branch operation.  This still exercises
-        // the lane mask and reconvergence stack rather than fabricating a
-        // single scalar path.
+        // Execute a conditional uop as a SIMT control-flow operation.  Each
+        // lane now records its selected target/fall-through PC; the deferred
+        // mask remains available at the recorded reconvergence boundary.
         if (op.conditional) {
             std::array<uint64_t, 2> taken = {};
             std::array<uint64_t, 2> deferred = {};
             for (unsigned lane = 0; lane < lanes; ++lane) {
                 const uint64_t bit = uint64_t(1) << (lane % 64);
                 const auto word = lane / 64;
-                if (!(activeMask[word] & bit))
+                if (!(activeMask[word] & bit) || lanePC[lane] != op.pc)
                     continue;
                 const RegVal predicate = op.source0 >= 0 ?
                     vectorRegs[op.source0][lane] : 0;
                 const bool value_taken = predicate != 0;
                 const bool lane_taken = value_taken == op.branchTaken;
+                lanePC[lane] = lane_taken ? op.branchTargetPC :
+                    (op.reconvergencePC != 0 ? op.reconvergencePC :
+                     op.fallthroughPC);
                 (lane_taken ? taken : deferred)[word] |= bit;
             }
 
@@ -647,7 +1018,8 @@ DVRVectorInstructionRegister::execute(
             const unsigned first = chunk * 16;
             const unsigned last = std::min(first + 16, lanes);
             for (unsigned lane = first; lane < last; ++lane) {
-                if (!(activeMask[lane / 64] & (uint64_t(1) << (lane % 64))))
+                if (!(activeMask[lane / 64] & (uint64_t(1) << (lane % 64))) ||
+                    lanePC[lane] != op.pc)
                     continue;
                 RegVal lhs = 0;
                 RegVal rhs = 0;
@@ -660,6 +1032,8 @@ DVRVectorInstructionRegister::execute(
                     continue;
                 if (op.destination >= 0)
                     vectorRegs[op.destination][lane] = value;
+                lanePC[lane] = uop + 1 < program.size() ?
+                    program[uop + 1].pc : 0;
                 ++active_in_chunk;
             }
             if (active_in_chunk == 0)
@@ -683,6 +1057,297 @@ DVRVectorInstructionRegister::execute(
     return result;
 }
 
+DVRVectorInstructionRegister::Result
+DVRVectorInstructionRegister::executeFromSource(
+    const std::array<DVRInstructionRecorder::Uop,
+                     DVRInstructionRecorder::MaxUops> &source,
+    unsigned size, int source_destination, RegVal source_value,
+    unsigned max_helper_uops,
+    const std::array<RegVal, 32> &initial_regs)
+{
+    DVRInstructionRecorder program;
+    program.import(source, size);
+    // Entry zero is the source load whose value arrived asynchronously.
+    // Start at the following captured uop so it cannot overwrite the value
+    // with an address calculation a second time.
+    return executeLanePC(program, 1, max_helper_uops, initial_regs, 1,
+                         source_destination, source_value);
+}
+
+void
+DVRVectorInstructionRegister::initializeSourceContinuation(
+    const std::array<DVRInstructionRecorder::Uop,
+                     DVRInstructionRecorder::MaxUops> &source,
+    unsigned size, unsigned lanes,
+    const std::array<RegVal, 32> &initial_regs)
+{
+    reset();
+    continuationLanes = std::min(lanes, 128U);
+    if (size <= 1 || continuationLanes == 0)
+        return;
+
+    continuationInitialized = true;
+    const Addr entry = source[1].pc;
+    for (unsigned lane = 0; lane < continuationLanes; ++lane) {
+        laneActive[lane] = true;
+        laneReady[lane] = false;
+        lanePC[lane] = entry;
+        activeMask[lane / 64] |= uint64_t(1) << (lane % 64);
+        for (unsigned reg = 0;
+             reg < DVRVectorRenameTable::NumArchitecturalRegs; ++reg)
+            vectorRegs[reg][lane] = initial_regs[reg];
+    }
+}
+
+DVRVectorInstructionRegister::Result
+DVRVectorInstructionRegister::resumeSourceLane(
+    const std::array<DVRInstructionRecorder::Uop,
+                     DVRInstructionRecorder::MaxUops> &source,
+    unsigned size, unsigned lane, int source_destination,
+    RegVal source_value, unsigned max_helper_uops)
+{
+    Result result;
+    if (!continuationInitialized || size <= 1 ||
+        lane >= continuationLanes || !laneActive[lane] ||
+        max_helper_uops == 0)
+        return result;
+
+    result.activeLanes = 1;
+    if (source_destination >= 0 &&
+        source_destination < DVRVectorRenameTable::NumArchitecturalRegs)
+        vectorRegs[source_destination][lane] = source_value;
+
+    for (unsigned step = 0; step < max_helper_uops; ++step) {
+        int op_index = -1;
+        for (unsigned candidate = 1; candidate < size; ++candidate) {
+            if (source[candidate].pc == lanePC[lane]) {
+                op_index = candidate;
+                break;
+            }
+        }
+
+        if (op_index < 0) {
+            if (lanePC[lane] != 0) {
+                result.unsupportedControlFlow = true;
+                ++result.externalPathLanes;
+            }
+            laneActive[lane] = false;
+            activeMask[lane / 64] &= ~(uint64_t(1) << (lane % 64));
+            break;
+        }
+
+        const auto &op = source[op_index];
+        if (lanePendingReconvergence[lane][op_index]) {
+            ++result.reconvergences;
+            lanePendingReconvergence[lane][op_index] = false;
+            if (laneStackDepth[lane] != 0)
+                --laneStackDepth[lane];
+        }
+
+        const RegVal lhs = op.source0 >= 0 ?
+            vectorRegs[op.source0][lane] : 0;
+        const RegVal rhs = op.source1 >= 0 ?
+            vectorRegs[op.source1][lane] : 0;
+        if (op.conditional) {
+            bool taken = false;
+            if (!op.evaluateBranch(lhs, rhs, taken)) {
+                result.unsupportedControlFlow = true;
+                ++result.externalPathLanes;
+                taken = (lhs != 0) == op.branchTaken;
+            }
+            const Addr next = taken ? op.branchTargetPC :
+                (op.fallthroughPC != 0 ? op.fallthroughPC :
+                 (op_index + 1 < size ? source[op_index + 1].pc : 0));
+            lanePC[lane] = next;
+            ++result.helperUops;
+            ++result.chunkIssues;
+            ++result.chunkExecutions;
+            if (next == 0) {
+                ++result.earlyExitLanes;
+                laneActive[lane] = false;
+                activeMask[lane / 64] &=
+                    ~(uint64_t(1) << (lane % 64));
+                break;
+            }
+            continue;
+        }
+
+        RegVal value = 0;
+        if (!op.evaluate(lhs, rhs, value)) {
+            result.unsupportedControlFlow = true;
+            ++result.unsupportedSemanticLanes;
+            laneActive[lane] = false;
+            activeMask[lane / 64] &= ~(uint64_t(1) << (lane % 64));
+            break;
+        }
+        if (op.destination >= 0)
+            vectorRegs[op.destination][lane] = value;
+        lanePC[lane] = op_index + 1 < size ? source[op_index + 1].pc : 0;
+        ++result.helperUops;
+        ++result.chunkIssues;
+        ++result.chunkExecutions;
+        if (lanePC[lane] == 0) {
+            ++result.normalTerminatedLanes;
+            laneActive[lane] = false;
+            activeMask[lane / 64] &= ~(uint64_t(1) << (lane % 64));
+            break;
+        }
+    }
+
+    if (result.helperUops >= max_helper_uops && laneActive[lane])
+        result.timedOut = true;
+    return result;
+}
+
+DVRVectorInstructionRegister::Result
+DVRVectorInstructionRegister::resumeSourceLanes(
+    const std::array<DVRInstructionRecorder::Uop,
+                     DVRInstructionRecorder::MaxUops> &source,
+    unsigned size, unsigned lane, int source_destination,
+    RegVal source_value, unsigned max_helper_uops)
+{
+    Result result;
+    if (!continuationInitialized || size <= 1 ||
+        lane >= continuationLanes || !laneActive[lane] ||
+        max_helper_uops == 0)
+        return result;
+
+    if (source_destination >= 0 &&
+        source_destination < DVRVectorRenameTable::NumArchitecturalRegs)
+        vectorRegs[source_destination][lane] = source_value;
+    laneReady[lane] = true;
+
+    for (unsigned step = 0; step < max_helper_uops; ++step) {
+        Addr group_pc = 0;
+        int op_index = -1;
+        for (unsigned candidate_lane = 0;
+             candidate_lane < continuationLanes; ++candidate_lane) {
+            if (!laneActive[candidate_lane] || !laneReady[candidate_lane])
+                continue;
+            group_pc = lanePC[candidate_lane];
+            for (unsigned candidate = 1; candidate < size; ++candidate) {
+                if (source[candidate].pc == group_pc) {
+                    op_index = candidate;
+                    break;
+                }
+            }
+            break;
+        }
+        if (op_index < 0) {
+            for (unsigned candidate_lane = 0;
+                 candidate_lane < continuationLanes; ++candidate_lane) {
+                if (!laneActive[candidate_lane] ||
+                    !laneReady[candidate_lane])
+                    continue;
+                laneActive[candidate_lane] = false;
+                laneReady[candidate_lane] = false;
+                activeMask[candidate_lane / 64] &=
+                    ~(uint64_t(1) << (candidate_lane % 64));
+                if (lanePC[candidate_lane] != 0) {
+                    result.unsupportedControlFlow = true;
+                    ++result.externalPathLanes;
+                }
+            }
+            break;
+        }
+
+        const auto &op = source[op_index];
+        ++result.pcGroups;
+        bool any_active = false;
+        unsigned group_lanes = 0;
+        bool has_taken = false;
+        bool has_fallthrough = false;
+        for (unsigned candidate_lane = 0;
+             candidate_lane < continuationLanes; ++candidate_lane) {
+            if (!laneActive[candidate_lane] || !laneReady[candidate_lane] ||
+                lanePC[candidate_lane] != group_pc)
+                continue;
+            any_active = true;
+            ++group_lanes;
+            const RegVal lhs = op.source0 >= 0 ?
+                vectorRegs[op.source0][candidate_lane] : 0;
+            const RegVal rhs = op.source1 >= 0 ?
+                vectorRegs[op.source1][candidate_lane] : 0;
+            if (op.conditional) {
+                bool taken = false;
+                if (!op.evaluateBranch(lhs, rhs, taken)) {
+                    result.unsupportedControlFlow = true;
+                    ++result.externalPathLanes;
+                    taken = (lhs != 0) == op.branchTaken;
+                }
+                const Addr next = taken ? op.branchTargetPC :
+                    (op.fallthroughPC != 0 ? op.fallthroughPC :
+                     (op_index + 1 < size ? source[op_index + 1].pc : 0));
+                lanePC[candidate_lane] = next;
+                has_taken |= taken;
+                has_fallthrough |= !taken;
+                if (next == 0) {
+                    ++result.earlyExitLanes;
+                    laneActive[candidate_lane] = false;
+                    laneReady[candidate_lane] = false;
+                    activeMask[candidate_lane / 64] &=
+                        ~(uint64_t(1) << (candidate_lane % 64));
+                }
+                continue;
+            }
+
+            RegVal value = 0;
+            if (!op.evaluate(lhs, rhs, value)) {
+                result.unsupportedControlFlow = true;
+                ++result.unsupportedSemanticLanes;
+                laneActive[candidate_lane] = false;
+                laneReady[candidate_lane] = false;
+                activeMask[candidate_lane / 64] &=
+                    ~(uint64_t(1) << (candidate_lane % 64));
+                continue;
+            }
+            if (op.destination >= 0)
+                vectorRegs[op.destination][candidate_lane] = value;
+            lanePC[candidate_lane] = op_index + 1 < size ?
+                source[op_index + 1].pc : 0;
+            if (lanePC[candidate_lane] == 0) {
+                ++result.normalTerminatedLanes;
+                laneActive[candidate_lane] = false;
+                laneReady[candidate_lane] = false;
+                activeMask[candidate_lane / 64] &=
+                    ~(uint64_t(1) << (candidate_lane % 64));
+            }
+        }
+
+        if (!any_active)
+            break;
+        result.activeLanes += group_lanes;
+        result.maxPCGroupLanes = std::max(result.maxPCGroupLanes,
+                                          group_lanes);
+        if (has_taken && has_fallthrough) {
+            ++result.divergentBranches;
+            // Each lane retains its own PC and active state.  The per-lane
+            // stack metadata is reserved for the reconvergence PC; lanes
+            // that leave the captured recorder are terminated above.
+            for (unsigned candidate_lane = 0;
+                 candidate_lane < continuationLanes; ++candidate_lane) {
+                if (laneActive[candidate_lane] &&
+                    laneReady[candidate_lane])
+                    ++laneStackDepth[candidate_lane];
+            }
+        }
+        ++result.helperUops;
+        ++result.chunkIssues;
+        ++result.chunkExecutions;
+    }
+
+    if (result.helperUops >= max_helper_uops) {
+        for (unsigned candidate_lane = 0;
+             candidate_lane < continuationLanes; ++candidate_lane) {
+            if (laneActive[candidate_lane] && laneReady[candidate_lane]) {
+                result.timedOut = true;
+                break;
+            }
+        }
+    }
+    return result;
+}
+
 RegVal
 DVRVectorInstructionRegister::laneValue(unsigned reg, unsigned lane) const
 {
@@ -697,6 +1362,14 @@ DVRVectorInstructionRegister::reset()
     activeMask = {};
     stack = {};
     vectorRegs = {};
+    lanePC = {};
+    laneActive = {};
+    laneReady = {};
+    lanePendingReconvergence = {};
+    laneStackDepth = {};
+    laneStack = {};
+    continuationLanes = 0;
+    continuationInitialized = false;
     stackDepth = 0;
     issuedChunks = 0;
     executedChunks = 0;
@@ -768,6 +1441,33 @@ DVRLoopBoundDetector::observe(const DynInstPtr &inst)
     if (!seenBranch && encloses_chain) {
         loopBranchPC = pc;
         loopTargetPC = target;
+        uint64_t encoded = 0;
+        if (inst->staticInst->asBytes(&encoded, sizeof(encoded)) >= 4 &&
+            (encoded & 0x7f) == 0x63) {
+            switch ((encoded >> 12) & 0x7) {
+              case 0:
+                comparison = Comparison::Equal;
+                break;
+              case 1:
+                comparison = Comparison::NotEqual;
+                break;
+              case 4:
+                comparison = Comparison::SignedLess;
+                break;
+              case 5:
+                comparison = Comparison::SignedGreaterEqual;
+                break;
+              case 6:
+                comparison = Comparison::UnsignedLess;
+                break;
+              case 7:
+                comparison = Comparison::UnsignedGreaterEqual;
+                break;
+              default:
+                comparison = Comparison::Unknown;
+                break;
+            }
+        }
         for (int idx = 0; idx < inst->numSrcRegs(); ++idx) {
             const RegId &src = inst->srcRegIdx(idx);
             if (src.classValue() != IntRegClass)
@@ -792,7 +1492,11 @@ DVRLoopBoundDetector::infer(const RegisterSnapshot &start,
 {
     // 一个寄存器应保持不变作为 bound，另一个应按固定步幅变化。
     Inference inference;
-    inference.lanes = max_lanes;
+    // A bound that cannot be proven must not silently become a 128-lane
+    // prefetch.  The paper's discovery path only vectorizes after a valid
+    // loop-control relation is established; callers treat lanes==0 as an
+    // explicit no-helper fallback.
+    inference.lanes = 0;
     if (!seenBranch || boundSource0 < 0 || boundSource1 < 0 ||
         boundSource0 >= MaxArchitecturalIntRegs ||
         boundSource1 >= MaxArchitecturalIntRegs)
@@ -820,11 +1524,24 @@ DVRLoopBoundDetector::infer(const RegisterSnapshot &start,
 
     uint64_t distance = 0;
     uint64_t step = 0;
-    if (increment > 0 && current < bound) {
-        distance = bound - current;
+    const bool signed_compare =
+        comparison == Comparison::SignedLess ||
+        comparison == Comparison::SignedGreaterEqual;
+    const int64_t signed_bound = static_cast<int64_t>(bound);
+    const int64_t signed_current = static_cast<int64_t>(current);
+    const bool below_bound = signed_compare ?
+        signed_current < signed_bound : current < bound;
+    const bool above_bound = signed_compare ?
+        signed_current > signed_bound : current > bound;
+    if (increment > 0 && below_bound) {
+        distance = signed_compare ?
+            static_cast<uint64_t>(signed_bound - signed_current) :
+            bound - current;
         step = increment;
-    } else if (increment < 0 && current > bound) {
-        distance = current - bound;
+    } else if (increment < 0 && above_bound) {
+        distance = signed_compare ?
+            static_cast<uint64_t>(signed_current - signed_bound) :
+            current - bound;
         step = uint64_t(-(increment + 1)) + 1;
     } else {
         return inference;
@@ -848,6 +1565,7 @@ DVRLoopBoundDetector::reset()
     loopTargetPC = 0;
     boundSource0 = -1;
     boundSource1 = -1;
+    comparison = Comparison::Unknown;
     seenBranch = false;
 }
 

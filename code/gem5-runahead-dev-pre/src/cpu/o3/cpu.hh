@@ -657,6 +657,7 @@ class CPU : public BaseCPU
         statistics::Scalar dvrDiscoveryCompletions;
         statistics::Scalar dvrDiscoveryTimeouts;
         statistics::Scalar dvrDiscoveryAbandons;
+        statistics::Scalar dvrDiscoveryRollbacks;
         statistics::Scalar dvrNestedRootStarts;
         statistics::Scalar dvrNestedStarts;
         statistics::Scalar dvrNestedCompletions;
@@ -683,11 +684,25 @@ class CPU : public BaseCPU
         statistics::Scalar dvrNDMOuterFound;
         statistics::Scalar dvrNDMFallbacks;
         statistics::Scalar dvrNDMTimeouts;
+        statistics::Scalar dvrNDMBranchInversions;
+        statistics::Scalar dvrNDMIRCaptures;
+        statistics::Scalar dvrNDMILRCaptures;
+        statistics::Scalar dvrNDMLCRCaptures;
+        statistics::Scalar dvrNDMOuterInvocations;
         statistics::Scalar dvrResourceConflicts;
         statistics::Scalar dvrIssueBudgetConflicts;
         statistics::Scalar dvrALUBudgetConflicts;
         statistics::Scalar dvrLSUBudgetConflicts;
         statistics::Scalar dvrHelperIssueCycles;
+        statistics::Scalar dvrHelperFetchCycles;
+        statistics::Scalar dvrHelperDecodeCycles;
+        statistics::Scalar dvrHelperReadyUops;
+        statistics::Scalar dvrHelperComputeCycles;
+        statistics::Scalar dvrHelperComputeConflicts;
+        statistics::Scalar dvrHelperALUOps;
+        statistics::Scalar dvrHelperShiftOps;
+        statistics::Scalar dvrHelperMultiplyOps;
+        statistics::Scalar dvrHelperLSUOps;
         statistics::Scalar dvrMainIssueSlotsUsed;
         statistics::Scalar dvrMainALUSlotsUsed;
         statistics::Scalar dvrMainLSUSlotsUsed;
@@ -723,10 +738,27 @@ class CPU : public BaseCPU
         statistics::Scalar dvrVIRChunkExecutions;
         statistics::Scalar dvrDivergentBranches;
         statistics::Scalar dvrReconvergences;
+        statistics::Scalar dvrVIRUnsupportedControlFlow;
+        statistics::Scalar dvrVIRNormalTerminatedLanes;
+        statistics::Scalar dvrVIREarlyExitLanes;
+        statistics::Scalar dvrVIRExternalPathLanes;
+        statistics::Scalar dvrVIRUnsupportedSemanticLanes;
+        statistics::Scalar dvrVIRSourceValueExecutions;
+        statistics::Scalar dvrVIRSourceValueBranches;
+        statistics::Scalar dvrVIRSourceValueExternalLanes;
+        statistics::Scalar dvrVIRSourceValueSemanticFailures;
+        statistics::Scalar dvrVIRSourceValueTerminations;
+        statistics::Scalar dvrVIRContinuationContexts;
+        statistics::Scalar dvrVIRContinuationResumes;
+        statistics::Scalar dvrVIRContinuationFallbacks;
+        statistics::Scalar dvrVIRContinuationPCGroups;
+        statistics::Scalar dvrVIRContinuationGroupedLanes;
+        statistics::Scalar dvrVIRContinuationMaxGroupWidth;
         statistics::Scalar dvrPredicateGenerationAbandons;
         statistics::Scalar dvrHelperTimeouts;
         statistics::Scalar dvrReconvergenceStackOverflows;
         statistics::Scalar dvrHelpersSuppressed;
+        statistics::Scalar dvrControlFallbackSourceLaunches;
         statistics::Scalar dvrPredicateSelections;
         statistics::Scalar dvrDistinctPredicatePaths;
         statistics::Scalar dvrPredicateMisses;
@@ -773,6 +805,8 @@ class CPU : public BaseCPU
 
     /** 用主线程 load 地址训练 DVR 的 RPT。 */
     void observeDVRLoad(const DynInstPtr &inst, Addr address);
+    /** IEW dispatch 阶段观察指令并启动/推进 DVR Discovery。 */
+    void observeDVRDispatch(const DynInstPtr &inst);
 
     struct DVRReplayTemplate
     {
@@ -781,6 +815,7 @@ class CPU : public BaseCPU
         std::array<DVRInstructionRecorder::Uop,
                    DVRInstructionRecorder::MaxUops> uops = {};
         DVRLoopBoundDetector::RegisterSnapshot initialRegs = {};
+        std::shared_ptr<DVRVectorInstructionRegister> continuation;
         bool valid = false;
     };
 
@@ -848,8 +883,11 @@ class CPU : public BaseCPU
     DVRVectorRenameTable dvrVectorRenameTable;
     DVRVectorInstructionRegister dvrVectorInstructionRegister;
     DVRLoopBoundDetector::RegisterSnapshot dvrDiscoveryStartRegs = {};
+    std::set<InstSeqNum> dvrDispatchTainted;
+    std::set<InstSeqNum> dvrDispatchDependentLoads;
     unsigned dvrMaxLanes;
     unsigned dvrHelperMaxUops;
+    bool dvrEnableDependentPrefetch;
     struct DVRPrefetchAddress
     {
         Addr address;
@@ -877,7 +915,7 @@ class CPU : public BaseCPU
      */
     struct DVRHelperThread
     {
-        enum class State { Idle, Running, Draining };
+        enum class State { Idle, Fetch, Decode, Running, Draining };
         State state = State::Idle;
         uint64_t id = 0;
         Addr triggerPC = 0;
@@ -887,6 +925,12 @@ class CPU : public BaseCPU
         unsigned nextLane = 0;
         unsigned issuedUops = 0;
         unsigned outstanding = 0;
+        unsigned fetchRemaining = 0;
+        unsigned decodeRemaining = 0;
+        unsigned readyUops = 0;
+        unsigned aluRemaining = 0;
+        unsigned shiftRemaining = 0;
+        unsigned multiplyRemaining = 0;
 
         void reset()
         {
@@ -899,10 +943,17 @@ class CPU : public BaseCPU
             nextLane = 0;
             issuedUops = 0;
             outstanding = 0;
+            fetchRemaining = 0;
+            decodeRemaining = 0;
+            readyUops = 0;
+            aluRemaining = 0;
+            shiftRemaining = 0;
+            multiplyRemaining = 0;
         }
 
         void begin(uint64_t helper_id, Addr pc, unsigned uops,
-                   unsigned lanes, unsigned budget)
+                   unsigned lanes, unsigned budget,
+                   const DVRInstructionRecorder::ResourceCounts &resources)
         {
             id = helper_id;
             triggerPC = pc;
@@ -912,19 +963,83 @@ class CPU : public BaseCPU
             nextLane = 0;
             issuedUops = 0;
             outstanding = 0;
-            state = State::Running;
+            // Each logical lane executes the captured program.  The helper
+            // therefore has a real fetch/decode population of
+            // program_uops * lanes, bounded by the helper budget.
+            const uint64_t total_uops = uint64_t(programUops) * lanes;
+            fetchRemaining = std::min<uint64_t>(total_uops, maxUops);
+            decodeRemaining = 0;
+            readyUops = 0;
+            aluRemaining = resources.alu * lanes;
+            shiftRemaining = resources.shift * lanes;
+            multiplyRemaining = resources.multiply * lanes;
+            state = fetchRemaining == 0 ? State::Idle : State::Fetch;
+        }
+
+        unsigned advanceFrontend(unsigned fetch_width, unsigned decode_width)
+        {
+            if (state == State::Idle || state == State::Draining)
+                return 0;
+
+            unsigned fetched = 0;
+            if (fetchRemaining != 0) {
+                fetched = std::min(fetch_width, fetchRemaining);
+                fetchRemaining -= fetched;
+                decodeRemaining += fetched;
+            }
+
+            unsigned decoded = std::min(decode_width, decodeRemaining);
+            decodeRemaining -= decoded;
+            readyUops += decoded;
+
+            if (fetchRemaining == 0 && decodeRemaining == 0 &&
+                readyUops == 0 && outstanding == 0) {
+                state = State::Idle;
+            } else if (readyUops != 0) {
+                state = State::Running;
+            } else if (fetchRemaining != 0) {
+                state = State::Fetch;
+            } else {
+                state = State::Decode;
+            }
+            return fetched + decoded;
+        }
+
+        unsigned advanceCompute(unsigned alu_width, unsigned shift_width,
+                                unsigned multiply_width)
+        {
+            if (state == State::Idle || state == State::Draining)
+                return 0;
+            const unsigned alu = std::min(alu_width, aluRemaining);
+            const unsigned shift = std::min(shift_width, shiftRemaining);
+            const unsigned multiply =
+                std::min(multiply_width, multiplyRemaining);
+            aluRemaining -= alu;
+            shiftRemaining -= shift;
+            multiplyRemaining -= multiply;
+            return alu + shift + multiply;
+        }
+
+        bool computePending() const
+        {
+            return aluRemaining != 0 || shiftRemaining != 0 ||
+                   multiplyRemaining != 0;
         }
 
         bool canIssue() const
         {
-            return state == State::Running && issuedUops < maxUops;
+            return state == State::Running && readyUops != 0 &&
+                   issuedUops < maxUops && !computePending();
         }
 
         void issue()
         {
             ++issuedUops;
+            assert(readyUops != 0);
+            --readyUops;
             ++outstanding;
-            if (issuedUops >= maxUops)
+            if (issuedUops >= maxUops && readyUops == 0 &&
+                fetchRemaining == 0 && decodeRemaining == 0)
                 state = State::Draining;
         }
 
@@ -1031,6 +1146,7 @@ class CPU : public BaseCPU
         Addr triggerPC = 0;
         std::array<Addr, 8> bases = {};
         std::array<unsigned, 8> innerLanes = {};
+        std::array<int64_t, 8> innerStrides = {};
         unsigned count = 0;
 
         void reset()
@@ -1038,6 +1154,7 @@ class CPU : public BaseCPU
             triggerPC = 0;
             bases = {};
             innerLanes = {};
+            innerStrides = {};
             count = 0;
         }
     } dvrNestedInvocationBatch;
@@ -1071,7 +1188,9 @@ class CPU : public BaseCPU
 
   private:
     void startDVRHelper(Addr trigger_pc, unsigned program_uops,
-                        unsigned lanes);
+                        unsigned lanes,
+                        const DVRInstructionRecorder::ResourceCounts
+                        &resources = {});
     Addr dvrPrefetchLine(Addr address) const;
     void accountDVRDemand(Addr address);
     void updateDVRPrefetchQueuePeak();

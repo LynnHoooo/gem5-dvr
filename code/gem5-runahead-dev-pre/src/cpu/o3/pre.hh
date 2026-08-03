@@ -56,6 +56,7 @@ class DVRStrideDetector
   public:
     explicit DVRStrideDetector(unsigned num_entries);
     std::optional<Candidate> observe(Addr pc, Addr address);
+    std::optional<Candidate> observeDispatch(Addr pc) const;
     void reset();
 };
 
@@ -92,6 +93,7 @@ class DVRDiscoveryController
     Addr triggerPC = 0;
     int64_t triggerStride = 0;
     InstSeqNum triggerSequence = 0;
+    InstSeqNum stopSequence = 0;
     unsigned instructions = 0;
     const unsigned maxInstructions;
 
@@ -101,8 +103,11 @@ class DVRDiscoveryController
     explicit DVRDiscoveryController(unsigned max_instructions);
     void arm(const DVRStrideDetector::Candidate &candidate,
              InstSeqNum sequence);
+    bool observeDispatch(Addr pc, InstSeqNum sequence);
     Result observeCommit(Addr pc, InstSeqNum sequence);
+    bool rollback(InstSeqNum squash_sequence);
     bool isDiscovering() const { return state == State::Discovering; }
+    InstSeqNum triggerSeq() const { return triggerSequence; }
     void reset();
 };
 
@@ -127,6 +132,7 @@ class DVRVectorTaintTracker
 
     void begin(const DynInstPtr &initiating_load);
     Observation observe(const DynInstPtr &inst);
+    Observation classify(const DynInstPtr &inst) const;
     void reset();
     Addr flr() const { return finalLoadPC; }
     uint32_t bits() const { return taint; }
@@ -137,6 +143,14 @@ class DVRInstructionRecorder
 {
   public:
     static constexpr unsigned MaxUops = 8;
+
+    struct ResourceCounts
+    {
+        unsigned alu = 0;
+        unsigned shift = 0;
+        unsigned multiply = 0;
+        unsigned lsu = 0;
+    };
 
     struct Uop
     {
@@ -159,18 +173,23 @@ class DVRInstructionRecorder
             AddWord,
             SubWord,
             AddImmediate,
+            AddWordImmediate,
             ShiftLeftImmediate,
+            ShiftLeftWordImmediate,
             AndImmediate,
             OrImmediate,
             XorImmediate,
             ShiftRightLogicalImmediate,
             ShiftRightArithmeticImmediate,
+            ShiftRightLogicalWordImmediate,
+            ShiftRightArithmeticWordImmediate,
             LoadAddress,
-            LoadByteSigned,
-            LoadHalfSigned,
-            LoadWordSigned,
-            LoadWordUnsigned,
-            LoadDouble
+            BranchEqual,
+            BranchNotEqual,
+            BranchSignedLess,
+            BranchSignedGreaterEqual,
+            BranchUnsignedLess,
+            BranchUnsignedGreaterEqual
         };
 
         Addr pc = 0;
@@ -197,6 +216,8 @@ class DVRInstructionRecorder
          */
         bool evaluate(RegVal source0_value, RegVal source1_value,
                       RegVal &result) const;
+        bool evaluateBranch(RegVal source0_value, RegVal source1_value,
+                            bool &taken) const;
     };
 
   private:
@@ -207,9 +228,12 @@ class DVRInstructionRecorder
   public:
     void begin(const DynInstPtr &trigger);
     bool record(const DynInstPtr &inst);
+    /** Import a committed helper template for response-driven replay. */
+    void import(const std::array<Uop, MaxUops> &source, unsigned size);
     void reset();
     unsigned size() const { return count; }
     bool overflow() const { return overflowed; }
+    ResourceCounts resourceCounts() const;
     const Uop &operator[](unsigned index) const { return uops[index]; }
 };
 
@@ -255,9 +279,20 @@ class DVRVectorInstructionRegister
     // private to the DVR context and are never copied to architectural regs.
     std::array<std::array<RegVal, 128>,
                DVRVectorRenameTable::NumArchitecturalRegs> vectorRegs = {};
+    std::array<Addr, 128> lanePC = {};
+    std::array<bool, 128> laneActive = {};
+    std::array<bool, 128> laneReady = {};
+    std::array<std::array<bool, DVRInstructionRecorder::MaxUops>, 128>
+        lanePendingReconvergence = {};
+    std::array<uint8_t, 128> laneStackDepth = {};
+    std::array<std::array<ReconvergenceEntry, ReconvergenceEntries>, 128>
+        laneStack = {};
+    unsigned continuationLanes = 0;
+    bool continuationInitialized = false;
     unsigned stackDepth = 0;
     uint16_t issuedChunks = 0;
     uint16_t executedChunks = 0;
+
 
   public:
     struct Result
@@ -268,12 +303,61 @@ class DVRVectorInstructionRegister
         unsigned divergentBranches = 0;
         unsigned reconvergences = 0;
         unsigned helperUops = 0;
+        unsigned normalTerminatedLanes = 0;
+        unsigned earlyExitLanes = 0;
+        unsigned externalPathLanes = 0;
+        unsigned unsupportedSemanticLanes = 0;
+        unsigned pcGroups = 0;
+        unsigned maxPCGroupLanes = 0;
         bool timedOut = false;
         bool stackOverflow = false;
+        // A lane selected a nonzero PC outside the captured recorder.
+        // This is unsupported control flow, not normal completion.
+        bool unsupportedControlFlow = false;
     };
 
+  private:
+    Result executeLanePC(const DVRInstructionRecorder &program,
+                         unsigned lanes, unsigned max_helper_uops,
+                         const std::array<RegVal, 32> &initial_regs,
+                         unsigned start_index = 0,
+                         int source_destination = -1,
+                         RegVal source_value = 0);
+
+  public:
+
     Result execute(const DVRInstructionRecorder &program, unsigned lanes,
-                   unsigned max_helper_uops = 200);
+                   unsigned max_helper_uops,
+                   const std::array<RegVal, 32> &initial_regs);
+    /**
+     * Resume one captured lane after its asynchronous source load returns.
+     * The returned value replaces the trigger-load destination and execution
+     * starts at the first uop after that load.
+     */
+    Result executeFromSource(const std::array<DVRInstructionRecorder::Uop,
+                                               DVRInstructionRecorder::MaxUops>
+                                 &source,
+                             unsigned size, int source_destination,
+                             RegVal source_value, unsigned max_helper_uops,
+                             const std::array<RegVal, 32> &initial_regs);
+    /** Initialize a persistent context for all source-response lanes. */
+    void initializeSourceContinuation(
+        const std::array<DVRInstructionRecorder::Uop,
+                         DVRInstructionRecorder::MaxUops> &source,
+        unsigned size, unsigned lanes,
+        const std::array<RegVal, 32> &initial_regs);
+    /** Resume one lane in the persistent source-response context. */
+    Result resumeSourceLane(
+        const std::array<DVRInstructionRecorder::Uop,
+                         DVRInstructionRecorder::MaxUops> &source,
+        unsigned size, unsigned lane, int source_destination,
+        RegVal source_value, unsigned max_helper_uops);
+    /** Resume all source-ready lanes in current-PC groups. */
+    Result resumeSourceLanes(
+        const std::array<DVRInstructionRecorder::Uop,
+                         DVRInstructionRecorder::MaxUops> &source,
+        unsigned size, unsigned lane, int source_destination,
+        RegVal source_value, unsigned max_helper_uops);
     void reset();
     const std::array<uint64_t, 2> &mask() const { return activeMask; }
     RegVal laneValue(unsigned reg, unsigned lane) const;
@@ -283,12 +367,23 @@ class DVRVectorInstructionRegister
 class DVRLoopBoundDetector
 {
   private:
+    enum class Comparison : uint8_t
+    {
+        Unknown,
+        Equal,
+        NotEqual,
+        SignedLess,
+        SignedGreaterEqual,
+        UnsignedLess,
+        UnsignedGreaterEqual
+    };
     Addr triggerPC = 0;
     Addr finalLoadPC = 0;
     Addr loopBranchPC = 0;
     Addr loopTargetPC = 0;
     int boundSource0 = -1;
     int boundSource1 = -1;
+    Comparison comparison = Comparison::Unknown;
     bool seenBranch = false;
 
   public:
@@ -321,6 +416,12 @@ class DVRLoopBoundDetector
     bool hasBound() const { return seenBranch; }
     Addr branchPC() const { return loopBranchPC; }
     Addr targetPC() const { return loopTargetPC; }
+    int8_t boundSource0Reg() const { return boundSource0; }
+    int8_t boundSource1Reg() const { return boundSource1; }
+    uint8_t comparisonKind() const
+    {
+        return static_cast<uint8_t>(comparison);
+    }
     int source0() const { return boundSource0; }
     int source1() const { return boundSource1; }
 };

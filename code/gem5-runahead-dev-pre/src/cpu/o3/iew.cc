@@ -1117,6 +1117,8 @@ IEW::dispatchInsts(ThreadID tid)
 
         insts_to_dispatch.pop();
 
+        cpu->observeDVRDispatch(inst);
+
         toRename->iewInfo[tid].dispatched++;
 
         ++iewStats.dispatchedInsts;
