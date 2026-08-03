@@ -751,6 +751,9 @@ class CPU : public BaseCPU
         statistics::Scalar dvrVIRContinuationContexts;
         statistics::Scalar dvrVIRContinuationResumes;
         statistics::Scalar dvrVIRContinuationFallbacks;
+        statistics::Scalar dvrVIRContinuationPCGroups;
+        statistics::Scalar dvrVIRContinuationGroupedLanes;
+        statistics::Scalar dvrVIRContinuationMaxGroupWidth;
         statistics::Scalar dvrPredicateGenerationAbandons;
         statistics::Scalar dvrHelperTimeouts;
         statistics::Scalar dvrReconvergenceStackOverflows;

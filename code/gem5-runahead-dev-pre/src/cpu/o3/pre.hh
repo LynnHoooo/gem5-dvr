@@ -281,6 +281,7 @@ class DVRVectorInstructionRegister
                DVRVectorRenameTable::NumArchitecturalRegs> vectorRegs = {};
     std::array<Addr, 128> lanePC = {};
     std::array<bool, 128> laneActive = {};
+    std::array<bool, 128> laneReady = {};
     std::array<std::array<bool, DVRInstructionRecorder::MaxUops>, 128>
         lanePendingReconvergence = {};
     std::array<uint8_t, 128> laneStackDepth = {};
@@ -306,6 +307,8 @@ class DVRVectorInstructionRegister
         unsigned earlyExitLanes = 0;
         unsigned externalPathLanes = 0;
         unsigned unsupportedSemanticLanes = 0;
+        unsigned pcGroups = 0;
+        unsigned maxPCGroupLanes = 0;
         bool timedOut = false;
         bool stackOverflow = false;
         // A lane selected a nonzero PC outside the captured recorder.
@@ -345,6 +348,12 @@ class DVRVectorInstructionRegister
         const std::array<RegVal, 32> &initial_regs);
     /** Resume one lane in the persistent source-response context. */
     Result resumeSourceLane(
+        const std::array<DVRInstructionRecorder::Uop,
+                         DVRInstructionRecorder::MaxUops> &source,
+        unsigned size, unsigned lane, int source_destination,
+        RegVal source_value, unsigned max_helper_uops);
+    /** Resume all source-ready lanes in current-PC groups. */
+    Result resumeSourceLanes(
         const std::array<DVRInstructionRecorder::Uop,
                          DVRInstructionRecorder::MaxUops> &source,
         unsigned size, unsigned lane, int source_destination,

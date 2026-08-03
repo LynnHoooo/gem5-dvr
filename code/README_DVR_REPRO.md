@@ -200,7 +200,7 @@ discovery complete
 | Lane-PC unsupported path audit | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `executeLanePC()`；`unsupportedControlFlow`；`dvrVIRUnsupportedControlFlow` | Stage 11 |
 | Lane termination classes | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | normal completion、branch early-exit、external target、unsupported semantic counters | Stage 11 |
 | VIR-only control fallback | `src/cpu/o3/cpu.cc`；`cpu.hh` | `CPU::instDone()` 在 VIR 仅因控制流/语义不支持而拒绝时保留 source helper；timeout、stack overflow、recorder overflow 仍禁止启动 | Stage 7、11 |
-| Source-value VIR continuation | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | 每个 replay template 建立持久化多 lane context；source response 将真实返回值写入对应 lane，并由 `resumeSourceLane()` 从 source load 后继续执行 | Stage 11 |
+| Source-value VIR continuation | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | 每个 replay template 建立持久化多 lane context；source response 将真实返回值写入对应 lane，并由 `resumeSourceLanes()` 按当前 PC 推进 ready lanes | Stage 11 |
 | Nested / Multiple | `src/cpu/o3/dvr_nested.hh/.cc`；`cpu.cc` | `DVRNestedController`、`DVRNestedDiscoveryMode`；`completeDVRNestedContext()`、`launchDVRNestedPrefetches()` | Stage 13、14 |
 | Quality metrics | `src/cpu/o3/dvr_quality.hh/.cc`；cache/LSQ 接线处 | `DVRQualityTracker::issued()`、`completed()`、`demandLookup()`、`cacheFill()` | Stage 12、15 |
 | Cache / LSQ timing | `src/cpu/o3/lsq_unit.cc`；`src/cpu/o3/lsq.cc`；`cpu.cc` | load address observation、helper packet response、prefetch queue service | Stage 7、8、9 |
@@ -241,7 +241,7 @@ NDM 和 helper 前端的专项统计也可由以下入口检查：
 | 8 | 真实逐 lane dependent replay | 需单独复核 | 代码已有 dispatch sequence tracking、地址有效性保护和 replay 统计；不要用 Stage 7 结果替代 Stage 8 证据 |
 | 9 | Baseline vs DVR | 当前树通过 | demand L1D miss 降低 11.56% |
 | 10 | 8-uop recorder/VRAT/VIR | 当前树通过 | 2396 programs，95470 VIR executions；真实 replay 守恒断言通过 |
-| 11 | actual-value predicate/reconvergence/timeout | 通过（控制流分类与持久化 source continuation） | `vir_continuation_contexts=3`、`vir_continuation_resumes=328`、`source_value_vir_executions=328`、`source_value_external_lanes=164`；仍不是完整并行 SIMT |
+| 11 | actual-value predicate/reconvergence/timeout | 通过（控制流分类与持久化 source continuation） | `contexts=3`、`resumes=328`、`pc_groups=1148`、`grouped_lanes=1148`、`max_group_width=1`；PC 分组路径已接入，但当前异步 response 时序尚未形成多 lane 同组 issue |
 | 12 | predicate/quality 独立严格 smoke | 当前树通过 | actual-value mask 与质量计数器 `-Werror` smoke |
 | 14 | NDM 控制与 timeout | 通过 | dispatch Discovery、IR/ILR/LCR、至少两个 outer invocation、timeout/fallback |
 | 15 | helper 前端与资源竞争 | 通过 | fetch/decode/issue、主线程优先资源统计 |
@@ -305,10 +305,11 @@ accuracy、coverage、timeliness 和 pollution 需要 L1 tag lookup/fill/victim
 
 1. 将已验证的逐 lane evaluator 扩展到更多 RV64/RVC 整数、比较、load-value 和地址生成 opcode；
    仿射逻辑仅保留为 unsupported 链的显式 fallback。
-2. 将当前已持久化的多 lane context 继续提升为真正的异步向量执行队列：让
-   多个 lane 在同一个 context 中按 PC 分组推进，并完整保存/恢复 deferred
-   mask 与多层 reconvergence stack；当前 source response 已恢复对应 lane 的
-   PC、寄存器和 active 状态，但每次 response 仍以单 lane resume 为主。
+2. 将当前已持久化的多 lane context 继续提升为真正的异步向量执行队列：当前
+   已按 PC 分组推进并保存 lane PC/寄存器/active 状态，但 Stage 11 的
+   `max_group_width=1` 说明 response 到达仍逐个触发；下一步需要 response
+   batching/issue arbitration 才能形成论文级多 lane 同组 issue，并完整保存/恢复
+   deferred mask 与多层 reconvergence stack。
 3. 将已验证的实际 value-predicate 路径选择进一步扩展到任意 branch opcode，
    并让 VIR 使用独立 lane PC 执行 branch target/fall-through，而不仅是
    recorder 内的有限路径。

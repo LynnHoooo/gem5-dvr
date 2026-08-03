@@ -656,6 +656,15 @@ CPU::CPUStats::CPUStats(CPU *cpu)
       ADD_STAT(dvrVIRContinuationFallbacks,
                statistics::units::Count::get(),
                "Source responses using temporary VIR continuation fallback"),
+      ADD_STAT(dvrVIRContinuationPCGroups,
+               statistics::units::Count::get(),
+               "Current-PC groups issued by persistent VIR contexts"),
+      ADD_STAT(dvrVIRContinuationGroupedLanes,
+               statistics::units::Count::get(),
+               "Lane-uops issued through persistent VIR PC groups"),
+      ADD_STAT(dvrVIRContinuationMaxGroupWidth,
+               statistics::units::Count::get(),
+               "Maximum lane width observed in a persistent VIR PC group"),
       ADD_STAT(dvrPredicateGenerationAbandons,
                statistics::units::Count::get(),
                "DVR predicate generations replaced before all lanes "
@@ -2728,7 +2737,7 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
             else
                 ++cpuStats.dvrVIRContinuationFallbacks;
             const auto response = state->replay->continuation ?
-                state->replay->continuation->resumeSourceLane(
+                state->replay->continuation->resumeSourceLanes(
                     state->replay->uops, state->replay->count,
                     state->lane, state->replay->triggerDestination, value,
                     dvrHelperMaxUops) :
@@ -2744,6 +2753,11 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
                 response.unsupportedSemanticLanes;
             cpuStats.dvrVIRSourceValueTerminations +=
                 response.normalTerminatedLanes + response.earlyExitLanes;
+            cpuStats.dvrVIRContinuationPCGroups += response.pcGroups;
+            cpuStats.dvrVIRContinuationGroupedLanes += response.activeLanes;
+            if (response.maxPCGroupLanes != 0)
+                cpuStats.dvrVIRContinuationMaxGroupWidth =
+                    response.maxPCGroupLanes;
         }
         bool matched = dvrEnableDependentPrefetch &&
                        replayDVRSource(*state, value);
