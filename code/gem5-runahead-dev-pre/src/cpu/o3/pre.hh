@@ -156,6 +156,8 @@ class DVRInstructionRecorder
             ShiftRightLogical,
             ShiftRightArithmetic,
             Multiply,
+            AddWord,
+            SubWord,
             AddImmediate,
             ShiftLeftImmediate,
             AndImmediate,
@@ -163,7 +165,12 @@ class DVRInstructionRecorder
             XorImmediate,
             ShiftRightLogicalImmediate,
             ShiftRightArithmeticImmediate,
-            LoadAddress
+            LoadAddress,
+            LoadByteSigned,
+            LoadHalfSigned,
+            LoadWordSigned,
+            LoadWordUnsigned,
+            LoadDouble
         };
 
         Addr pc = 0;

@@ -345,6 +345,16 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
         return;
     }
 
+    // RV64I word operations: the architectural result is sign-extended
+    // from 32 bits.  Keep these distinct from ADD/SUB so replay cannot
+    // accidentally preserve the upper half of a 64-bit operand.
+    if (opcode == 0x3b) {
+        if (funct3 == 0 && funct7 == 0) uop.semantic = Semantic::AddWord;
+        else if (funct3 == 0 && funct7 == 0x20)
+            uop.semantic = Semantic::SubWord;
+        return;
+    }
+
     if (opcode == 0x13) {
         if (funct3 == 0) {
             uop.semantic = Semantic::AddImmediate;
@@ -372,7 +382,14 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
     }
 
     if (opcode == 0x03) {
-        uop.semantic = Semantic::LoadAddress;
+        switch (funct3) {
+          case 0: uop.semantic = Semantic::LoadByteSigned; break; // LB
+          case 1: uop.semantic = Semantic::LoadHalfSigned; break; // LH
+          case 2: uop.semantic = Semantic::LoadWordSigned; break; // LW
+          case 3: uop.semantic = Semantic::LoadDouble; break; // LD
+          case 4: uop.semantic = Semantic::LoadWordUnsigned; break; // LWU
+          default: uop.semantic = Semantic::Unsupported; return;
+        }
         uop.immediate = dvrSignExtend(uop.encoding >> 20, 12);
     }
 }
@@ -413,8 +430,26 @@ DVRInstructionRecorder::Uop::evaluate(
       case Semantic::Multiply:
         result = source0_value * source1_value;
         return true;
+      case Semantic::AddWord:
+        result = static_cast<RegVal>(static_cast<int64_t>(
+            static_cast<int32_t>(source0_value + source1_value)));
+        return true;
+      case Semantic::SubWord:
+        result = static_cast<RegVal>(static_cast<int64_t>(
+            static_cast<int32_t>(source0_value - source1_value)));
+        return true;
       case Semantic::AddImmediate:
       case Semantic::LoadAddress:
+        result = source0_value + static_cast<RegVal>(immediate);
+        return true;
+      case Semantic::LoadByteSigned:
+      case Semantic::LoadHalfSigned:
+      case Semantic::LoadWordSigned:
+      case Semantic::LoadWordUnsigned:
+      case Semantic::LoadDouble:
+        // The memory request and response supply the loaded value.  These
+        // semantics are markers for the next dependent load address; the
+        // address itself is still base+offset.
         result = source0_value + static_cast<RegVal>(immediate);
         return true;
       case Semantic::ShiftLeftImmediate:
