@@ -215,6 +215,9 @@ NDM 和 helper 前端的专项统计也可由以下入口检查：
   `dvrNDMOuterInvocations`：NDM 控制状态是否真实建立。
 - `dvrHelperFetchCycles`、`dvrHelperDecodeCycles`：helper 是否实际经过独立
   fetch/decode 阶段。
+- `dvrHelperComputeCycles` 以及 `dvrHelperALUOps`、`dvrHelperShiftOps`、
+  `dvrHelperMultiplyOps`、`dvrHelperLSUOps`：captured helper program 的 FU
+  profile 和 compute 前段占用；这是资源模型增量，不等价于完整共享 issue queue。
 - `scripts/run_remote_dvr_stage14_ndm_control.sh`：NDM 控制状态 smoke。
 - `scripts/run_remote_dvr_stage15_resource_smoke.sh`：helper 前端和共享资源
   smoke。
@@ -240,7 +243,7 @@ NDM 和 helper 前端的专项统计也可由以下入口检查：
 | 14 | NDM 控制与 timeout | 通过 | dispatch Discovery、IR/ILR/LCR、至少两个 outer invocation、timeout/fallback |
 | 15 | helper 前端与资源竞争 | 通过 | fetch/decode/issue、主线程优先资源统计 |
 | 16 | NDM IR/ILR/LCR 与 outer invocation gate | 通过 | branch inversion、两个 outer invocation 后 Vectorizing、timeout fallback |
-| 17 | L1D workload 级 quality 事件 | 通过 | demand=294915，DVR issued=12588，timely=1717，coverage=0.011329，timeliness=0.565733 |
+| 17 | L1D workload 级 quality 事件 | 通过 | demand=294915，DVR issued=9910，timely=1266，coverage=0.008353，timeliness=0.549957 |
 
 Stage 9 的当前稳定结果：
 
@@ -903,7 +906,8 @@ Stage 14 当前已通过服务器验证，并实现了 branch-direction 控制�
 
 ## 11. Stage 15：资源竞争统计与固定构建环境
 
-Stage 15 已加入回归脚本，统计 `dvrHelperIssueCycles`、`dvrResourceConflicts`、
+Stage 15 已加入回归脚本，统计 `dvrHelperIssueCycles`、`dvrHelperComputeCycles`、
+captured ALU/shift/LSU profile、`dvrResourceConflicts`、
 `dvrPrefetchesSuppressedMainThread` 和 `dvrPrefetchesIssued`。运行：
 
 ```bash
@@ -914,7 +918,7 @@ bash scripts/run_remote_dvr_stage15_resource_smoke.sh
 超过总周期。2026-08-01 的服务器验证已经通过：
 
 ```text
-DVR_STAGE15_RESOURCE_PASSED cycles=2462727 helper_issue_cycles=9 conflicts=0 main_thread_suppressed=1 dvr_issued=9
+DVR_STAGE15_RESOURCE_PASSED cycles=2463975 helper_fetch=6091 helper_decode=6252 helper_compute=8367 alu_ops=38742 shift_ops=19371 lsu_ops=38742 helper_issue_cycles=9910 conflicts=14555 main_thread_suppressed=13480 dvr_issued=9910
 ```
 
 服务器构建统一使用 Python 3.11.15 ABI，同时保留 `nix develop` 注入的

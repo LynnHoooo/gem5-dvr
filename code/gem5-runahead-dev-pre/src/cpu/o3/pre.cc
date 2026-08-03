@@ -601,6 +601,40 @@ DVRInstructionRecorder::reset()
     overflowed = false;
 }
 
+DVRInstructionRecorder::ResourceCounts
+DVRInstructionRecorder::resourceCounts() const
+{
+    ResourceCounts resources;
+    for (unsigned index = 0; index < count; ++index) {
+        const auto &uop = uops[index];
+        if (uop.load || uop.semantic == Uop::Semantic::LoadAddress) {
+            ++resources.lsu;
+            continue;
+        }
+        if (uop.semantic == Uop::Semantic::Multiply) {
+            ++resources.multiply;
+            continue;
+        }
+        switch (uop.semantic) {
+          case Uop::Semantic::ShiftLeft:
+          case Uop::Semantic::ShiftRightLogical:
+          case Uop::Semantic::ShiftRightArithmetic:
+          case Uop::Semantic::ShiftLeftImmediate:
+          case Uop::Semantic::ShiftLeftWordImmediate:
+          case Uop::Semantic::ShiftRightLogicalImmediate:
+          case Uop::Semantic::ShiftRightArithmeticImmediate:
+          case Uop::Semantic::ShiftRightLogicalWordImmediate:
+          case Uop::Semantic::ShiftRightArithmeticWordImmediate:
+            ++resources.shift;
+            break;
+          default:
+            ++resources.alu;
+            break;
+        }
+    }
+    return resources;
+}
+
 DVRVectorRenameTable::DVRVectorRenameTable()
 {
     // 初始化所有架构寄存器的向量映射。

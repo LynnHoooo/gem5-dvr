@@ -697,6 +697,12 @@ class CPU : public BaseCPU
         statistics::Scalar dvrHelperFetchCycles;
         statistics::Scalar dvrHelperDecodeCycles;
         statistics::Scalar dvrHelperReadyUops;
+        statistics::Scalar dvrHelperComputeCycles;
+        statistics::Scalar dvrHelperComputeConflicts;
+        statistics::Scalar dvrHelperALUOps;
+        statistics::Scalar dvrHelperShiftOps;
+        statistics::Scalar dvrHelperMultiplyOps;
+        statistics::Scalar dvrHelperLSUOps;
         statistics::Scalar dvrMainIssueSlotsUsed;
         statistics::Scalar dvrMainALUSlotsUsed;
         statistics::Scalar dvrMainLSUSlotsUsed;
@@ -905,6 +911,9 @@ class CPU : public BaseCPU
         unsigned fetchRemaining = 0;
         unsigned decodeRemaining = 0;
         unsigned readyUops = 0;
+        unsigned aluRemaining = 0;
+        unsigned shiftRemaining = 0;
+        unsigned multiplyRemaining = 0;
 
         void reset()
         {
@@ -920,10 +929,14 @@ class CPU : public BaseCPU
             fetchRemaining = 0;
             decodeRemaining = 0;
             readyUops = 0;
+            aluRemaining = 0;
+            shiftRemaining = 0;
+            multiplyRemaining = 0;
         }
 
         void begin(uint64_t helper_id, Addr pc, unsigned uops,
-                   unsigned lanes, unsigned budget)
+                   unsigned lanes, unsigned budget,
+                   const DVRInstructionRecorder::ResourceCounts &resources)
         {
             id = helper_id;
             triggerPC = pc;
@@ -940,6 +953,9 @@ class CPU : public BaseCPU
             fetchRemaining = std::min<uint64_t>(total_uops, maxUops);
             decodeRemaining = 0;
             readyUops = 0;
+            aluRemaining = resources.alu * lanes;
+            shiftRemaining = resources.shift * lanes;
+            multiplyRemaining = resources.multiply * lanes;
             state = fetchRemaining == 0 ? State::Idle : State::Fetch;
         }
 
@@ -972,10 +988,31 @@ class CPU : public BaseCPU
             return fetched + decoded;
         }
 
+        unsigned advanceCompute(unsigned alu_width, unsigned shift_width,
+                                unsigned multiply_width)
+        {
+            if (state == State::Idle || state == State::Draining)
+                return 0;
+            const unsigned alu = std::min(alu_width, aluRemaining);
+            const unsigned shift = std::min(shift_width, shiftRemaining);
+            const unsigned multiply =
+                std::min(multiply_width, multiplyRemaining);
+            aluRemaining -= alu;
+            shiftRemaining -= shift;
+            multiplyRemaining -= multiply;
+            return alu + shift + multiply;
+        }
+
+        bool computePending() const
+        {
+            return aluRemaining != 0 || shiftRemaining != 0 ||
+                   multiplyRemaining != 0;
+        }
+
         bool canIssue() const
         {
             return state == State::Running && readyUops != 0 &&
-                   issuedUops < maxUops;
+                   issuedUops < maxUops && !computePending();
         }
 
         void issue()
@@ -1134,7 +1171,9 @@ class CPU : public BaseCPU
 
   private:
     void startDVRHelper(Addr trigger_pc, unsigned program_uops,
-                        unsigned lanes);
+                        unsigned lanes,
+                        const DVRInstructionRecorder::ResourceCounts
+                        &resources = {});
     Addr dvrPrefetchLine(Addr address) const;
     void accountDVRDemand(Addr address);
     void updateDVRPrefetchQueuePeak();

@@ -530,6 +530,18 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Cycles in which the DVR helper decoded captured uops"),
       ADD_STAT(dvrHelperReadyUops, statistics::units::Count::get(),
                "Captured helper uops made ready for issue"),
+      ADD_STAT(dvrHelperComputeCycles, statistics::units::Cycle::get(),
+               "Cycles in which captured helper compute uops executed"),
+      ADD_STAT(dvrHelperComputeConflicts, statistics::units::Count::get(),
+               "Helper compute cycles blocked by main ALU occupancy"),
+      ADD_STAT(dvrHelperALUOps, statistics::units::Count::get(),
+               "Captured helper ALU/control uops profiled"),
+      ADD_STAT(dvrHelperShiftOps, statistics::units::Count::get(),
+               "Captured helper shift uops profiled"),
+      ADD_STAT(dvrHelperMultiplyOps, statistics::units::Count::get(),
+               "Captured helper multiply uops profiled"),
+      ADD_STAT(dvrHelperLSUOps, statistics::units::Count::get(),
+               "Captured helper load/store uops profiled"),
       ADD_STAT(dvrMainIssueSlotsUsed, statistics::units::Count::get(),
                "Demand instructions executed before DVR arbitration"),
       ADD_STAT(dvrMainALUSlotsUsed, statistics::units::Count::get(),
@@ -780,6 +792,17 @@ CPU::tick()
             ++cpuStats.dvrHelperDecodeCycles;
         cpuStats.dvrHelperReadyUops += dvrHelperThread.readyUops;
     }
+
+    const unsigned helper_alu_width =
+        dvrMainALUIssuesThisCycle < dvrIssueWidth ?
+        dvrIssueWidth - dvrMainALUIssuesThisCycle : 0;
+    const unsigned helper_compute = dvrHelperThread.advanceCompute(
+        helper_alu_width, dvrIssueWidth, dvrIssueWidth);
+    if (helper_compute != 0)
+        ++cpuStats.dvrHelperComputeCycles;
+    else if (dvrHelperThread.computePending() &&
+             dvrHelperThread.readyUops != 0 && helper_alu_width == 0)
+        ++cpuStats.dvrHelperComputeConflicts;
 
     cpuStats.dvrMainIssueSlotsUsed += dvrMainIssuesThisCycle;
     cpuStats.dvrMainALUSlotsUsed += dvrMainALUIssuesThisCycle;
@@ -2135,7 +2158,8 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
     // Source stride prefetches are useful even when the committed slice did
     // not contain a replayable load uop.  Keep the helper alive for source
     // lanes; replay->count only controls dependent replay semantics.
-    startDVRHelper(pc, std::max(1u, replay->count), lanes);
+    startDVRHelper(pc, std::max(1u, replay->count), lanes,
+                   dvrInstructionRecorder.resourceCounts());
     for (unsigned lane = 1; lane <= lanes; ++lane) {
         const Addr address = current_address + stride * lane;
         DVRPrefetchAddress prefetch;
@@ -2164,7 +2188,9 @@ CPU::launchDVRVectorRunahead(ThreadID tid, Addr current_address,
     const unsigned lanes = std::min(dvrMaxLanes,
                                     DVRLanePredicateTracker::MaxLanes);
     dvrPrefetchQueue.clear();
-    startDVRHelper(pc, 1, lanes);
+    DVRInstructionRecorder::ResourceCounts vector_resources;
+    vector_resources.lsu = 1;
+    startDVRHelper(pc, 1, lanes, vector_resources);
     for (unsigned lane = 1; lane <= lanes; ++lane) {
         DVRPrefetchAddress prefetch;
         prefetch.address = current_address + stride * lane;
@@ -2373,7 +2399,7 @@ CPU::launchDVRNestedPrefetches(
     if (variable_lanes)
         ++cpuStats.dvrNestedVariableLaneBatches;
     startDVRHelper(dvrNestedContext.triggerPC, replay->count,
-                   flattened);
+                   flattened, dvrNestedContext.recorder.resourceCounts());
     unsigned flat_lane = 0;
     for (unsigned invocation = 0; invocation < invocations; ++invocation) {
       const Addr base = plan_bases[invocation];
@@ -2679,13 +2705,19 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
 }
 
 void
-CPU::startDVRHelper(Addr trigger_pc, unsigned program_uops, unsigned lanes)
+CPU::startDVRHelper(
+    Addr trigger_pc, unsigned program_uops, unsigned lanes,
+    const DVRInstructionRecorder::ResourceCounts &resources)
 {
     if (program_uops == 0 || lanes == 0)
         return;
 
     dvrHelperThread.begin(dvrNextHelperId++, trigger_pc, program_uops,
-                          lanes, dvrHelperMaxUops);
+                          lanes, dvrHelperMaxUops, resources);
+    cpuStats.dvrHelperALUOps += resources.alu * lanes;
+    cpuStats.dvrHelperShiftOps += resources.shift * lanes;
+    cpuStats.dvrHelperMultiplyOps += resources.multiply * lanes;
+    cpuStats.dvrHelperLSUOps += resources.lsu * lanes;
     DPRINTF(O3CPU,
             "DVR helper start id=%llu trigger=%#x uops=%u lanes=%u budget=%u\n",
             static_cast<unsigned long long>(dvrHelperThread.id), trigger_pc,

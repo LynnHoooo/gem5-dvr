@@ -144,6 +144,14 @@ class DVRInstructionRecorder
   public:
     static constexpr unsigned MaxUops = 8;
 
+    struct ResourceCounts
+    {
+        unsigned alu = 0;
+        unsigned shift = 0;
+        unsigned multiply = 0;
+        unsigned lsu = 0;
+    };
+
     struct Uop
     {
         /**
@@ -215,6 +223,7 @@ class DVRInstructionRecorder
     void reset();
     unsigned size() const { return count; }
     bool overflow() const { return overflowed; }
+    ResourceCounts resourceCounts() const;
     const Uop &operator[](unsigned index) const { return uops[index]; }
 };
 
