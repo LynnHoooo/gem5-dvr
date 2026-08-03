@@ -622,6 +622,16 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                statistics::units::Count::get(),
                "VIR programs terminated because a lane target was outside "
                "the captured recorder"),
+      ADD_STAT(dvrVIRNormalTerminatedLanes,
+               statistics::units::Count::get(),
+               "VIR lanes that reached the end of the captured program"),
+      ADD_STAT(dvrVIREarlyExitLanes, statistics::units::Count::get(),
+               "VIR lanes that exited through a captured branch"),
+      ADD_STAT(dvrVIRExternalPathLanes, statistics::units::Count::get(),
+               "VIR lanes that selected a recorder-external target"),
+      ADD_STAT(dvrVIRUnsupportedSemanticLanes,
+               statistics::units::Count::get(),
+               "VIR lanes stopped by an unsupported recorded semantic"),
       ADD_STAT(dvrPredicateGenerationAbandons,
                statistics::units::Count::get(),
                "DVR predicate generations replaced before all lanes "
@@ -1913,6 +1923,14 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                         vir_result.divergentBranches;
                     cpuStats.dvrReconvergences +=
                         vir_result.reconvergences;
+                    cpuStats.dvrVIRNormalTerminatedLanes +=
+                        vir_result.normalTerminatedLanes;
+                    cpuStats.dvrVIREarlyExitLanes +=
+                        vir_result.earlyExitLanes;
+                    cpuStats.dvrVIRExternalPathLanes +=
+                        vir_result.externalPathLanes;
+                    cpuStats.dvrVIRUnsupportedSemanticLanes +=
+                        vir_result.unsupportedSemanticLanes;
                     if (vir_result.unsupportedControlFlow) {
                         ++cpuStats.dvrVIRUnsupportedControlFlow;
                         helper_allowed = false;
@@ -2241,6 +2259,12 @@ CPU::completeDVRNestedContext(
         cpuStats.dvrNestedVIRExecutions += vir_result.chunkExecutions;
         cpuStats.dvrDivergentBranches += vir_result.divergentBranches;
         cpuStats.dvrReconvergences += vir_result.reconvergences;
+        cpuStats.dvrVIRNormalTerminatedLanes +=
+            vir_result.normalTerminatedLanes;
+        cpuStats.dvrVIREarlyExitLanes += vir_result.earlyExitLanes;
+        cpuStats.dvrVIRExternalPathLanes += vir_result.externalPathLanes;
+        cpuStats.dvrVIRUnsupportedSemanticLanes +=
+            vir_result.unsupportedSemanticLanes;
         if (vir_result.unsupportedControlFlow) {
             ++cpuStats.dvrVIRUnsupportedControlFlow;
             helper_allowed = false;

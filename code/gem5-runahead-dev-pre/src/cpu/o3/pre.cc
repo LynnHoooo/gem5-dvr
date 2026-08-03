@@ -722,8 +722,10 @@ DVRVectorInstructionRegister::executeLanePC(
             }
             if (op_index >= 0)
                 break;
-            if (lanePC[lane] != 0)
+            if (lanePC[lane] != 0) {
                 result.unsupportedControlFlow = true;
+                ++result.externalPathLanes;
+            }
             lane_active[lane] = false;
             activeMask[lane / 64] &= ~(uint64_t(1) << (lane % 64));
         }
@@ -756,6 +758,8 @@ DVRVectorInstructionRegister::executeLanePC(
                      (op_index + 1 < program.size() ?
                       program[op_index + 1].pc : 0));
                 lanePC[lane] = next;
+                if (next == 0)
+                    ++result.earlyExitLanes;
                 has_taken |= lane_taken;
                 has_fallthrough |= !lane_taken;
                 continue;
@@ -763,6 +767,8 @@ DVRVectorInstructionRegister::executeLanePC(
 
             RegVal value = 0;
             if (!op.evaluate(lhs, rhs, value)) {
+                result.unsupportedControlFlow = true;
+                ++result.unsupportedSemanticLanes;
                 lane_active[lane] = false;
                 activeMask[lane / 64] &= ~(uint64_t(1) << (lane % 64));
                 continue;
@@ -771,6 +777,8 @@ DVRVectorInstructionRegister::executeLanePC(
                 vectorRegs[op.destination][lane] = value;
             lanePC[lane] = op_index + 1 < program.size() ?
                 program[op_index + 1].pc : 0;
+            if (lanePC[lane] == 0)
+                ++result.normalTerminatedLanes;
         }
 
         if (has_taken && has_fallthrough) {

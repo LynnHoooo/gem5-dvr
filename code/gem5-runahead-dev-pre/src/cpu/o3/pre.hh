@@ -284,6 +284,10 @@ class DVRVectorInstructionRegister
         unsigned divergentBranches = 0;
         unsigned reconvergences = 0;
         unsigned helperUops = 0;
+        unsigned normalTerminatedLanes = 0;
+        unsigned earlyExitLanes = 0;
+        unsigned externalPathLanes = 0;
+        unsigned unsupportedSemanticLanes = 0;
         bool timedOut = false;
         bool stackOverflow = false;
         // A lane selected a nonzero PC outside the captured recorder.

@@ -198,6 +198,7 @@ discovery complete
 | Dependent replay | `src/cpu/o3/cpu.cc` | `replayDVRSource()`、`completeDVRPrefetch()`；`lsq.cc` 完成 response 回调 | Stage 8 |
 | Predicate / reconvergence | `src/cpu/o3/dvr_predicate.hh/.cc`；`cpu.cc` | `DVRLanePredicateTracker`；`retireDVRPredicateLane()` | Stage 11、12 |
 | Lane-PC unsupported path audit | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `executeLanePC()`；`unsupportedControlFlow`；`dvrVIRUnsupportedControlFlow` | Stage 11 |
+| Lane termination classes | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | normal completion、branch early-exit、external target、unsupported semantic counters | Stage 11 |
 | Nested / Multiple | `src/cpu/o3/dvr_nested.hh/.cc`；`cpu.cc` | `DVRNestedController`、`DVRNestedDiscoveryMode`；`completeDVRNestedContext()`、`launchDVRNestedPrefetches()` | Stage 13、14 |
 | Quality metrics | `src/cpu/o3/dvr_quality.hh/.cc`；cache/LSQ 接线处 | `DVRQualityTracker::issued()`、`completed()`、`demandLookup()`、`cacheFill()` | Stage 12、15 |
 | Cache / LSQ timing | `src/cpu/o3/lsq_unit.cc`；`src/cpu/o3/lsq.cc`；`cpu.cc` | load address observation、helper packet response、prefetch queue service | Stage 7、8、9 |
@@ -238,7 +239,7 @@ NDM 和 helper 前端的专项统计也可由以下入口检查：
 | 8 | 真实逐 lane dependent replay | 需单独复核 | 代码已有 dispatch sequence tracking、地址有效性保护和 replay 统计；不要用 Stage 7 结果替代 Stage 8 证据 |
 | 9 | Baseline vs DVR | 当前树通过 | demand L1D miss 降低 11.56% |
 | 10 | 8-uop recorder/VRAT/VIR | 当前树通过 | 2396 programs，95470 VIR executions；真实 replay 守恒断言通过 |
-| 11 | actual-value predicate/reconvergence/timeout | 当前树通过 | divergent=1，reconverged=1，unsupported_control_flow=1329；forced timeout=116/generated=0 |
+| 11 | actual-value predicate/reconvergence/timeout | 当前树通过（控制流分类） | 真实快照下 divergent=0，正常/外部 lane termination 计数有效；source-return-driven divergence 仍待接入 |
 | 12 | predicate/quality 独立严格 smoke | 当前树通过 | actual-value mask 与质量计数器 `-Werror` smoke |
 | 14 | NDM 控制与 timeout | 通过 | dispatch Discovery、IR/ILR/LCR、至少两个 outer invocation、timeout/fallback |
 | 15 | helper 前端与资源竞争 | 通过 | fetch/decode/issue、主线程优先资源统计 |

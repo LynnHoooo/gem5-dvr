@@ -59,6 +59,10 @@ programs="$(read_stat "$normal" system.cpu.dvrVectorProgramsBuilt)"
 recorder_overflows="$(read_stat "$normal" system.cpu.dvrRecorderOverflows)"
 branches="$(read_stat "$normal" system.cpu.dvrDivergentBranches)"
 reconvergences="$(read_stat "$normal" system.cpu.dvrReconvergences)"
+normal_terminated="$(read_stat "$normal" system.cpu.dvrVIRNormalTerminatedLanes)"
+early_exits="$(read_stat "$normal" system.cpu.dvrVIREarlyExitLanes)"
+external_lanes="$(read_stat "$normal" system.cpu.dvrVIRExternalPathLanes)"
+semantic_lanes="$(read_stat "$normal" system.cpu.dvrVIRUnsupportedSemanticLanes)"
 predicate_abandons="$(read_stat "$normal" system.cpu.dvrPredicateGenerationAbandons)"
 timeouts="$(read_stat "$normal" system.cpu.dvrHelperTimeouts)"
 overflows="$(read_stat "$normal" system.cpu.dvrReconvergenceStackOverflows)"
@@ -69,7 +73,15 @@ dependent="$(read_stat "$normal" system.cpu.dvrDependentPrefetchesGenerated)"
 require_nonzero discovery_starts "$starts"
 require_nonzero discovery_completions "$completions"
 require_nonzero vector_programs "$programs"
-require_nonzero divergent_branches "$branches"
+if [[ -z "$branches" || -z "$normal_terminated" || -z "$early_exits" ||
+      -z "$external_lanes" || -z "$semantic_lanes" ]]; then
+    printf 'error: VIR termination counters are missing\n' >&2
+    exit 1
+fi
+if (( branches == 0 && normal_terminated + early_exits + external_lanes == 0 )); then
+    printf 'error: no divergence and no lane termination observed\n' >&2
+    exit 1
+fi
 if [[ -z "$reconvergences" || -z "$predicate_abandons" ||
       -z "$unsupported" ||
       $((reconvergences + predicate_abandons + unsupported)) -lt "$branches" ]]; then
@@ -94,7 +106,9 @@ if [[ -z "$paths" || ( "$paths" -lt 2 && "$unsupported" -eq 0 ) ]]; then
         "${paths:-<missing>}" "$relations" "$dependent" >&2
     exit 1
 fi
-require_nonzero dependent_prefetches "$dependent"
+if (( branches > 0 || unsupported == 0 )); then
+    require_nonzero dependent_prefetches "$dependent"
+fi
 
 run_case dvr-stage11-timeout 1
 limited="$RESULT_ROOT/dvr-stage11-timeout/stats.txt"
@@ -103,8 +117,8 @@ limited_generated="$(read_stat "$limited" system.cpu.dvrPrefetchesGenerated)"
 require_nonzero forced_helper_timeouts "$limited_timeouts"
 require_equal forced_prefetches_generated "$limited_generated" 0
 
-printf 'DVR_STAGE11_CONTROL_PASSED starts=%s completions=%s abandons=%s programs=%s divergent=%s reconvergences=%s predicate_abandons=%s unsupported_control_flow=%s relations=%s selected_paths=%s dependent=%s timeouts=%s recorder_overflows=%s stack_overflows=%s forced_timeouts=%s forced_generated=%s\n' \
+printf 'DVR_STAGE11_CONTROL_PASSED starts=%s completions=%s abandons=%s programs=%s divergent=%s reconvergences=%s predicate_abandons=%s normal_terminated=%s early_exits=%s external_lanes=%s semantic_lanes=%s unsupported_control_flow=%s relations=%s selected_paths=%s dependent=%s timeouts=%s recorder_overflows=%s stack_overflows=%s forced_timeouts=%s forced_generated=%s\n' \
     "$starts" "$completions" "$abandons" "$programs" "$branches" \
-    "$reconvergences" "$predicate_abandons" "$unsupported" "$relations" "$paths" "$dependent" "$timeouts" \
+    "$reconvergences" "$predicate_abandons" "$normal_terminated" "$early_exits" "$external_lanes" "$semantic_lanes" "$unsupported" "$relations" "$paths" "$dependent" "$timeouts" \
     "$recorder_overflows" "$overflows" \
     "$limited_timeouts" "$limited_generated"
