@@ -632,6 +632,21 @@ CPU::CPUStats::CPUStats(CPU *cpu)
       ADD_STAT(dvrVIRUnsupportedSemanticLanes,
                statistics::units::Count::get(),
                "VIR lanes stopped by an unsupported recorded semantic"),
+      ADD_STAT(dvrVIRSourceValueExecutions,
+               statistics::units::Count::get(),
+               "Per-lane VIR continuations started by source responses"),
+      ADD_STAT(dvrVIRSourceValueBranches,
+               statistics::units::Count::get(),
+               "Branches executed after a real source value was installed"),
+      ADD_STAT(dvrVIRSourceValueExternalLanes,
+               statistics::units::Count::get(),
+               "Source-value VIR lanes selecting recorder-external targets"),
+      ADD_STAT(dvrVIRSourceValueSemanticFailures,
+               statistics::units::Count::get(),
+               "Source-value VIR lanes stopped by unsupported semantics"),
+      ADD_STAT(dvrVIRSourceValueTerminations,
+               statistics::units::Count::get(),
+               "Source-value VIR lanes reaching a terminal path"),
       ADD_STAT(dvrPredicateGenerationAbandons,
                statistics::units::Count::get(),
                "DVR predicate generations replaced before all lanes "
@@ -2680,6 +2695,24 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
     if (state->source && pkt->hasData()) {
         const RegVal value = pkt->getLE<RegVal>();
         retireDVRPredicateLane(state->predicate, state->lane, true, value);
+        if (state->replay && state->replay->count > 1 &&
+            state->replay->triggerDestination > 0 &&
+            state->replay->triggerDestination <
+                DVRLoopBoundDetector::MaxArchitecturalIntRegs) {
+            DVRVectorInstructionRegister response_vir;
+            const auto response = response_vir.executeFromSource(
+                state->replay->uops, state->replay->count,
+                state->replay->triggerDestination, value,
+                dvrHelperMaxUops, state->replay->initialRegs);
+            ++cpuStats.dvrVIRSourceValueExecutions;
+            cpuStats.dvrVIRSourceValueBranches += response.divergentBranches;
+            cpuStats.dvrVIRSourceValueExternalLanes +=
+                response.externalPathLanes;
+            cpuStats.dvrVIRSourceValueSemanticFailures +=
+                response.unsupportedSemanticLanes;
+            cpuStats.dvrVIRSourceValueTerminations +=
+                response.normalTerminatedLanes + response.earlyExitLanes;
+        }
         bool matched = dvrEnableDependentPrefetch &&
                        replayDVRSource(*state, value);
         if (dvrEnableDependentPrefetch && !matched) {

@@ -376,6 +376,15 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
             uop.semantic = Semantic::Add;
             return;
         }
+
+        // C.BEQZ/C.BNEZ rs1', offset -- quadrant 1.  The second
+        // comparison operand is architectural x0 and is represented by the
+        // absent source1 register, which the VIR evaluator treats as zero.
+        if (quadrant == 1 && (funct3 == 6 || funct3 == 7)) {
+            uop.semantic = funct3 == 6 ? Semantic::BranchEqual :
+                                         Semantic::BranchNotEqual;
+            return;
+        }
         return;
     }
 
@@ -450,6 +459,35 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
     if (opcode == 0x03) {
         uop.semantic = Semantic::LoadAddress;
         uop.immediate = dvrSignExtend(uop.encoding >> 20, 12);
+        return;
+    }
+
+    // Preserve the actual RV64 branch comparison for value-driven VIR
+    // continuation; branchTaken only describes the path observed during
+    // discovery and must not be used as the predicate itself.
+    if (opcode == 0x63) {
+        switch (funct3) {
+          case 0:
+            uop.semantic = Semantic::BranchEqual;
+            break;
+          case 1:
+            uop.semantic = Semantic::BranchNotEqual;
+            break;
+          case 4:
+            uop.semantic = Semantic::BranchSignedLess;
+            break;
+          case 5:
+            uop.semantic = Semantic::BranchSignedGreaterEqual;
+            break;
+          case 6:
+            uop.semantic = Semantic::BranchUnsignedLess;
+            break;
+          case 7:
+            uop.semantic = Semantic::BranchUnsignedGreaterEqual;
+            break;
+          default:
+            break;
+        }
     }
 }
 
@@ -542,10 +580,46 @@ DVRInstructionRecorder::Uop::evaluate(
             static_cast<int32_t>(source0_value) >>
             (static_cast<unsigned>(immediate) & 0x1f))));
         return true;
+      case Semantic::BranchEqual:
+      case Semantic::BranchNotEqual:
+      case Semantic::BranchSignedLess:
+      case Semantic::BranchSignedGreaterEqual:
+      case Semantic::BranchUnsignedLess:
+      case Semantic::BranchUnsignedGreaterEqual:
       case Semantic::Unsupported:
         return false;
     }
     return false;
+}
+
+bool
+DVRInstructionRecorder::Uop::evaluateBranch(
+    RegVal source0_value, RegVal source1_value, bool &taken) const
+{
+    switch (semantic) {
+      case Semantic::BranchEqual:
+        taken = source0_value == source1_value;
+        return true;
+      case Semantic::BranchNotEqual:
+        taken = source0_value != source1_value;
+        return true;
+      case Semantic::BranchSignedLess:
+        taken = static_cast<int64_t>(source0_value) <
+            static_cast<int64_t>(source1_value);
+        return true;
+      case Semantic::BranchSignedGreaterEqual:
+        taken = static_cast<int64_t>(source0_value) >=
+            static_cast<int64_t>(source1_value);
+        return true;
+      case Semantic::BranchUnsignedLess:
+        taken = source0_value < source1_value;
+        return true;
+      case Semantic::BranchUnsignedGreaterEqual:
+        taken = source0_value >= source1_value;
+        return true;
+      default:
+        return false;
+    }
 }
 
 void
@@ -591,6 +665,16 @@ DVRInstructionRecorder::record(const DynInstPtr &inst)
     uop.branchTaken = inst->pcState().branching();
     dvrDecodeRiscvSemantic(uop, inst);
     return true;
+}
+
+void
+DVRInstructionRecorder::import(const std::array<Uop, MaxUops> &source,
+                                unsigned size)
+{
+    reset();
+    count = std::min(size, MaxUops);
+    for (unsigned index = 0; index < count; ++index)
+        uops[index] = source[index];
 }
 
 void
@@ -683,18 +767,20 @@ DVRVectorInstructionRegister::Result
 DVRVectorInstructionRegister::executeLanePC(
     const DVRInstructionRecorder &program, unsigned lanes,
     unsigned max_helper_uops,
-    const std::array<RegVal, 32> &initial_regs)
+    const std::array<RegVal, 32> &initial_regs, unsigned start_index,
+    int source_destination, RegVal source_value)
 {
     reset();
     Result result;
     lanes = std::min(lanes, 128U);
-    if (program.size() == 0 || lanes == 0 || max_helper_uops == 0)
+    if (program.size() == 0 || start_index >= program.size() ||
+        lanes == 0 || max_helper_uops == 0)
         return result;
 
     std::array<bool, 128> lane_active = {};
     std::array<bool, DVRInstructionRecorder::MaxUops> pending_reconvergence =
         {};
-    const Addr entry = program[0].pc;
+    const Addr entry = program[start_index].pc;
     for (unsigned lane = 0; lane < lanes; ++lane) {
         lane_active[lane] = true;
         lanePC[lane] = entry;
@@ -702,6 +788,9 @@ DVRVectorInstructionRegister::executeLanePC(
         for (unsigned reg = 0;
              reg < DVRVectorRenameTable::NumArchitecturalRegs; ++reg)
             vectorRegs[reg][lane] = initial_regs[reg];
+        if (source_destination >= 0 &&
+            source_destination < DVRVectorRenameTable::NumArchitecturalRegs)
+            vectorRegs[source_destination][lane] = source_value;
     }
     result.activeLanes = lanes;
 
@@ -752,7 +841,17 @@ DVRVectorInstructionRegister::executeLanePC(
             const RegVal rhs = op.source1 >= 0 ?
                 vectorRegs[op.source1][lane] : 0;
             if (op.conditional) {
-                const bool lane_taken = (lhs != 0) == op.branchTaken;
+                // The initial vector pass is a control-flow audit and runs
+                // before asynchronous source values exist.  Preserve its
+                // conservative discovered-path behavior.  A response-driven
+                // continuation, in contrast, has a real source value and
+                // must evaluate the decoded architectural comparison.
+                bool lane_taken = (lhs != 0) == op.branchTaken;
+                if (start_index != 0 &&
+                    !op.evaluateBranch(lhs, rhs, lane_taken)) {
+                    result.unsupportedControlFlow = true;
+                    ++result.externalPathLanes;
+                }
                 const Addr next = lane_taken ? op.branchTargetPC :
                     (op.fallthroughPC != 0 ? op.fallthroughPC :
                      (op_index + 1 < program.size() ?
@@ -956,6 +1055,23 @@ DVRVectorInstructionRegister::execute(
 
     }
     return result;
+}
+
+DVRVectorInstructionRegister::Result
+DVRVectorInstructionRegister::executeFromSource(
+    const std::array<DVRInstructionRecorder::Uop,
+                     DVRInstructionRecorder::MaxUops> &source,
+    unsigned size, int source_destination, RegVal source_value,
+    unsigned max_helper_uops,
+    const std::array<RegVal, 32> &initial_regs)
+{
+    DVRInstructionRecorder program;
+    program.import(source, size);
+    // Entry zero is the source load whose value arrived asynchronously.
+    // Start at the following captured uop so it cannot overwrite the value
+    // with an address calculation a second time.
+    return executeLanePC(program, 1, max_helper_uops, initial_regs, 1,
+                         source_destination, source_value);
 }
 
 RegVal

@@ -183,7 +183,13 @@ class DVRInstructionRecorder
             ShiftRightArithmeticImmediate,
             ShiftRightLogicalWordImmediate,
             ShiftRightArithmeticWordImmediate,
-            LoadAddress
+            LoadAddress,
+            BranchEqual,
+            BranchNotEqual,
+            BranchSignedLess,
+            BranchSignedGreaterEqual,
+            BranchUnsignedLess,
+            BranchUnsignedGreaterEqual
         };
 
         Addr pc = 0;
@@ -210,6 +216,8 @@ class DVRInstructionRecorder
          */
         bool evaluate(RegVal source0_value, RegVal source1_value,
                       RegVal &result) const;
+        bool evaluateBranch(RegVal source0_value, RegVal source1_value,
+                            bool &taken) const;
     };
 
   private:
@@ -220,6 +228,8 @@ class DVRInstructionRecorder
   public:
     void begin(const DynInstPtr &trigger);
     bool record(const DynInstPtr &inst);
+    /** Import a committed helper template for response-driven replay. */
+    void import(const std::array<Uop, MaxUops> &source, unsigned size);
     void reset();
     unsigned size() const { return count; }
     bool overflow() const { return overflowed; }
@@ -298,13 +308,27 @@ class DVRVectorInstructionRegister
   private:
     Result executeLanePC(const DVRInstructionRecorder &program,
                          unsigned lanes, unsigned max_helper_uops,
-                         const std::array<RegVal, 32> &initial_regs);
+                         const std::array<RegVal, 32> &initial_regs,
+                         unsigned start_index = 0,
+                         int source_destination = -1,
+                         RegVal source_value = 0);
 
   public:
 
     Result execute(const DVRInstructionRecorder &program, unsigned lanes,
                    unsigned max_helper_uops,
                    const std::array<RegVal, 32> &initial_regs);
+    /**
+     * Resume one captured lane after its asynchronous source load returns.
+     * The returned value replaces the trigger-load destination and execution
+     * starts at the first uop after that load.
+     */
+    Result executeFromSource(const std::array<DVRInstructionRecorder::Uop,
+                                               DVRInstructionRecorder::MaxUops>
+                                 &source,
+                             unsigned size, int source_destination,
+                             RegVal source_value, unsigned max_helper_uops,
+                             const std::array<RegVal, 32> &initial_regs);
     void reset();
     const std::array<uint64_t, 2> &mask() const { return activeMask; }
     RegVal laneValue(unsigned reg, unsigned lane) const;
