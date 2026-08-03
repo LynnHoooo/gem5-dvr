@@ -1281,3 +1281,44 @@ path evaluator 和严格的论文 NDM branch inversion 仍然是后续缺口。�
 - GAP 五 workload 六模式实验：已完成；
 - evaluator 常见整数语义：已扩展并编译/Stage15 验证；
 - 完整论文 NDM 与真实 FU pipeline：尚未完成。
+
+## 17. O3 pipeline 接入状态
+
+`38b4aa8` 的 load-width evaluator 已合并到当前分支；随后又完成了 helper
+compute 到 gem5 原生 O3 FU pool 的接入。当前路径是：
+
+```text
+committed Discovery slice
+  -> DVRHelperThread fetch/decode/ready state
+  -> IEW::tryIssueDVRHelperFU()
+  -> FUPool::getUnit(IntAlu/IntMult)
+  -> freeUnitNextCycle()
+  -> helper memory uop -> LSQ data port -> cache response
+```
+
+对应代码位置：
+
+- `src/cpu/o3/iew.hh/.cc`：`IEW::tryIssueDVRHelperFU()`，调用原生
+  `FUPool::getUnit()`、读取 native op latency，并按 O3 生命周期预约 FU 释放；
+- `src/cpu/o3/cpu.cc`：`CPU::issueDVRHelperCompute()`，把 captured ALU/shift
+  映射到 `IntAluOp`，把 multiply 映射到 `IntMultOp`，并在主线程 issue 后参与
+  residual issue arbitration；
+- `src/cpu/o3/cpu.cc`：`serviceDVRPrefetchQueue()`，helper memory request
+  仍经过 O3 LSQ 的 data port、DTLB、cache timing response 和 completion；
+- `scripts/run_remote_dvr_stage15_resource_smoke.sh`：验收 native FU request、
+  grant、stall 以及 LSQ/helper 资源统计。
+
+新二进制的 Stage 15 结果为：
+
+```text
+fu_requests=120921 fu_grants=89129 fu_stalls=31792
+helper_fetch=9394 helper_decode=9641 helper_compute=25288
+helper_issue_cycles=10414 dvr_issued=10414
+```
+
+因此当前可以称为 **ISA-adapted, O3-pipeline-integrated helper resource and
+LSQ path**。边界仍需准确保留：helper 尚未作为真实 `DynInst` 插入主线程的
+fetch/decode queues、IQ、ROB 或 commit；其 captured evaluator 仍由 DVR 专用
+状态机驱动，native O3 FU/LSQ 是接入的资源和 memory lifetime 后端。下一阶段若
+要达到论文级完整 helper，需要建立 helper-owned `DynInst`/IQ 生命周期、真实
+依赖 wakeup、FU completion/writeback 和独立 helper squash/recovery。

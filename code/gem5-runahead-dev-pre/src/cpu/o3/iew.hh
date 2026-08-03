@@ -212,6 +212,9 @@ class IEW
     /** Reports to the CPU that there is activity this cycle. */
     void activityThisCycle();
 
+    /** Reserve a native O3 FU for one DVR helper compute uop. */
+    bool tryIssueDVRHelperFU(OpClass op_class, Cycles &latency);
+
     /** Tells CPU that the IEW stage is active and running. */
     void activateStage();
 

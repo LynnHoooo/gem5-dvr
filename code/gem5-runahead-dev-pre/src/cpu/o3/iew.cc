@@ -840,6 +840,18 @@ IEW::activityThisCycle()
     cpu->activityThisCycle();
 }
 
+bool
+IEW::tryIssueDVRHelperFU(OpClass op_class, Cycles &latency)
+{
+    const int fu_idx = fuPool->getUnit(op_class);
+    if (fu_idx == FUPool::NoFreeFU || fu_idx == FUPool::NoCapableFU)
+        return false;
+
+    latency = fuPool->getOpLatency(op_class);
+    fuPool->freeUnitNextCycle(fu_idx);
+    return true;
+}
+
 void
 IEW::activateStage()
 {

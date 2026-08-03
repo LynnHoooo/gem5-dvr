@@ -699,6 +699,9 @@ class CPU : public BaseCPU
         statistics::Scalar dvrHelperReadyUops;
         statistics::Scalar dvrHelperComputeCycles;
         statistics::Scalar dvrHelperComputeConflicts;
+        statistics::Scalar dvrHelperFURequests;
+        statistics::Scalar dvrHelperFUGrants;
+        statistics::Scalar dvrHelperFUStalls;
         statistics::Scalar dvrHelperALUOps;
         statistics::Scalar dvrHelperShiftOps;
         statistics::Scalar dvrHelperMultiplyOps;
@@ -1056,6 +1059,7 @@ class CPU : public BaseCPU
     // Main O3 stages run first every cycle.  Helpers may consume at most one
     // residual issue/LSU slot after IEW has completed.
     unsigned dvrHelperIssuesThisCycle = 0;
+    unsigned dvrHelperComputeIssuesThisCycle = 0;
     unsigned dvrMainIssuesThisCycle = 0;
     unsigned dvrMainALUIssuesThisCycle = 0;
     unsigned dvrMainLSUIssuesThisCycle = 0;
@@ -1086,6 +1090,7 @@ class CPU : public BaseCPU
     uint64_t dvrNextHelperId = 1;
     std::shared_ptr<DVRPredicateGeneration> dvrActivePredicateGeneration;
     Addr dvrCurrentTriggerPC = 0;
+    Addr dvrCurrentTriggerAddress = 0;
     uint8_t dvrSelectedRelationSlots = 0;
     RegVal dvrInitiatingLoadValue = 0;
     struct DVRPendingNestedCandidate
@@ -1191,6 +1196,7 @@ class CPU : public BaseCPU
                         unsigned lanes,
                         const DVRInstructionRecorder::ResourceCounts
                         &resources = {});
+    unsigned issueDVRHelperCompute();
     Addr dvrPrefetchLine(Addr address) const;
     void accountDVRDemand(Addr address);
     void updateDVRPrefetchQueuePeak();

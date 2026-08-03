@@ -534,6 +534,12 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Cycles in which captured helper compute uops executed"),
       ADD_STAT(dvrHelperComputeConflicts, statistics::units::Count::get(),
                "Helper compute cycles blocked by main ALU occupancy"),
+      ADD_STAT(dvrHelperFURequests, statistics::units::Count::get(),
+               "Helper compute uops requesting a native O3 FU"),
+      ADD_STAT(dvrHelperFUGrants, statistics::units::Count::get(),
+               "Helper compute uops granted a native O3 FU"),
+      ADD_STAT(dvrHelperFUStalls, statistics::units::Count::get(),
+               "Helper compute uops stalled by native FU availability"),
       ADD_STAT(dvrHelperALUOps, statistics::units::Count::get(),
                "Captured helper ALU/control uops profiled"),
       ADD_STAT(dvrHelperShiftOps, statistics::units::Count::get(),
@@ -809,6 +815,7 @@ CPU::tick()
     ++baseStats.numCycles;
     updateCycleCounters(BaseCPU::CPU_STATE_ON);
     dvrHelperIssuesThisCycle = 0;
+    dvrHelperComputeIssuesThisCycle = 0;
     dvrMainIssuesThisCycle = 0;
     dvrMainALUIssuesThisCycle = 0;
     dvrMainLSUIssuesThisCycle = 0;
@@ -839,15 +846,11 @@ CPU::tick()
         cpuStats.dvrHelperReadyUops += dvrHelperThread.readyUops;
     }
 
-    const unsigned helper_alu_width =
-        dvrMainALUIssuesThisCycle < dvrIssueWidth ?
-        dvrIssueWidth - dvrMainALUIssuesThisCycle : 0;
-    const unsigned helper_compute = dvrHelperThread.advanceCompute(
-        helper_alu_width, dvrIssueWidth, dvrIssueWidth);
+    const unsigned helper_compute = issueDVRHelperCompute();
     if (helper_compute != 0)
         ++cpuStats.dvrHelperComputeCycles;
     else if (dvrHelperThread.computePending() &&
-             dvrHelperThread.readyUops != 0 && helper_alu_width == 0)
+             dvrHelperThread.readyUops != 0)
         ++cpuStats.dvrHelperComputeConflicts;
 
     cpuStats.dvrMainIssueSlotsUsed += dvrMainIssuesThisCycle;
@@ -1831,6 +1834,8 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                     dvrNestedDiscoveryMode.reset();
                 dvrCommittedNestedCandidate = {};
                 dvrCurrentTriggerPC = result.triggerPC;
+                dvrCurrentTriggerAddress = inst->effAddrValid() ?
+                    inst->effAddr : 0;
                 dvrInitiatingLoadValue = 0;
                 for (int dest = 0; dest < inst->numDestRegs(); ++dest) {
                     if (inst->destRegIdx(dest).classValue() == IntRegClass) {
@@ -1857,6 +1862,21 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 captureDVRRegisterSnapshot(tid, inst, finish_regs);
                 const auto inference = dvrLoopBoundDetector.infer(
                     dvrDiscoveryStartRegs, finish_regs, dvrMaxLanes);
+                // Every completed root discovery is a dynamic inner-loop
+                // invocation with its own start address and bound.  Once NDM
+                // has found the outer stride, pair that exact data with the
+                // next committed outer base from its FIFO.
+                if (dvrNestedDiscoveryMode.state() ==
+                        DVRNestedDiscoveryMode::State::OuterFound &&
+                    inference.matched && inference.lanes != 0 &&
+                    dvrCurrentTriggerAddress != 0 &&
+                    dvrTaintTracker.flr() != 0 &&
+                    dvrNestedDiscoveryMode.recordOuterInvocation(
+                        dvrCurrentTriggerAddress, inference.lanes,
+                        result.triggerPC, dvrTaintTracker.flr(),
+                        inference.increment)) {
+                    ++cpuStats.dvrNDMOuterInvocations;
+                }
                 const auto ndm_started = dvrNestedDiscoveryMode.start(
                     result.triggerPC, inference.increment, inference.lanes);
                 if (ndm_started.event ==
@@ -1952,7 +1972,26 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 }
                 const bool launch_source_fallback =
                     vir_control_fallback && !dvrInstructionRecorder.overflow();
-                if ((helper_allowed || launch_source_fallback) &&
+                bool ndm_launched = false;
+                if (helper_allowed &&
+                    dvrNestedDiscoveryMode.readyToVectorize()) {
+                    dvrNestedContext.reset();
+                    dvrNestedContext.active = true;
+                    dvrNestedContext.tid = tid;
+                    dvrNestedContext.triggerPC = result.triggerPC;
+                    dvrNestedContext.triggerAddress =
+                        dvrCurrentTriggerAddress;
+                    dvrNestedContext.stride = inference.increment;
+                    dvrNestedContext.taint = dvrTaintTracker;
+                    dvrNestedContext.recorder = dvrInstructionRecorder;
+                    dvrNestedContext.startRegs = dvrDiscoveryStartRegs;
+                    launchDVRNestedPrefetches(finish_regs);
+                    dvrNestedDiscoveryMode.finishVectorization();
+                    dvrNestedContext.reset();
+                    ndm_launched = true;
+                }
+                if (!ndm_launched &&
+                    (helper_allowed || launch_source_fallback) &&
                     inst->effAddrValid()) {
                     if (launch_source_fallback)
                         ++cpuStats.dvrControlFallbackSourceLaunches;
@@ -2561,6 +2600,40 @@ CPU::retireDVRPredicateLane(
     finishDVRPredicateGeneration(generation, false);
 }
 
+unsigned
+CPU::issueDVRHelperCompute()
+{
+    unsigned slots = dvrIssueWidth;
+    if (dvrMainIssuesThisCycle >= slots)
+        return 0;
+    slots -= dvrMainIssuesThisCycle;
+    if (dvrHelperIssuesThisCycle >= slots)
+        return 0;
+    slots -= dvrHelperIssuesThisCycle;
+
+    unsigned issued = 0;
+    auto issue_class = [&](unsigned &remaining, OpClass op_class) {
+        while (remaining != 0 && slots != 0) {
+            ++cpuStats.dvrHelperFURequests;
+            Cycles latency(1);
+            if (!iew.tryIssueDVRHelperFU(op_class, latency)) {
+                ++cpuStats.dvrHelperFUStalls;
+                break;
+            }
+            --remaining;
+            --slots;
+            ++issued;
+            ++dvrHelperComputeIssuesThisCycle;
+            ++cpuStats.dvrHelperFUGrants;
+        }
+    };
+
+    issue_class(dvrHelperThread.aluRemaining, IntAluOp);
+    issue_class(dvrHelperThread.shiftRemaining, IntAluOp);
+    issue_class(dvrHelperThread.multiplyRemaining, IntMultOp);
+    return issued;
+}
+
 void
 CPU::serviceDVRPrefetchQueue()
 {
@@ -2571,7 +2644,8 @@ CPU::serviceDVRPrefetchQueue()
         ++cpuStats.dvrIssueBudgetConflicts;
         return;
     }
-    if (dvrMainIssuesThisCycle + dvrHelperIssuesThisCycle >= dvrIssueWidth) {
+    if (dvrMainIssuesThisCycle + dvrHelperIssuesThisCycle +
+            dvrHelperComputeIssuesThisCycle >= dvrIssueWidth) {
         ++cpuStats.dvrResourceConflicts;
         ++cpuStats.dvrIssueBudgetConflicts;
         return;
@@ -3389,6 +3463,7 @@ CPU::observeDVRDispatch(const DynInstPtr &inst)
                     dvrNestedDiscoveryMode.reset();
                 dvrCommittedNestedCandidate = {};
                 dvrCurrentTriggerPC = candidate->pc;
+                dvrCurrentTriggerAddress = candidate->address;
                 dvrInitiatingLoadValue = 0;
                 captureDVRRegisterSnapshot(
                     inst->threadNumber, inst, dvrDiscoveryStartRegs);
