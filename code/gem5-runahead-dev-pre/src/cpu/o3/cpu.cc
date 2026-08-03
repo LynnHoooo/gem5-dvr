@@ -1904,7 +1904,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                     const auto vir_result =
                         dvrVectorInstructionRegister.execute(
                             dvrInstructionRecorder, inference.lanes,
-                            dvrHelperMaxUops);
+                            dvrHelperMaxUops, dvrDiscoveryStartRegs);
                     cpuStats.dvrVIRChunkIssues +=
                         vir_result.chunkIssues;
                     cpuStats.dvrVIRChunkExecutions +=
@@ -2237,7 +2237,7 @@ CPU::completeDVRNestedContext(
             dvrNestedContext.recorder, inference.lanes);
         const auto vir_result = dvrNestedContext.vir.execute(
             dvrNestedContext.recorder, inference.lanes,
-            dvrHelperMaxUops);
+            dvrHelperMaxUops, dvrNestedContext.startRegs);
         cpuStats.dvrNestedVIRExecutions += vir_result.chunkExecutions;
         cpuStats.dvrDivergentBranches += vir_result.divergentBranches;
         cpuStats.dvrReconvergences += vir_result.reconvergences;

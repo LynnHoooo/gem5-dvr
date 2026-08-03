@@ -293,12 +293,14 @@ class DVRVectorInstructionRegister
 
   private:
     Result executeLanePC(const DVRInstructionRecorder &program,
-                         unsigned lanes, unsigned max_helper_uops);
+                         unsigned lanes, unsigned max_helper_uops,
+                         const std::array<RegVal, 32> &initial_regs);
 
   public:
 
     Result execute(const DVRInstructionRecorder &program, unsigned lanes,
-                   unsigned max_helper_uops = 200);
+                   unsigned max_helper_uops,
+                   const std::array<RegVal, 32> &initial_regs);
     void reset();
     const std::array<uint64_t, 2> &mask() const { return activeMask; }
     RegVal laneValue(unsigned reg, unsigned lane) const;

@@ -193,7 +193,7 @@ discovery complete
 | VTT / FLR | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `DVRVectorTaintTracker::observe()`、`classify()`；dispatch 侧 taint/dependent 记录 | Stage 4 |
 | Loop-Bound Detector | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `begin()`、`updateFinalLoad()`、`observe()`、`infer()`；RV64 branch compare decode 与 signed bound arithmetic | Stage 5、6 |
 | Instruction Recorder | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `DVRInstructionRecorder::begin()`、`record()`；`instDone()` 保存 committed slice | Stage 8、10 |
-| VRAT / VIR | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `DVRVectorRenameTable::build()`；`DVRVectorInstructionRegister::execute()` | Stage 10 |
+| VRAT / VIR | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `DVRVectorRenameTable::build()`；`DVRVectorInstructionRegister::execute()`；真实 Discovery register snapshot 初始化 lane | Stage 10、11 |
 | Source prefetch | `src/cpu/o3/cpu.cc` | `launchDVRStridePrefetches()`、`serviceDVRPrefetchQueue()` | Stage 7 |
 | Dependent replay | `src/cpu/o3/cpu.cc` | `replayDVRSource()`、`completeDVRPrefetch()`；`lsq.cc` 完成 response 回调 | Stage 8 |
 | Predicate / reconvergence | `src/cpu/o3/dvr_predicate.hh/.cc`；`cpu.cc` | `DVRLanePredicateTracker`；`retireDVRPredicateLane()` | Stage 11、12 |
@@ -238,7 +238,7 @@ NDM 和 helper 前端的专项统计也可由以下入口检查：
 | 8 | 真实逐 lane dependent replay | 需单独复核 | 代码已有 dispatch sequence tracking、地址有效性保护和 replay 统计；不要用 Stage 7 结果替代 Stage 8 证据 |
 | 9 | Baseline vs DVR | 当前树通过 | demand L1D miss 降低 11.56% |
 | 10 | 8-uop recorder/VRAT/VIR | 当前树通过 | 2396 programs，95470 VIR executions；真实 replay 守恒断言通过 |
-| 11 | actual-value predicate/reconvergence/timeout | 当前树完整通过 | divergent=3019，reconverged=604，abandoned=2415；forced timeout=1965/generated=0 |
+| 11 | actual-value predicate/reconvergence/timeout | 当前树通过 | divergent=1，reconverged=1，unsupported_control_flow=1329；forced timeout=116/generated=0 |
 | 12 | predicate/quality 独立严格 smoke | 当前树通过 | actual-value mask 与质量计数器 `-Werror` smoke |
 | 14 | NDM 控制与 timeout | 通过 | dispatch Discovery、IR/ILR/LCR、至少两个 outer invocation、timeout/fallback |
 | 15 | helper 前端与资源竞争 | 通过 | fetch/decode/issue、主线程优先资源统计 |

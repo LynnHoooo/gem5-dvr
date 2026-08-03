@@ -682,7 +682,8 @@ DVRVectorRenameTable::lookup(unsigned architectural, unsigned chunk) const
 DVRVectorInstructionRegister::Result
 DVRVectorInstructionRegister::executeLanePC(
     const DVRInstructionRecorder &program, unsigned lanes,
-    unsigned max_helper_uops)
+    unsigned max_helper_uops,
+    const std::array<RegVal, 32> &initial_regs)
 {
     reset();
     Result result;
@@ -699,11 +700,8 @@ DVRVectorInstructionRegister::executeLanePC(
         lanePC[lane] = entry;
         activeMask[lane / 64] |= uint64_t(1) << (lane % 64);
         for (unsigned reg = 0;
-             reg < DVRVectorRenameTable::NumArchitecturalRegs; ++reg) {
-            // The asynchronous source response replaces the trigger value in
-            // replay; VIR uses the lane ordinal for pre-response scalar state.
-            vectorRegs[reg][lane] = lane;
-        }
+             reg < DVRVectorRenameTable::NumArchitecturalRegs; ++reg)
+            vectorRegs[reg][lane] = initial_regs[reg];
     }
     result.activeLanes = lanes;
 
@@ -827,9 +825,10 @@ DVRVectorInstructionRegister::executeLanePC(
 DVRVectorInstructionRegister::Result
 DVRVectorInstructionRegister::execute(
     const DVRInstructionRecorder &program, unsigned lanes,
-    unsigned max_helper_uops)
+    unsigned max_helper_uops,
+    const std::array<RegVal, 32> &initial_regs)
 {
-    return executeLanePC(program, lanes, max_helper_uops);
+    return executeLanePC(program, lanes, max_helper_uops, initial_regs);
 
     // Legacy mask-only implementation retained below as a reference while
     // the lane-PC executor is validated against existing VIR counters.
