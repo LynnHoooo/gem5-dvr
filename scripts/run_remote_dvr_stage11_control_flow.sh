@@ -74,10 +74,14 @@ dependent="$(read_stat "$normal" system.cpu.dvrDependentPrefetchesGenerated)"
 control_fallback="$(read_stat "$normal" system.cpu.dvrControlFallbackSourceLaunches)"
 source_value_execs="$(read_stat "$normal" system.cpu.dvrVIRSourceValueExecutions)"
 source_value_external="$(read_stat "$normal" system.cpu.dvrVIRSourceValueExternalLanes)"
+continuation_contexts="$(read_stat "$normal" system.cpu.dvrVIRContinuationContexts)"
+continuation_resumes="$(read_stat "$normal" system.cpu.dvrVIRContinuationResumes)"
 require_nonzero discovery_starts "$starts"
 require_nonzero discovery_completions "$completions"
 require_nonzero vector_programs "$programs"
 require_nonzero source_value_vir_executions "$source_value_execs"
+require_nonzero vir_continuation_contexts "$continuation_contexts"
+require_nonzero vir_continuation_resumes "$continuation_resumes"
 if [[ -z "$branches" || -z "$normal_terminated" || -z "$early_exits" ||
       -z "$external_lanes" || -z "$semantic_lanes" ]]; then
     printf 'error: VIR termination counters are missing\n' >&2
@@ -122,8 +126,8 @@ limited_generated="$(read_stat "$limited" system.cpu.dvrPrefetchesGenerated)"
 require_nonzero forced_helper_timeouts "$limited_timeouts"
 require_equal forced_prefetches_generated "$limited_generated" 0
 
-printf 'DVR_STAGE11_CONTROL_PASSED starts=%s completions=%s abandons=%s programs=%s divergent=%s reconvergences=%s predicate_abandons=%s normal_terminated=%s early_exits=%s external_lanes=%s semantic_lanes=%s unsupported_control_flow=%s control_fallback_source_launches=%s source_value_vir_executions=%s source_value_external_lanes=%s relations=%s selected_paths=%s dependent=%s timeouts=%s recorder_overflows=%s stack_overflows=%s forced_timeouts=%s forced_generated=%s\n' \
+printf 'DVR_STAGE11_CONTROL_PASSED starts=%s completions=%s abandons=%s programs=%s divergent=%s reconvergences=%s predicate_abandons=%s normal_terminated=%s early_exits=%s external_lanes=%s semantic_lanes=%s unsupported_control_flow=%s control_fallback_source_launches=%s vir_continuation_contexts=%s vir_continuation_resumes=%s source_value_vir_executions=%s source_value_external_lanes=%s relations=%s selected_paths=%s dependent=%s timeouts=%s recorder_overflows=%s stack_overflows=%s forced_timeouts=%s forced_generated=%s\n' \
     "$starts" "$completions" "$abandons" "$programs" "$branches" \
-    "$reconvergences" "$predicate_abandons" "$normal_terminated" "$early_exits" "$external_lanes" "$semantic_lanes" "$unsupported" "$control_fallback" "$source_value_execs" "$source_value_external" "$relations" "$paths" "$dependent" "$timeouts" \
+    "$reconvergences" "$predicate_abandons" "$normal_terminated" "$early_exits" "$external_lanes" "$semantic_lanes" "$unsupported" "$control_fallback" "$continuation_contexts" "$continuation_resumes" "$source_value_execs" "$source_value_external" "$relations" "$paths" "$dependent" "$timeouts" \
     "$recorder_overflows" "$overflows" \
     "$limited_timeouts" "$limited_generated"

@@ -1074,6 +1074,130 @@ DVRVectorInstructionRegister::executeFromSource(
                          source_destination, source_value);
 }
 
+void
+DVRVectorInstructionRegister::initializeSourceContinuation(
+    const std::array<DVRInstructionRecorder::Uop,
+                     DVRInstructionRecorder::MaxUops> &source,
+    unsigned size, unsigned lanes,
+    const std::array<RegVal, 32> &initial_regs)
+{
+    reset();
+    continuationLanes = std::min(lanes, 128U);
+    if (size <= 1 || continuationLanes == 0)
+        return;
+
+    continuationInitialized = true;
+    const Addr entry = source[1].pc;
+    for (unsigned lane = 0; lane < continuationLanes; ++lane) {
+        laneActive[lane] = true;
+        lanePC[lane] = entry;
+        activeMask[lane / 64] |= uint64_t(1) << (lane % 64);
+        for (unsigned reg = 0;
+             reg < DVRVectorRenameTable::NumArchitecturalRegs; ++reg)
+            vectorRegs[reg][lane] = initial_regs[reg];
+    }
+}
+
+DVRVectorInstructionRegister::Result
+DVRVectorInstructionRegister::resumeSourceLane(
+    const std::array<DVRInstructionRecorder::Uop,
+                     DVRInstructionRecorder::MaxUops> &source,
+    unsigned size, unsigned lane, int source_destination,
+    RegVal source_value, unsigned max_helper_uops)
+{
+    Result result;
+    if (!continuationInitialized || size <= 1 ||
+        lane >= continuationLanes || !laneActive[lane] ||
+        max_helper_uops == 0)
+        return result;
+
+    result.activeLanes = 1;
+    if (source_destination >= 0 &&
+        source_destination < DVRVectorRenameTable::NumArchitecturalRegs)
+        vectorRegs[source_destination][lane] = source_value;
+
+    for (unsigned step = 0; step < max_helper_uops; ++step) {
+        int op_index = -1;
+        for (unsigned candidate = 1; candidate < size; ++candidate) {
+            if (source[candidate].pc == lanePC[lane]) {
+                op_index = candidate;
+                break;
+            }
+        }
+
+        if (op_index < 0) {
+            if (lanePC[lane] != 0) {
+                result.unsupportedControlFlow = true;
+                ++result.externalPathLanes;
+            }
+            laneActive[lane] = false;
+            activeMask[lane / 64] &= ~(uint64_t(1) << (lane % 64));
+            break;
+        }
+
+        const auto &op = source[op_index];
+        if (lanePendingReconvergence[lane][op_index]) {
+            ++result.reconvergences;
+            lanePendingReconvergence[lane][op_index] = false;
+            if (laneStackDepth[lane] != 0)
+                --laneStackDepth[lane];
+        }
+
+        const RegVal lhs = op.source0 >= 0 ?
+            vectorRegs[op.source0][lane] : 0;
+        const RegVal rhs = op.source1 >= 0 ?
+            vectorRegs[op.source1][lane] : 0;
+        if (op.conditional) {
+            bool taken = false;
+            if (!op.evaluateBranch(lhs, rhs, taken)) {
+                result.unsupportedControlFlow = true;
+                ++result.externalPathLanes;
+                taken = (lhs != 0) == op.branchTaken;
+            }
+            const Addr next = taken ? op.branchTargetPC :
+                (op.fallthroughPC != 0 ? op.fallthroughPC :
+                 (op_index + 1 < size ? source[op_index + 1].pc : 0));
+            lanePC[lane] = next;
+            ++result.helperUops;
+            ++result.chunkIssues;
+            ++result.chunkExecutions;
+            if (next == 0) {
+                ++result.earlyExitLanes;
+                laneActive[lane] = false;
+                activeMask[lane / 64] &=
+                    ~(uint64_t(1) << (lane % 64));
+                break;
+            }
+            continue;
+        }
+
+        RegVal value = 0;
+        if (!op.evaluate(lhs, rhs, value)) {
+            result.unsupportedControlFlow = true;
+            ++result.unsupportedSemanticLanes;
+            laneActive[lane] = false;
+            activeMask[lane / 64] &= ~(uint64_t(1) << (lane % 64));
+            break;
+        }
+        if (op.destination >= 0)
+            vectorRegs[op.destination][lane] = value;
+        lanePC[lane] = op_index + 1 < size ? source[op_index + 1].pc : 0;
+        ++result.helperUops;
+        ++result.chunkIssues;
+        ++result.chunkExecutions;
+        if (lanePC[lane] == 0) {
+            ++result.normalTerminatedLanes;
+            laneActive[lane] = false;
+            activeMask[lane / 64] &= ~(uint64_t(1) << (lane % 64));
+            break;
+        }
+    }
+
+    if (result.helperUops >= max_helper_uops && laneActive[lane])
+        result.timedOut = true;
+    return result;
+}
+
 RegVal
 DVRVectorInstructionRegister::laneValue(unsigned reg, unsigned lane) const
 {
@@ -1089,6 +1213,12 @@ DVRVectorInstructionRegister::reset()
     stack = {};
     vectorRegs = {};
     lanePC = {};
+    laneActive = {};
+    lanePendingReconvergence = {};
+    laneStackDepth = {};
+    laneStack = {};
+    continuationLanes = 0;
+    continuationInitialized = false;
     stackDepth = 0;
     issuedChunks = 0;
     executedChunks = 0;

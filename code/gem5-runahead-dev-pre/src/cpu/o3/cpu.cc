@@ -647,6 +647,15 @@ CPU::CPUStats::CPUStats(CPU *cpu)
       ADD_STAT(dvrVIRSourceValueTerminations,
                statistics::units::Count::get(),
                "Source-value VIR lanes reaching a terminal path"),
+      ADD_STAT(dvrVIRContinuationContexts,
+               statistics::units::Count::get(),
+               "Persistent multi-lane VIR contexts created per helper"),
+      ADD_STAT(dvrVIRContinuationResumes,
+               statistics::units::Count::get(),
+               "Source responses resumed through persistent VIR contexts"),
+      ADD_STAT(dvrVIRContinuationFallbacks,
+               statistics::units::Count::get(),
+               "Source responses using temporary VIR continuation fallback"),
       ADD_STAT(dvrPredicateGenerationAbandons,
                statistics::units::Count::get(),
                "DVR predicate generations replaced before all lanes "
@@ -2199,6 +2208,13 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
         if (unstable_input)
             ++cpuStats.dvrReplayUnstableInputs;
     }
+    if (replay->count > 1) {
+        replay->continuation =
+            std::make_shared<DVRVectorInstructionRegister>();
+        replay->continuation->initializeSourceContinuation(
+            replay->uops, replay->count, lanes, replay->initialRegs);
+        ++cpuStats.dvrVIRContinuationContexts;
+    }
 
     // Source stride prefetches are useful even when the committed slice did
     // not contain a replayable load uop.  Keep the helper alive for source
@@ -2449,6 +2465,13 @@ CPU::launchDVRNestedPrefetches(
     cpuStats.dvrNestedFlattenedLanes += flattened;
     if (variable_lanes)
         ++cpuStats.dvrNestedVariableLaneBatches;
+    if (replay->count > 1) {
+        replay->continuation =
+            std::make_shared<DVRVectorInstructionRegister>();
+        replay->continuation->initializeSourceContinuation(
+            replay->uops, replay->count, flattened, replay->initialRegs);
+        ++cpuStats.dvrVIRContinuationContexts;
+    }
     startDVRHelper(dvrNestedContext.triggerPC, replay->count,
                    flattened, dvrNestedContext.recorder.resourceCounts());
     unsigned flat_lane = 0;
@@ -2471,7 +2494,7 @@ CPU::launchDVRNestedPrefetches(
         prefetch.masks = masks;
         prefetch.patterns = patterns;
         prefetch.replay = replay;
-        prefetch.lane = lane - 1;
+        prefetch.lane = flat_lane;
         dvrPrefetchQueue.push_back(prefetch);
         ++cpuStats.dvrPrefetchesGenerated;
         ++cpuStats.dvrNestedHelpersGenerated;
@@ -2700,10 +2723,19 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
             state->replay->triggerDestination <
                 DVRLoopBoundDetector::MaxArchitecturalIntRegs) {
             DVRVectorInstructionRegister response_vir;
-            const auto response = response_vir.executeFromSource(
-                state->replay->uops, state->replay->count,
-                state->replay->triggerDestination, value,
-                dvrHelperMaxUops, state->replay->initialRegs);
+            if (state->replay->continuation)
+                ++cpuStats.dvrVIRContinuationResumes;
+            else
+                ++cpuStats.dvrVIRContinuationFallbacks;
+            const auto response = state->replay->continuation ?
+                state->replay->continuation->resumeSourceLane(
+                    state->replay->uops, state->replay->count,
+                    state->lane, state->replay->triggerDestination, value,
+                    dvrHelperMaxUops) :
+                response_vir.executeFromSource(
+                    state->replay->uops, state->replay->count,
+                    state->replay->triggerDestination, value,
+                    dvrHelperMaxUops, state->replay->initialRegs);
             ++cpuStats.dvrVIRSourceValueExecutions;
             cpuStats.dvrVIRSourceValueBranches += response.divergentBranches;
             cpuStats.dvrVIRSourceValueExternalLanes +=

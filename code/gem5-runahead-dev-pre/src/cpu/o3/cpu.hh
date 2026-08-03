@@ -748,6 +748,9 @@ class CPU : public BaseCPU
         statistics::Scalar dvrVIRSourceValueExternalLanes;
         statistics::Scalar dvrVIRSourceValueSemanticFailures;
         statistics::Scalar dvrVIRSourceValueTerminations;
+        statistics::Scalar dvrVIRContinuationContexts;
+        statistics::Scalar dvrVIRContinuationResumes;
+        statistics::Scalar dvrVIRContinuationFallbacks;
         statistics::Scalar dvrPredicateGenerationAbandons;
         statistics::Scalar dvrHelperTimeouts;
         statistics::Scalar dvrReconvergenceStackOverflows;
@@ -809,6 +812,7 @@ class CPU : public BaseCPU
         std::array<DVRInstructionRecorder::Uop,
                    DVRInstructionRecorder::MaxUops> uops = {};
         DVRLoopBoundDetector::RegisterSnapshot initialRegs = {};
+        std::shared_ptr<DVRVectorInstructionRegister> continuation;
         bool valid = false;
     };
 

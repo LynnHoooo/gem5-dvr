@@ -280,6 +280,14 @@ class DVRVectorInstructionRegister
     std::array<std::array<RegVal, 128>,
                DVRVectorRenameTable::NumArchitecturalRegs> vectorRegs = {};
     std::array<Addr, 128> lanePC = {};
+    std::array<bool, 128> laneActive = {};
+    std::array<std::array<bool, DVRInstructionRecorder::MaxUops>, 128>
+        lanePendingReconvergence = {};
+    std::array<uint8_t, 128> laneStackDepth = {};
+    std::array<std::array<ReconvergenceEntry, ReconvergenceEntries>, 128>
+        laneStack = {};
+    unsigned continuationLanes = 0;
+    bool continuationInitialized = false;
     unsigned stackDepth = 0;
     uint16_t issuedChunks = 0;
     uint16_t executedChunks = 0;
@@ -329,6 +337,18 @@ class DVRVectorInstructionRegister
                              unsigned size, int source_destination,
                              RegVal source_value, unsigned max_helper_uops,
                              const std::array<RegVal, 32> &initial_regs);
+    /** Initialize a persistent context for all source-response lanes. */
+    void initializeSourceContinuation(
+        const std::array<DVRInstructionRecorder::Uop,
+                         DVRInstructionRecorder::MaxUops> &source,
+        unsigned size, unsigned lanes,
+        const std::array<RegVal, 32> &initial_regs);
+    /** Resume one lane in the persistent source-response context. */
+    Result resumeSourceLane(
+        const std::array<DVRInstructionRecorder::Uop,
+                         DVRInstructionRecorder::MaxUops> &source,
+        unsigned size, unsigned lane, int source_destination,
+        RegVal source_value, unsigned max_helper_uops);
     void reset();
     const std::array<uint64_t, 2> &mask() const { return activeMask; }
     RegVal laneValue(unsigned reg, unsigned lane) const;
