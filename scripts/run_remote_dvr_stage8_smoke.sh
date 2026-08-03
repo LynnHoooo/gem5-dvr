@@ -41,11 +41,15 @@ test -n "$replay_supported" && test "$replay_supported" -gt 0
 test -n "$replay_attempts" && test "$replay_attempts" -gt 0
 test -n "$replay_targets" && test "$replay_targets" -gt 0
 test -n "$replay_fallbacks" && test "$replay_fallbacks" -ge 0
-test "$replay_targets" -eq "$replay_attempts"
+# Some captured paths intentionally use the affine fallback when the native
+# evaluator rejects an unsupported semantic.  Account for both outcomes.
+test $((replay_targets + replay_fallbacks)) -eq "$replay_attempts"
 test $((replay_targets + replay_fallbacks)) -eq "$source_completed"
-test -n "$issued_bytes" && test "$issued_bytes" -eq $((total_issued * 8))
-test -n "$completed_bytes" &&
-    test "$completed_bytes" -eq $((total_completed * 8))
+# Load-width-aware replay may issue byte/half/word/double requests.  Validate
+# the timing lifecycle with exact issued/completed bytes rather than assuming
+# every helper packet is an eight-byte source load.
+test -n "$issued_bytes" && test "$issued_bytes" -gt 0
+test -n "$completed_bytes" && test "$completed_bytes" -eq "$issued_bytes"
 
 printf 'DVR_STAGE8_SMOKE_PASSED relations=%s generated=%s issued=%s completed=%s replay_supported=%s replay_attempts=%s replay_targets=%s replay_fallbacks=%s issued_bytes=%s completed_bytes=%s\n' \
     "$relations" "$generated" "$issued" "$completed" \
