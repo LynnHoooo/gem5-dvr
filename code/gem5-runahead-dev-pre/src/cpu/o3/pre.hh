@@ -299,12 +299,23 @@ class DVRVectorInstructionRegister
 class DVRLoopBoundDetector
 {
   private:
+    enum class Comparison : uint8_t
+    {
+        Unknown,
+        Equal,
+        NotEqual,
+        SignedLess,
+        SignedGreaterEqual,
+        UnsignedLess,
+        UnsignedGreaterEqual
+    };
     Addr triggerPC = 0;
     Addr finalLoadPC = 0;
     Addr loopBranchPC = 0;
     Addr loopTargetPC = 0;
     int boundSource0 = -1;
     int boundSource1 = -1;
+    Comparison comparison = Comparison::Unknown;
     bool seenBranch = false;
 
   public:
@@ -339,6 +350,10 @@ class DVRLoopBoundDetector
     Addr targetPC() const { return loopTargetPC; }
     int8_t boundSource0Reg() const { return boundSource0; }
     int8_t boundSource1Reg() const { return boundSource1; }
+    uint8_t comparisonKind() const
+    {
+        return static_cast<uint8_t>(comparison);
+    }
     int source0() const { return boundSource0; }
     int source1() const { return boundSource1; }
 };

@@ -191,7 +191,7 @@ discovery complete
 | O3 dispatch 接入 | `src/cpu/o3/iew.cc`；`src/cpu/o3/cpu.cc` | `IEW::dispatchInsts()` → `CPU::observeDVRDispatch()` | Stage 1、3、4 |
 | Discovery | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `arm()`、`observeDispatch()`、`observeCommit()`；`CPU::instDone()` | Stage 3 |
 | VTT / FLR | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `DVRVectorTaintTracker::observe()`、`classify()`；dispatch 侧 taint/dependent 记录 | Stage 4 |
-| Loop-Bound Detector | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `begin()`、`updateFinalLoad()`、`observe()`、`infer()` | Stage 5、6 |
+| Loop-Bound Detector | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `begin()`、`updateFinalLoad()`、`observe()`、`infer()`；RV64 branch compare decode 与 signed bound arithmetic | Stage 5、6 |
 | Instruction Recorder | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `DVRInstructionRecorder::begin()`、`record()`；`instDone()` 保存 committed slice | Stage 8、10 |
 | VRAT / VIR | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `DVRVectorRenameTable::build()`；`DVRVectorInstructionRegister::execute()` | Stage 10 |
 | Source prefetch | `src/cpu/o3/cpu.cc` | `launchDVRStridePrefetches()`、`serviceDVRPrefetchQueue()` | Stage 7 |

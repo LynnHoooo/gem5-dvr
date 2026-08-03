@@ -1003,6 +1003,33 @@ DVRLoopBoundDetector::observe(const DynInstPtr &inst)
     if (!seenBranch && encloses_chain) {
         loopBranchPC = pc;
         loopTargetPC = target;
+        uint64_t encoded = 0;
+        if (inst->staticInst->asBytes(&encoded, sizeof(encoded)) >= 4 &&
+            (encoded & 0x7f) == 0x63) {
+            switch ((encoded >> 12) & 0x7) {
+              case 0:
+                comparison = Comparison::Equal;
+                break;
+              case 1:
+                comparison = Comparison::NotEqual;
+                break;
+              case 4:
+                comparison = Comparison::SignedLess;
+                break;
+              case 5:
+                comparison = Comparison::SignedGreaterEqual;
+                break;
+              case 6:
+                comparison = Comparison::UnsignedLess;
+                break;
+              case 7:
+                comparison = Comparison::UnsignedGreaterEqual;
+                break;
+              default:
+                comparison = Comparison::Unknown;
+                break;
+            }
+        }
         for (int idx = 0; idx < inst->numSrcRegs(); ++idx) {
             const RegId &src = inst->srcRegIdx(idx);
             if (src.classValue() != IntRegClass)
@@ -1059,11 +1086,24 @@ DVRLoopBoundDetector::infer(const RegisterSnapshot &start,
 
     uint64_t distance = 0;
     uint64_t step = 0;
-    if (increment > 0 && current < bound) {
-        distance = bound - current;
+    const bool signed_compare =
+        comparison == Comparison::SignedLess ||
+        comparison == Comparison::SignedGreaterEqual;
+    const int64_t signed_bound = static_cast<int64_t>(bound);
+    const int64_t signed_current = static_cast<int64_t>(current);
+    const bool below_bound = signed_compare ?
+        signed_current < signed_bound : current < bound;
+    const bool above_bound = signed_compare ?
+        signed_current > signed_bound : current > bound;
+    if (increment > 0 && below_bound) {
+        distance = signed_compare ?
+            static_cast<uint64_t>(signed_bound - signed_current) :
+            bound - current;
         step = increment;
-    } else if (increment < 0 && current > bound) {
-        distance = current - bound;
+    } else if (increment < 0 && above_bound) {
+        distance = signed_compare ?
+            static_cast<uint64_t>(signed_current - signed_bound) :
+            current - bound;
         step = uint64_t(-(increment + 1)) + 1;
     } else {
         return inference;
@@ -1087,6 +1127,7 @@ DVRLoopBoundDetector::reset()
     loopTargetPC = 0;
     boundSource0 = -1;
     boundSource1 = -1;
+    comparison = Comparison::Unknown;
     seenBranch = false;
 }
 
