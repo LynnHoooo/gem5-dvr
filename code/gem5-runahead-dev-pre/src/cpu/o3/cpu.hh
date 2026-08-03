@@ -747,6 +747,7 @@ class CPU : public BaseCPU
         statistics::Scalar dvrHelperTimeouts;
         statistics::Scalar dvrReconvergenceStackOverflows;
         statistics::Scalar dvrHelpersSuppressed;
+        statistics::Scalar dvrControlFallbackSourceLaunches;
         statistics::Scalar dvrPredicateSelections;
         statistics::Scalar dvrDistinctPredicatePaths;
         statistics::Scalar dvrPredicateMisses;

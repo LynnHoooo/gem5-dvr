@@ -1,6 +1,6 @@
 # gem5 RISC-V DVR 复现代码导览
 
-> 更新时间：2026-07-30
+> 更新时间：2026-08-03
 >
 > 项目定位：这是一个 **RISC-V ISA-adapted DVR（Decoupled Vector
 > Runahead）机制原型**。它复现论文的核心思想并把 x86/AVX-512 后端映射为
@@ -199,6 +199,7 @@ discovery complete
 | Predicate / reconvergence | `src/cpu/o3/dvr_predicate.hh/.cc`；`cpu.cc` | `DVRLanePredicateTracker`；`retireDVRPredicateLane()` | Stage 11、12 |
 | Lane-PC unsupported path audit | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `executeLanePC()`；`unsupportedControlFlow`；`dvrVIRUnsupportedControlFlow` | Stage 11 |
 | Lane termination classes | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | normal completion、branch early-exit、external target、unsupported semantic counters | Stage 11 |
+| VIR-only control fallback | `src/cpu/o3/cpu.cc`；`cpu.hh` | `CPU::instDone()` 在 VIR 仅因控制流/语义不支持而拒绝时保留 source helper；timeout、stack overflow、recorder overflow 仍禁止启动 | Stage 7、11 |
 | Nested / Multiple | `src/cpu/o3/dvr_nested.hh/.cc`；`cpu.cc` | `DVRNestedController`、`DVRNestedDiscoveryMode`；`completeDVRNestedContext()`、`launchDVRNestedPrefetches()` | Stage 13、14 |
 | Quality metrics | `src/cpu/o3/dvr_quality.hh/.cc`；cache/LSQ 接线处 | `DVRQualityTracker::issued()`、`completed()`、`demandLookup()`、`cacheFill()` | Stage 12、15 |
 | Cache / LSQ timing | `src/cpu/o3/lsq_unit.cc`；`src/cpu/o3/lsq.cc`；`cpu.cc` | load address observation、helper packet response、prefetch queue service | Stage 7、8、9 |
@@ -239,12 +240,12 @@ NDM 和 helper 前端的专项统计也可由以下入口检查：
 | 8 | 真实逐 lane dependent replay | 需单独复核 | 代码已有 dispatch sequence tracking、地址有效性保护和 replay 统计；不要用 Stage 7 结果替代 Stage 8 证据 |
 | 9 | Baseline vs DVR | 当前树通过 | demand L1D miss 降低 11.56% |
 | 10 | 8-uop recorder/VRAT/VIR | 当前树通过 | 2396 programs，95470 VIR executions；真实 replay 守恒断言通过 |
-| 11 | actual-value predicate/reconvergence/timeout | 当前树通过（控制流分类） | 真实快照下 divergent=0，正常/外部 lane termination 计数有效；source-return-driven divergence 仍待接入 |
+| 11 | actual-value predicate/reconvergence/timeout | 通过（控制流分类） | `divergent=2`、`reconvergences=2`、`dependent=256`；source-return-driven lane register 回填仍待接入 |
 | 12 | predicate/quality 独立严格 smoke | 当前树通过 | actual-value mask 与质量计数器 `-Werror` smoke |
 | 14 | NDM 控制与 timeout | 通过 | dispatch Discovery、IR/ILR/LCR、至少两个 outer invocation、timeout/fallback |
 | 15 | helper 前端与资源竞争 | 通过 | fetch/decode/issue、主线程优先资源统计 |
 | 16 | NDM IR/ILR/LCR 与 outer invocation gate | 通过 | branch inversion、两个 outer invocation 后 Vectorizing、timeout fallback |
-| 17 | L1D workload 级 quality 事件 | 通过 | demand=294915，DVR issued=9910，timely=1266，coverage=0.008353，timeliness=0.549957 |
+| 17 | L1D workload 级 quality 事件 | 通过 | demand=294915，issued=9910，completed=8354，fills=1462，timely=1266，late=1036，coverage=0.008353，timeliness=0.549957 |
 
 Stage 9 的当前稳定结果：
 
@@ -303,16 +304,20 @@ accuracy、coverage、timeliness 和 pollution 需要 L1 tag lookup/fill/victim
 
 1. 将已验证的逐 lane evaluator 扩展到更多 RV64/RVC 整数、比较、load-value 和地址生成 opcode；
    仿射逻辑仅保留为 unsupported 链的显式 fallback。
-2. 将已验证的实际 value-predicate 路径选择进一步扩展到任意 branch opcode，
+2. 将 source response 的真实 load value 回填到对应 VIR lane 的私有寄存器，
+   然后重新推进该 lane 的 branch/dependent-load 路径。当前返回值已经进入
+   `retireDVRPredicateLane()` 和 `replayDVRSource()`，但 VIR 的首次执行发生在
+   source response 之前，因此还不能声称已完成论文级 source-return-driven SIMT。
+3. 将已验证的实际 value-predicate 路径选择进一步扩展到任意 branch opcode，
    并让 VIR 使用独立 lane PC 执行 branch target/fall-through，而不仅是
    recorder 内的有限路径。
-3. 将当前已加入 fetch/decode/issue 状态的 helper 继续扩展为执行端口级资源
+4. 将当前已加入 fetch/decode/issue 状态的 helper 继续扩展为执行端口级资源
    竞争模型。
-4. 将已接通的严格质量 tracker 扩展到更多 workload，并统一论文的 accuracy、
+5. 将已接通的严格质量 tracker 扩展到更多 workload，并统一论文的 accuracy、
    coverage、timeliness 和 pollution 报告口径。
-5. 缩小版 GAP workload。
-6. Baseline、PRE、Offload/Discovery、Nested DVR 消融。
-7. 最终实验报告；Stage 7 source-only、Stage 14 NDM control 和 Stage 15
+6. 缩小版 GAP workload。
+7. Baseline、PRE、Offload/Discovery、Nested DVR 消融。
+8. 最终实验报告；Stage 7 source-only、Stage 14 NDM control 和 Stage 15
    helper resource smoke 已通过，Stage 8 dependent replay 和
    后续 workload 级结果仍需按当前二进制重新归档。
 

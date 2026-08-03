@@ -643,6 +643,9 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "DVR helpers terminated by an eight-entry stack overflow"),
       ADD_STAT(dvrHelpersSuppressed, statistics::units::Count::get(),
                "DVR helper launches suppressed by invalid or terminated VIR"),
+      ADD_STAT(dvrControlFallbackSourceLaunches,
+               statistics::units::Count::get(),
+               "Source helpers launched after VIR-only control-flow rejection"),
       ADD_STAT(dvrPredicateSelections, statistics::units::Count::get(),
                "Dependent paths selected by learned value predicates"),
       ADD_STAT(dvrDistinctPredicatePaths, statistics::units::Count::get(),
@@ -1906,6 +1909,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                     ++cpuStats.dvrRecorderOverflows;
                     helper_allowed = false;
                 }
+                bool vir_control_fallback = false;
                 if (helper_allowed) {
                     ++cpuStats.dvrVectorProgramsBuilt;
                     cpuStats.dvrVRATAllocations +=
@@ -1934,17 +1938,25 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                     if (vir_result.unsupportedControlFlow) {
                         ++cpuStats.dvrVIRUnsupportedControlFlow;
                         helper_allowed = false;
+                        vir_control_fallback = true;
                     }
                     if (vir_result.timedOut) {
                         ++cpuStats.dvrHelperTimeouts;
                         helper_allowed = false;
+                        vir_control_fallback = false;
                     }
                     if (vir_result.stackOverflow) {
                         ++cpuStats.dvrReconvergenceStackOverflows;
                         helper_allowed = false;
+                        vir_control_fallback = false;
                     }
                 }
-                if (helper_allowed && inst->effAddrValid()) {
+                const bool launch_source_fallback =
+                    vir_control_fallback && !dvrInstructionRecorder.overflow();
+                if ((helper_allowed || launch_source_fallback) &&
+                    inst->effAddrValid()) {
+                    if (launch_source_fallback)
+                        ++cpuStats.dvrControlFallbackSourceLaunches;
                     launchDVRStridePrefetches(
                         tid, inst->effAddr, result.triggerPC,
                         result.stride, inference.lanes, finish_regs);
