@@ -117,9 +117,9 @@ class DVRNestedController
 /**
  * 论文 Nested Discovery Mode 的控制状态。
  *
- * 第一阶段只负责低 lane 数触发、IR/ILR 状态、已提交 outer stride 候选和
- * timeout/fallback。它不生成 helper，也不假装已经完成 branch inversion 或
- * inner-lane flatten。
+ * NDM uses the committed stream as a non-architectural control-flow shadow:
+ * it inverts the first inner backedge, scans the fall-through path for an
+ * outer stride, and records independently bounded inner invocations.
  */
 class DVRNestedDiscoveryMode
 {
@@ -151,6 +151,20 @@ class DVRNestedDiscoveryMode
         bool branchTaken = false;
         bool branchInverted = false;
         bool valid = false;
+        std::array<uint64_t, 2> takenMask = {};
+        std::array<uint64_t, 2> fallthroughMask = {};
+    };
+
+    struct OuterInvocation
+    {
+        Addr outerBase = 0;
+        Addr innerStart = 0;
+        unsigned innerLanes = 0;
+        Addr innerTriggerPC = 0;
+        Addr innerFLRPC = 0;
+        int64_t innerStride = 0;
+        std::array<uint64_t, 2> predicate = {};
+        Addr reconvergencePC = 0;
     };
 
     struct Result
@@ -192,9 +206,20 @@ class DVRNestedDiscoveryMode
     Addr outerAddress = 0;
     int64_t outerStride = 0;
     static constexpr unsigned MaxOuterInvocations = 8;
-    std::array<Addr, MaxOuterInvocations> invocationBases = {};
-    std::array<unsigned, MaxOuterInvocations> invocationLanes = {};
+    std::array<OuterInvocation, MaxOuterInvocations> invocations = {};
     unsigned invocationCount = 0;
+    struct OuterProbe
+    {
+        Addr pc = 0;
+        Addr address = 0;
+        int64_t stride = 0;
+        unsigned samples = 0;
+        std::array<Addr, 3> recentAddresses = {};
+    };
+    std::array<OuterProbe, 8> outerProbes = {};
+    std::array<Addr, MaxOuterInvocations> pendingOuterBases = {};
+    unsigned pendingOuterCount = 0;
+    unsigned pendingOuterConsumed = 0;
     ControlState control = {};
     Statistics counters = {};
 
@@ -218,8 +243,13 @@ class DVRNestedDiscoveryMode
     bool observeInnerBranch(Addr branch_pc, Addr branch_target,
                             Addr fallthrough_pc, bool taken);
 
+    /** Observe real committed addresses; three samples confirm the stride. */
+    Result observeOuterLoad(Addr pc, Addr address);
+
     /** Record one independently bounded outer invocation. */
-    bool recordOuterInvocation(Addr base, unsigned lanes);
+    bool recordOuterInvocation(Addr inner_start, unsigned lanes,
+                               Addr inner_trigger_pc, Addr inner_flr_pc,
+                               int64_t inner_stride);
 
     /** True after enough independent outer invocations are available. */
     bool readyToVectorize() const
@@ -227,13 +257,10 @@ class DVRNestedDiscoveryMode
         return currentState == State::Vectorizing;
     }
     unsigned outerInvocationCount() const { return invocationCount; }
-    const std::array<Addr, MaxOuterInvocations> &outerBases() const
+    const std::array<OuterInvocation, MaxOuterInvocations> &outerInvocations()
+        const
     {
-        return invocationBases;
-    }
-    const std::array<unsigned, MaxOuterInvocations> &outerLanes() const
-    {
-        return invocationLanes;
+        return invocations;
     }
 
     /** Consume the current NDM plan after the nested vector is launched. */

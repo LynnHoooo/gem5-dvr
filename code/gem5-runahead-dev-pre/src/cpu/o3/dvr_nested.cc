@@ -1,5 +1,6 @@
 #include "cpu/o3/dvr_nested.hh"
 
+#include <algorithm>
 #include <cassert>
 
 namespace gem5
@@ -200,7 +201,8 @@ bool
 DVRNestedDiscoveryMode::observeInnerBranch(
     Addr branch_pc, Addr branch_target, Addr fallthrough_pc, bool taken)
 {
-    if (!active() || branch_pc == 0 || branch_target >= branch_pc)
+    if (!active() || branch_pc <= innerLoadPC ||
+        branch_target > innerLoadPC || branch_target >= branch_pc)
         return false;
     if (control.valid)
         return false;
@@ -215,6 +217,15 @@ DVRNestedDiscoveryMode::observeInnerBranch(
     control.branchTaken = taken;
     control.branchInverted = true;
     control.reconvergencePC = fallthrough_pc;
+    const unsigned active_lanes = std::min(innerLanes, 128U);
+    for (unsigned lane = 0; lane < active_lanes; ++lane) {
+        const unsigned word = lane / 64;
+        const uint64_t bit = uint64_t(1) << (lane % 64);
+        // The original taken path is parked on the reconvergence stack.  The
+        // NDM shadow executes the inverted, fall-through path immediately.
+        control.takenMask[word] |= bit;
+        control.fallthroughMask[word] |= bit;
+    }
     control.valid = true;
     ++counters.irCaptures;
     ++counters.branchInversions;
@@ -222,14 +233,26 @@ DVRNestedDiscoveryMode::observeInnerBranch(
 }
 
 bool
-DVRNestedDiscoveryMode::recordOuterInvocation(Addr base, unsigned lanes)
+DVRNestedDiscoveryMode::recordOuterInvocation(
+    Addr inner_start, unsigned lanes, Addr inner_trigger_pc,
+    Addr inner_flr_pc, int64_t inner_stride)
 {
-    if (currentState != State::OuterFound || base == 0 || lanes == 0)
+    if ((currentState != State::OuterFound &&
+         currentState != State::Vectorizing) ||
+        pendingOuterConsumed >= pendingOuterCount || inner_start == 0 || lanes == 0 ||
+        inner_trigger_pc == 0 || inner_flr_pc == 0 || !control.valid)
         return false;
     ++counters.outerInvocations;
     if (invocationCount < MaxOuterInvocations) {
-        invocationBases[invocationCount] = base;
-        invocationLanes[invocationCount] = lanes;
+        auto &invocation = invocations[invocationCount];
+        invocation.outerBase = pendingOuterBases[pendingOuterConsumed++];
+        invocation.innerStart = inner_start;
+        invocation.innerLanes = std::min(lanes, 128U);
+        invocation.innerTriggerPC = inner_trigger_pc;
+        invocation.innerFLRPC = inner_flr_pc;
+        invocation.innerStride = inner_stride;
+        invocation.predicate = control.fallthroughMask;
+        invocation.reconvergencePC = control.reconvergencePC;
         ++invocationCount;
     }
     // NDM needs at least two distinct outer invocations before flattening;
@@ -238,6 +261,80 @@ DVRNestedDiscoveryMode::recordOuterInvocation(Addr base, unsigned lanes)
     if (invocationCount >= 2)
         currentState = State::Vectorizing;
     return true;
+}
+
+DVRNestedDiscoveryMode::Result
+DVRNestedDiscoveryMode::observeOuterLoad(Addr pc, Addr address)
+{
+    if (!control.valid || pc == 0 || pc == innerLoadPC || address == 0) {
+        return snapshot(Event::None);
+    }
+    if (currentState == State::OuterFound) {
+        if (pc == outerLoadPC &&
+            static_cast<int64_t>(address) -
+                static_cast<int64_t>(outerAddress) == outerStride) {
+            outerAddress = address;
+            if (pendingOuterCount < pendingOuterBases.size())
+                pendingOuterBases[pendingOuterCount++] = address;
+        }
+        return snapshot(Event::None);
+    }
+    if (currentState != State::SeekingOuter)
+        return snapshot(Event::None);
+
+    OuterProbe *probe = nullptr;
+    for (auto &candidate : outerProbes) {
+        if (candidate.pc == pc) {
+            probe = &candidate;
+            break;
+        }
+        if (candidate.pc == 0 && probe == nullptr)
+            probe = &candidate;
+    }
+    if (probe == nullptr)
+        return snapshot(Event::None);
+    if (probe->pc == 0) {
+        probe->pc = pc;
+        probe->address = address;
+        probe->samples = 1;
+        probe->recentAddresses[0] = address;
+        return snapshot(Event::None);
+    }
+
+    const int64_t delta = static_cast<int64_t>(address) -
+        static_cast<int64_t>(probe->address);
+    probe->address = address;
+    probe->recentAddresses[2] = probe->recentAddresses[1];
+    probe->recentAddresses[1] = probe->recentAddresses[0];
+    probe->recentAddresses[0] = address;
+    if (delta == 0) {
+        probe->samples = 1;
+        probe->stride = 0;
+        return snapshot(Event::None);
+    }
+    if (probe->samples == 1) {
+        probe->stride = delta;
+        probe->samples = 2;
+        return snapshot(Event::None);
+    }
+    if (delta != probe->stride) {
+        probe->stride = delta;
+        probe->samples = 2;
+        return snapshot(Event::None);
+    }
+
+    ++probe->samples;
+    const Result result = acceptOuter(pc, address, probe->stride);
+    // Preserve the exact three committed addresses that established the
+    // stride.  Each independently bounded child consumes one FIFO entry.
+    for (int index = 2; index >= 0; --index) {
+        if (probe->recentAddresses[index] != 0 &&
+            pendingOuterCount < pendingOuterBases.size()) {
+            pendingOuterBases[pendingOuterCount++] =
+                probe->recentAddresses[index];
+        }
+    }
+    return result;
 }
 
 void
@@ -268,8 +365,9 @@ DVRNestedDiscoveryMode::Result
 DVRNestedDiscoveryMode::acceptOuter(
     Addr outer_load_pc, Addr outer_address, int64_t outer_stride)
 {
-    if (currentState != State::SeekingOuter || outer_load_pc == 0 ||
-        outer_load_pc == innerLoadPC || outer_stride == 0) {
+    if (currentState != State::SeekingOuter || !control.valid ||
+        outer_load_pc == 0 || outer_load_pc == innerLoadPC ||
+        outer_stride == 0) {
         return snapshot(Event::None);
     }
 
@@ -277,6 +375,10 @@ DVRNestedDiscoveryMode::acceptOuter(
     outerLoadPC = outer_load_pc;
     outerAddress = outer_address;
     outerStride = outer_stride;
+    // Searching and invocation collection are distinct NDM phases.  Give the
+    // latter its own bounded window; otherwise a stride confirmed near the
+    // search deadline can never collect even one independently closed child.
+    committedInstructions = 0;
     ++counters.outerFound;
     return snapshot(Event::OuterAccepted);
 }
@@ -304,9 +406,12 @@ DVRNestedDiscoveryMode::reset()
     outerLoadPC = 0;
     outerAddress = 0;
     outerStride = 0;
-    invocationBases = {};
-    invocationLanes = {};
+    invocations = {};
     invocationCount = 0;
+    outerProbes = {};
+    pendingOuterBases = {};
+    pendingOuterCount = 0;
+    pendingOuterConsumed = 0;
     control = {};
 }
 

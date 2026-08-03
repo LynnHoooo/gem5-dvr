@@ -21,14 +21,28 @@ main()
     assert(ndm.controlState().branchInverted);
     assert(ndm.controlState().innerBranchTarget == 0x100);
     assert(ndm.controlState().innerFallthrough == 0x144);
+    assert(ndm.controlState().takenMask[0] == 0xffff);
+    assert(ndm.controlState().fallthroughMask[0] == 0xffff);
 
-    auto outer = ndm.acceptOuter(0x200, 0x8000, 64);
+    assert(ndm.observeOuterLoad(0x200, 0x8000).event ==
+           DVRNestedDiscoveryMode::Event::None);
+    // Interleaved loads must not destroy the per-PC outer stride history.
+    assert(ndm.observeOuterLoad(0x220, 0x9000).event ==
+           DVRNestedDiscoveryMode::Event::None);
+    assert(ndm.observeOuterLoad(0x200, 0x8040).event ==
+           DVRNestedDiscoveryMode::Event::None);
+    auto outer = ndm.observeOuterLoad(0x200, 0x8080);
     assert(outer.event == DVRNestedDiscoveryMode::Event::OuterAccepted);
-    assert(ndm.recordOuterInvocation(0x8000, 16));
+    assert(ndm.recordOuterInvocation(0xa000, 16, 0x100, 0x130, 8));
     assert(!ndm.readyToVectorize());
-    assert(ndm.recordOuterInvocation(0x8040, 12));
+    assert(ndm.recordOuterInvocation(0xb000, 12, 0x100, 0x130, 8));
     assert(ndm.readyToVectorize());
     assert(ndm.outerInvocationCount() == 2);
+    assert(ndm.outerInvocations()[0].outerBase == 0x8000);
+    assert(ndm.outerInvocations()[1].outerBase == 0x8040);
+    assert(ndm.outerInvocations()[0].innerStart == 0xa000);
+    assert(ndm.outerInvocations()[0].innerLanes == 16);
+    assert(ndm.outerInvocations()[1].innerLanes == 12);
     ndm.finishVectorization();
     assert(!ndm.active());
 

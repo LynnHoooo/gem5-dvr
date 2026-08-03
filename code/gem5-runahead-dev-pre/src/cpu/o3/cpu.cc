@@ -1678,6 +1678,18 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                     ++cpuStats.dvrNDMIRCaptures;
                 }
             }
+            // This is the NDM shadow's outer-path scan.  It intentionally
+            // consumes committed effective addresses, not the affine address
+            // reconstructed from a stride candidate.
+            if (dvrNestedDiscoveryMode.active() && inst->isLoad() &&
+                inst->effAddrValid()) {
+                const auto outer = dvrNestedDiscoveryMode.observeOuterLoad(
+                    inst->pcState().instAddr(), inst->effAddr);
+                if (outer.event ==
+                    DVRNestedDiscoveryMode::Event::OuterAccepted) {
+                    ++cpuStats.dvrNDMOuterFound;
+                }
+            }
             if (was_discovering &&
                 inst->seqNum == dvrDiscovery.triggerSeq()) {
                 for (int dest = 0; dest < inst->numDestRegs(); ++dest) {
@@ -1717,41 +1729,6 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 dvrPendingNestedCandidate.sequence == inst->seqNum &&
                 dvrPendingNestedCandidate.pc == inst->pcState().instAddr()) {
                 dvrCommittedNestedCandidate = dvrPendingNestedCandidate;
-                if (dvrNestedDiscoveryMode.active()) {
-                    const auto ndm_outer =
-                        dvrNestedDiscoveryMode.acceptOuter(
-                            dvrPendingNestedCandidate.pc,
-                            dvrPendingNestedCandidate.address,
-                            dvrPendingNestedCandidate.stride);
-                    if (ndm_outer.event ==
-                        DVRNestedDiscoveryMode::Event::OuterAccepted) {
-                        ++cpuStats.dvrNDMOuterFound;
-                        // The outer stride is committed before the child
-                        // context begins.  NDM can therefore place this
-                        // invocation in its outer plan immediately, using
-                        // the bound captured from the short inner loop;
-                        // helper completion is still responsible for
-                        // launching the flattened requests.
-                        if (dvrNestedDiscoveryMode.recordOuterInvocation(
-                                dvrPendingNestedCandidate.address,
-                                dvrNestedDiscoveryMode.innerLaneCount())) {
-                            ++cpuStats.dvrNDMOuterInvocations;
-                        }
-                    } else if (
-                        dvrNestedDiscoveryMode.state() ==
-                            DVRNestedDiscoveryMode::State::OuterFound &&
-                        dvrPendingNestedCandidate.pc ==
-                            dvrNestedDiscoveryMode.outerLoadPCValue() &&
-                        dvrPendingNestedCandidate.stride ==
-                            dvrNestedDiscoveryMode.outerStrideValue() &&
-                        dvrNestedDiscoveryMode.recordOuterInvocation(
-                            dvrPendingNestedCandidate.address,
-                            dvrNestedDiscoveryMode.innerLaneCount())) {
-                        // The outer stride has already been found. Each later
-                        // committed instance is another NDM invocation.
-                        ++cpuStats.dvrNDMOuterInvocations;
-                    }
-                }
                 if (dvrNestedController.depth() == 1) {
                     const auto parent = dvrNestedController.currentId();
                     if (parent) {
@@ -1913,17 +1890,6 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                         ++cpuStats.dvrNDMILRCaptures;
                     if (bound_reg >= 0)
                         ++cpuStats.dvrNDMLCRCaptures;
-                    if (dvrCommittedNestedCandidate.valid) {
-                        const auto ndm_outer =
-                            dvrNestedDiscoveryMode.acceptOuter(
-                                dvrCommittedNestedCandidate.pc,
-                                dvrCommittedNestedCandidate.address,
-                                dvrCommittedNestedCandidate.stride);
-                        if (ndm_outer.event ==
-                            DVRNestedDiscoveryMode::Event::OuterAccepted) {
-                            ++cpuStats.dvrNDMOuterFound;
-                        }
-                    }
                 }
                 ++cpuStats.dvrLaneCountSamples;
                 cpuStats.dvrTotalActiveLanes += inference.lanes;
@@ -2284,18 +2250,17 @@ CPU::completeDVRNestedContext(
 
     const auto inference = dvrNestedContext.loopBound.infer(
         dvrNestedContext.startRegs, finish_regs, dvrMaxLanes);
-    // NDM records a completed outer invocation from its independently
-    // inferred inner bound.  This control-plane event must not depend on
-    // whether the captured helper program later passes VIR/issue/resource
-    // checks; otherwise a resource miss would incorrectly erase an
-    // invocation from the paper's outer-vector construction.
-    const unsigned ndm_invocation_lanes = inference.matched ?
-        inference.lanes : dvrNestedDiscoveryMode.innerLaneCount();
+    // NDM records only a completed child with its own inferred bound.  The
+    // old prototype copied the initiating short-loop bound here, which paired
+    // one invocation's bound with another invocation's base.
+    const unsigned ndm_invocation_lanes = inference.matched ? inference.lanes : 0;
     if (dvrNestedDiscoveryMode.state() ==
             DVRNestedDiscoveryMode::State::OuterFound &&
-        ndm_invocation_lanes != 0 &&
+        ndm_invocation_lanes != 0 && dvrNestedContext.taint.flr() != 0 &&
         dvrNestedDiscoveryMode.recordOuterInvocation(
-            dvrNestedContext.triggerAddress, ndm_invocation_lanes)) {
+            dvrNestedContext.triggerAddress, ndm_invocation_lanes,
+            dvrNestedContext.triggerPC, dvrNestedContext.taint.flr(),
+            inference.increment)) {
         ++cpuStats.dvrNDMOuterInvocations;
     }
     bool helper_allowed = dvrNestedContext.recorder.size() > 1 &&
@@ -2442,27 +2407,23 @@ CPU::launchDVRNestedPrefetches(
     // stride of the outer discovery candidate.
     const bool use_ndm_plan = dvrNestedDiscoveryMode.readyToVectorize();
     const unsigned invocations = use_ndm_plan ?
-        std::min<unsigned>(dvrNestedDiscoveryMode.outerInvocationCount(),
-                           dvrNestedDiscoveryMode.outerBases().size()) :
+        std::min<unsigned>(dvrNestedDiscoveryMode.outerInvocationCount(), 8) :
         std::min<unsigned>(dvrNestedInvocationBatch.count,
                            dvrNestedInvocationBatch.bases.size());
-    const auto &plan_bases = use_ndm_plan ?
-        dvrNestedDiscoveryMode.outerBases() : dvrNestedInvocationBatch.bases;
-    const auto &plan_lanes = use_ndm_plan ?
-        dvrNestedDiscoveryMode.outerLanes() :
-        dvrNestedInvocationBatch.innerLanes;
-    const int64_t ndm_inner_stride =
-        dvrNestedDiscoveryMode.innerIncrement();
+    const auto &ndm_invocations = dvrNestedDiscoveryMode.outerInvocations();
     unsigned flattened = 0;
     unsigned total_inner_lanes = 0;
     bool variable_lanes = false;
     for (unsigned invocation = 0; invocation < invocations; ++invocation) {
-        const unsigned invocation_lanes = std::min(
-            plan_lanes[invocation],
+        const unsigned plan_lanes = use_ndm_plan ?
+            ndm_invocations[invocation].innerLanes :
+            dvrNestedInvocationBatch.innerLanes[invocation];
+        const unsigned invocation_lanes = std::min(plan_lanes,
             DVRLanePredicateTracker::MaxLanes);
         total_inner_lanes += invocation_lanes;
         if (invocation != 0 && invocation_lanes !=
-            plan_lanes[0]) {
+            (use_ndm_plan ? ndm_invocations[0].innerLanes :
+             dvrNestedInvocationBatch.innerLanes[0])) {
             variable_lanes = true;
         }
         flattened += std::min(invocation_lanes,
@@ -2485,9 +2446,13 @@ CPU::launchDVRNestedPrefetches(
                    flattened, dvrNestedContext.recorder.resourceCounts());
     unsigned flat_lane = 0;
     for (unsigned invocation = 0; invocation < invocations; ++invocation) {
-      const Addr base = plan_bases[invocation];
-      const unsigned invocation_lanes = plan_lanes[invocation];
-      const int64_t inner_stride = use_ndm_plan ? ndm_inner_stride :
+      const Addr base = use_ndm_plan ? ndm_invocations[invocation].innerStart :
+          dvrNestedInvocationBatch.bases[invocation];
+      const unsigned invocation_lanes = use_ndm_plan ?
+          ndm_invocations[invocation].innerLanes :
+          dvrNestedInvocationBatch.innerLanes[invocation];
+      const int64_t inner_stride = use_ndm_plan ?
+          ndm_invocations[invocation].innerStride :
           dvrNestedInvocationBatch.innerStrides[invocation];
       for (unsigned lane = 1; lane <= invocation_lanes && flat_lane <
                DVRLanePredicateTracker::MaxLanes; ++lane, ++flat_lane) {
