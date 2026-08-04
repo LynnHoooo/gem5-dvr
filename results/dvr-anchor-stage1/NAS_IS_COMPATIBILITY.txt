@@ -1,0 +1,13 @@
+Workload: /home/lynnhoo/buckyball/bb-tests/output/workloads/src/CTest/leap-bench/leap_nas_is_singlecore-baremetal
+Date: 2026-08-04 Asia/Shanghai
+Command:
+  code/gem5-runahead-dev-pre/build/RISCV/gem5.opt +    code/gem5-runahead-dev-pre/configs/dvr/table1_se.py +    --cmd=/home/lynnhoo/buckyball/bb-tests/output/workloads/src/CTest/leap-bench/leap_nas_is_singlecore-baremetal
+Result: not usable in the current SE/Linux configuration
+Failure:
+  panic: Illegal instruction 0x3002a073 at pc 0x80000006
+  mstatus is not accessible in 0
+Interpretation:
+  The ELF is a RISC-V bare-metal LeAP image that accesses privileged CSR state.
+  It requires the matching bare-metal/LeAP machine environment; it is not a
+  valid user-mode SE benchmark for this gem5 configuration. No NAS-IS
+  performance result is reported.
