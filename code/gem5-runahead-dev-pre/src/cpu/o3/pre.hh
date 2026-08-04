@@ -142,7 +142,12 @@ class DVRVectorTaintTracker
 class DVRInstructionRecorder
 {
   public:
-    static constexpr unsigned MaxUops = 8;
+    // The paper's eight decoded-uop front-end buffer is a refill window.  It
+    // is not the capacity of the captured trigger-to-FLR metadata.  Keep the
+    // complete template separate so a long discovery path can be replayed by
+    // refilling the front-end while VIR state remains live.
+    static constexpr unsigned FrontEndBufferUops = 8;
+    static constexpr unsigned MaxUops = 256;
 
     struct ResourceCounts
     {
@@ -289,10 +294,16 @@ class DVRVectorInstructionRegister
     std::array<bool, 128> laneReady = {};
     std::array<std::array<bool, DVRInstructionRecorder::MaxUops>, 128>
         lanePendingReconvergence = {};
+    // Each lane has its own decoded-uop window.  A divergent target can move
+    // one lane to a different window while the other lanes keep issuing.
+    std::array<unsigned, 128> laneWindowStart = {};
+    std::array<unsigned, 128> laneWindowEnd = {};
     std::array<uint8_t, 128> laneStackDepth = {};
     std::array<std::array<ReconvergenceEntry, ReconvergenceEntries>, 128>
         laneStack = {};
     unsigned continuationLanes = 0;
+    unsigned continuationStopIndex = 0;
+    bool continuationContinuePastFLR = false;
     bool continuationInitialized = false;
     unsigned stackDepth = 0;
     uint16_t issuedChunks = 0;
@@ -350,7 +361,8 @@ class DVRVectorInstructionRegister
         const std::array<DVRInstructionRecorder::Uop,
                          DVRInstructionRecorder::MaxUops> &source,
         unsigned size, unsigned lanes,
-        const std::array<RegVal, 32> &initial_regs);
+        const std::array<RegVal, 32> &initial_regs,
+        unsigned scalar_count = 0, bool continue_past_flr = false);
     /** Resume one lane in the persistent source-response context. */
     Result resumeSourceLane(
         const std::array<DVRInstructionRecorder::Uop,

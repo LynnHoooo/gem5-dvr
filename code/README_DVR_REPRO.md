@@ -149,12 +149,15 @@ induction/bound register 的 ILR/LCR、branch inversion 标志、出口/重汇�
 
 ### 3.4 Recorder、VRAT 和 VIR
 
-- `DVRInstructionRecorder`：最多保存 8 条 tainted uop template。
+- `DVRInstructionRecorder`：最多保存 256 条 replay metadata uop；8 条是论文中
+  front-end buffer 的 decoded-uop refill window，不是整个 trigger-to-FLR template
+  的容量上限。
 - `DVRVectorRenameTable`：32 个 RISC-V architectural integer registers、
   8 个 16-lane chunk、128 个逻辑 vector physical ID。
 - `DVRVectorInstructionRegister`：两个 64-bit active-mask word。
 - 按 16-lane chunk 记录 issue/execute。
-- 8-entry reconvergence stack。
+- 8-entry reconvergence stack；每个 lane 还保存独立的 front-end window、PC 和
+  continuation 状态。
 - 200-helper-uop termination budget。
 
 这里的 VRAT/VIR 已有真实状态和运行统计。VIR 的 recorder 分支现在保存实际的
@@ -200,7 +203,7 @@ discovery complete
 | Lane-PC unsupported path audit | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `executeLanePC()`；`unsupportedControlFlow`；`dvrVIRUnsupportedControlFlow` | Stage 11 |
 | Lane termination classes | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | normal completion、branch early-exit、external target、unsupported semantic counters | Stage 11 |
 | VIR-only control fallback | `src/cpu/o3/cpu.cc`；`cpu.hh` | `CPU::instDone()` 在 VIR 仅因控制流/语义不支持而拒绝时保留 source helper；timeout、stack overflow、recorder overflow 仍禁止启动 | Stage 7、11 |
-| Source-value VIR continuation | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `executeFromSource()` 在 source response 后将真实返回值写入 trigger destination，并从 source load 后的 captured uop 继续执行 | Stage 11 |
+| Source-value VIR continuation | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `initializeSourceContinuation()` 为整个 helper 保存 lane PC/register/window 状态；`resumeSourceLanes()` 按当前 PC 合并 ready lanes；scalar replay 使用独立 FLR prefix | Stage 11 |
 | Nested / Multiple | `src/cpu/o3/dvr_nested.hh/.cc`；`cpu.cc` | `DVRNestedController`、`DVRNestedDiscoveryMode`；`completeDVRNestedContext()`、`launchDVRNestedPrefetches()` | Stage 13、14 |
 | Quality metrics | `src/cpu/o3/dvr_quality.hh/.cc`；cache/LSQ 接线处 | `DVRQualityTracker::issued()`、`completed()`、`demandLookup()`、`cacheFill()` | Stage 12、15 |
 | Cache / LSQ timing | `src/cpu/o3/lsq_unit.cc`；`src/cpu/o3/lsq.cc`；`cpu.cc` | load address observation、helper packet response、prefetch queue service | Stage 7、8、9 |
@@ -280,7 +283,7 @@ Nested DVR 产生了 47,652 个 stride candidate、3,062 次 Discovery start 和
 | 7 | 128-lane cache injection | source-only 通过 | `--dvr-no-dependent-prefetch`：generated=18123，issued/completed=10666，faults=0 |
 | 8 | 真实逐 lane dependent replay | 需单独复核 | 代码已有 dispatch sequence tracking、地址有效性保护和 replay 统计；不要用 Stage 7 结果替代 Stage 8 证据 |
 | 9 | Baseline vs DVR | 当前树通过 | demand L1D miss 降低 11.56% |
-| 10 | 8-uop recorder/VRAT/VIR | 当前树通过 | 2396 programs，95470 VIR executions；真实 replay 守恒断言通过 |
+| 10 | recorder/8-uop front-end window/VRAT/VIR | 当前树通过 | recorder capacity 与 8-uop refill window 解耦；真实 replay 守恒断言通过 |
 | 11 | actual-value predicate/reconvergence/timeout | 通过（控制流分类与 source continuation） | `divergent=2`、`reconvergences=2`、`dependent=256`、`source_value_vir_executions=328`、`source_value_external_lanes=164`；仍不是完整并行 SIMT |
 | 12 | predicate/quality 独立严格 smoke | 当前树通过 | actual-value mask 与质量计数器 `-Werror` smoke |
 | 14 | NDM 控制与 timeout | 通过 | dispatch Discovery、IR/ILR/LCR、至少两个 outer invocation、timeout/fallback |
@@ -534,7 +537,8 @@ docs/06_nested_dvr_design.md
 
 - 32-entry RPT、commit-ordered Discovery、32-register VTT/FLR、loop-bound 和
   lane-count 推断均已接入主执行路径。
-- 已实现最多 128 lane、8-uop recorder、VRAT/VIR 状态和 200-uop timeout。
+- 已实现最多 128 lane、256-entry replay metadata、8-uop front-end refill window、
+  VRAT/VIR 状态和 200-uop timeout。
 - helper source/dependent 请求经过 DTLB、O3 LSQ data port、cache backpressure、
   cache hierarchy 和 response completion，不是只增加统计计数。
 - 当前微基准的 `load → C.SLLI → C.ADD → C.LD` 链已经由真实 source value
