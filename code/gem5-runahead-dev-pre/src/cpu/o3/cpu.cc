@@ -3108,6 +3108,7 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
         // template must terminate this lane.  Falling back to the older
         // affine relation here can emit an address unrelated to the current
         // dynamic chain and turns replay uncertainty into MMU faults.
+        if (dvrEnableDependentPrefetch && !matched && !state->replay) {
             if (state->replay) {
                 ++cpuStats.dvrReplayFallbacks;
                 if (state->nested)
