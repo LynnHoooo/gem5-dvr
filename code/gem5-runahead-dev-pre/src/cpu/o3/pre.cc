@@ -803,17 +803,16 @@ DVRVectorInstructionRegister::executeLanePC(
     std::array<bool, 128> lane_active = {};
     std::array<bool, DVRInstructionRecorder::MaxUops> pending_reconvergence =
         {};
-    // The paper's front-end buffer is a refill window.  VIR state (registers,
-    // lane PCs and reconvergence metadata) survives while the next window is
-    // decoded from the captured template.
-    unsigned window_start = start_index;
-    unsigned window_end = std::min(
-        start_index + DVRInstructionRecorder::FrontEndBufferUops,
-        program.size());
+    std::array<unsigned, 128> lane_window_start = {};
+    std::array<unsigned, 128> lane_window_end = {};
     const Addr entry = program[start_index].pc;
     for (unsigned lane = 0; lane < lanes; ++lane) {
         lane_active[lane] = true;
         lanePC[lane] = entry;
+        lane_window_start[lane] = start_index;
+        lane_window_end[lane] = std::min(
+            start_index + DVRInstructionRecorder::FrontEndBufferUops,
+            program.size());
         activeMask[lane / 64] |= uint64_t(1) << (lane % 64);
         for (unsigned reg = 0;
              reg < DVRVectorRenameTable::NumArchitecturalRegs; ++reg)
@@ -831,23 +830,23 @@ DVRVectorInstructionRegister::executeLanePC(
         for (unsigned lane = 0; lane < lanes; ++lane) {
             if (!lane_active[lane])
                 continue;
-            for (unsigned candidate = window_start; candidate < window_end;
-                 ++candidate) {
+            for (unsigned candidate = lane_window_start[lane];
+                 candidate < lane_window_end[lane]; ++candidate) {
                 if (program[candidate].pc == lanePC[lane]) {
                     op_index = candidate;
                     group_pc = lanePC[lane];
                     break;
                 }
             }
-            // A branch or the sequential successor may leave the current
-            // eight-uop front-end window. Refill it from the captured stream.
+            // Refill only this lane's front-end window.  VIR state (registers,
+            // lane PC, and reconvergence metadata) is deliberately retained.
             if (op_index < 0) {
                 for (unsigned candidate = 0; candidate < program.size();
                      ++candidate) {
                     if (program[candidate].pc != lanePC[lane])
                         continue;
-                    window_start = candidate;
-                    window_end = std::min(
+                    lane_window_start[lane] = candidate;
+                    lane_window_end[lane] = std::min(
                         candidate + DVRInstructionRecorder::FrontEndBufferUops,
                         program.size());
                     op_index = candidate;
@@ -1125,10 +1124,13 @@ DVRVectorInstructionRegister::initializeSourceContinuation(
     const std::array<DVRInstructionRecorder::Uop,
                      DVRInstructionRecorder::MaxUops> &source,
     unsigned size, unsigned lanes,
-    const std::array<RegVal, 32> &initial_regs)
+    const std::array<RegVal, 32> &initial_regs,
+    unsigned scalar_count, bool continue_past_flr)
 {
     reset();
     continuationLanes = std::min(lanes, 128U);
+    continuationStopIndex = scalar_count > 1 ? scalar_count - 1 : 0;
+    continuationContinuePastFLR = continue_past_flr;
     if (size <= 1 || continuationLanes == 0)
         return;
 
@@ -1138,6 +1140,9 @@ DVRVectorInstructionRegister::initializeSourceContinuation(
         laneActive[lane] = true;
         laneReady[lane] = false;
         lanePC[lane] = entry;
+        laneWindowStart[lane] = 1;
+        laneWindowEnd[lane] = std::min(
+            1 + DVRInstructionRecorder::FrontEndBufferUops, size);
         activeMask[lane / 64] |= uint64_t(1) << (lane % 64);
         for (unsigned reg = 0;
              reg < DVRVectorRenameTable::NumArchitecturalRegs; ++reg)
@@ -1165,14 +1170,34 @@ DVRVectorInstructionRegister::resumeSourceLane(
 
     for (unsigned step = 0; step < max_helper_uops; ++step) {
         int op_index = -1;
-        for (unsigned candidate = 1; candidate < size; ++candidate) {
+        for (unsigned candidate = laneWindowStart[lane];
+             candidate < laneWindowEnd[lane]; ++candidate) {
             if (source[candidate].pc == lanePC[lane]) {
+                op_index = candidate;
+                break;
+            }
+        }
+        if (op_index < 0) {
+            for (unsigned candidate = 1; candidate < size; ++candidate) {
+                if (source[candidate].pc != lanePC[lane])
+                    continue;
+                laneWindowStart[lane] = candidate;
+                laneWindowEnd[lane] = std::min(
+                    candidate + DVRInstructionRecorder::FrontEndBufferUops,
+                    size);
                 op_index = candidate;
                 break;
             }
         }
 
         if (op_index < 0) {
+            if (lanePC[lane] == source[0].pc) {
+                ++result.normalTerminatedLanes;
+                laneActive[lane] = false;
+                activeMask[lane / 64] &=
+                    ~(uint64_t(1) << (lane % 64));
+                break;
+            }
             if (lanePC[lane] != 0) {
                 result.unsupportedControlFlow = true;
                 ++result.externalPathLanes;
@@ -1215,6 +1240,13 @@ DVRVectorInstructionRegister::resumeSourceLane(
                     ~(uint64_t(1) << (lane % 64));
                 break;
             }
+            if (next == source[0].pc) {
+                ++result.normalTerminatedLanes;
+                laneActive[lane] = false;
+                activeMask[lane / 64] &=
+                    ~(uint64_t(1) << (lane % 64));
+                break;
+            }
             continue;
         }
 
@@ -1236,6 +1268,15 @@ DVRVectorInstructionRegister::resumeSourceLane(
             ++result.normalTerminatedLanes;
             laneActive[lane] = false;
             activeMask[lane / 64] &= ~(uint64_t(1) << (lane % 64));
+            break;
+        }
+        if (!continuationContinuePastFLR &&
+            op_index == continuationStopIndex) {
+            ++result.normalTerminatedLanes;
+            lanePC[lane] = 0;
+            laneActive[lane] = false;
+            activeMask[lane / 64] &=
+                ~(uint64_t(1) << (lane % 64));
             break;
         }
     }
@@ -1263,6 +1304,19 @@ DVRVectorInstructionRegister::resumeSourceLanes(
         vectorRegs[source_destination][lane] = source_value;
     laneReady[lane] = true;
 
+    // A memory response only makes a lane eligible to issue.  Do not execute
+    // the first response immediately: the next response can arrive before
+    // the next helper issue opportunity and join the same-PC group.  This is
+    // the response-side analogue of the paper's in-order VIR issue register.
+    unsigned ready_lanes = 0;
+    for (unsigned candidate_lane = 0;
+         candidate_lane < continuationLanes; ++candidate_lane) {
+        if (laneActive[candidate_lane] && laneReady[candidate_lane])
+            ++ready_lanes;
+    }
+    if (ready_lanes < 2)
+        return result;
+
     for (unsigned step = 0; step < max_helper_uops; ++step) {
         Addr group_pc = 0;
         int op_index = -1;
@@ -1271,8 +1325,21 @@ DVRVectorInstructionRegister::resumeSourceLanes(
             if (!laneActive[candidate_lane] || !laneReady[candidate_lane])
                 continue;
             group_pc = lanePC[candidate_lane];
-            for (unsigned candidate = 1; candidate < size; ++candidate) {
+            for (unsigned candidate = laneWindowStart[candidate_lane];
+                 candidate < laneWindowEnd[candidate_lane]; ++candidate) {
                 if (source[candidate].pc == group_pc) {
+                    op_index = candidate;
+                    break;
+                }
+            }
+            if (op_index < 0) {
+                for (unsigned candidate = 1; candidate < size; ++candidate) {
+                    if (source[candidate].pc != group_pc)
+                        continue;
+                    laneWindowStart[candidate_lane] = candidate;
+                    laneWindowEnd[candidate_lane] = std::min(
+                        candidate + DVRInstructionRecorder::FrontEndBufferUops,
+                        size);
                     op_index = candidate;
                     break;
                 }
@@ -1289,7 +1356,9 @@ DVRVectorInstructionRegister::resumeSourceLanes(
                 laneReady[candidate_lane] = false;
                 activeMask[candidate_lane / 64] &=
                     ~(uint64_t(1) << (candidate_lane % 64));
-                if (lanePC[candidate_lane] != 0) {
+                if (lanePC[candidate_lane] == source[0].pc) {
+                    ++result.normalTerminatedLanes;
+                } else if (lanePC[candidate_lane] != 0) {
                     result.unsupportedControlFlow = true;
                     ++result.externalPathLanes;
                 }
@@ -1333,6 +1402,12 @@ DVRVectorInstructionRegister::resumeSourceLanes(
                     laneReady[candidate_lane] = false;
                     activeMask[candidate_lane / 64] &=
                         ~(uint64_t(1) << (candidate_lane % 64));
+                } else if (next == source[0].pc) {
+                    ++result.normalTerminatedLanes;
+                    laneActive[candidate_lane] = false;
+                    laneReady[candidate_lane] = false;
+                    activeMask[candidate_lane / 64] &=
+                        ~(uint64_t(1) << (candidate_lane % 64));
                 }
                 continue;
             }
@@ -1353,6 +1428,14 @@ DVRVectorInstructionRegister::resumeSourceLanes(
                 source[op_index + 1].pc : 0;
             if (lanePC[candidate_lane] == 0) {
                 ++result.normalTerminatedLanes;
+                laneActive[candidate_lane] = false;
+                laneReady[candidate_lane] = false;
+                activeMask[candidate_lane / 64] &=
+                    ~(uint64_t(1) << (candidate_lane % 64));
+            } else if (!continuationContinuePastFLR &&
+                       op_index == continuationStopIndex) {
+                ++result.normalTerminatedLanes;
+                lanePC[candidate_lane] = 0;
                 laneActive[candidate_lane] = false;
                 laneReady[candidate_lane] = false;
                 activeMask[candidate_lane / 64] &=
@@ -1412,9 +1495,13 @@ DVRVectorInstructionRegister::reset()
     laneActive = {};
     laneReady = {};
     lanePendingReconvergence = {};
+    laneWindowStart = {};
+    laneWindowEnd = {};
     laneStackDepth = {};
     laneStack = {};
     continuationLanes = 0;
+    continuationStopIndex = 0;
+    continuationContinuePastFLR = false;
     continuationInitialized = false;
     stackDepth = 0;
     issuedChunks = 0;

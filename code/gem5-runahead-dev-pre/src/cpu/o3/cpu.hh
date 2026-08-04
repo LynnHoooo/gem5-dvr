@@ -832,8 +832,13 @@ class CPU : public BaseCPU
     struct DVRReplayTemplate
     {
         Addr triggerPC = 0;
+        // Complete captured stream consumed by the persistent VIR.  The
+        // scalar replay prefix ends at the final dependent load so post-FLR
+        // loop-control state cannot invalidate a valid address chain.
         unsigned count = 0;
+        unsigned scalarCount = 0;
         int8_t triggerDestination = -1;
+        bool continuePastFLR = false;
         std::array<DVRInstructionRecorder::Uop,
                    DVRInstructionRecorder::MaxUops> uops = {};
         DVRLoopBoundDetector::RegisterSnapshot initialRegs = {};
@@ -907,6 +912,10 @@ class CPU : public BaseCPU
     DVRLoopBoundDetector::RegisterSnapshot dvrDiscoveryStartRegs = {};
     std::set<InstSeqNum> dvrDispatchTainted;
     std::set<InstSeqNum> dvrDispatchDependentLoads;
+    // Control-flow uops are retained in the replay metadata even when their
+    // operands are not tainted, so branches between FLR and LCR are visible
+    // to the VIR path.
+    std::set<InstSeqNum> dvrDispatchRecorded;
     unsigned dvrMaxLanes;
     unsigned dvrHelperMaxUops;
     bool dvrEnableDependentPrefetch;

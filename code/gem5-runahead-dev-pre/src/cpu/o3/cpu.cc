@@ -698,9 +698,9 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                statistics::units::Count::get(),
                "DVR dependent prefetch responses completed"),
       ADD_STAT(dvrRecordedUops, statistics::units::Count::get(),
-               "Trigger-to-FLR uops retained by the DVR recorder"),
+               "Captured trigger/replay metadata uops retained by the DVR recorder"),
       ADD_STAT(dvrRecorderOverflows, statistics::units::Count::get(),
-               "Discoveries whose replay template exceeded recorder capacity"),
+               "Discoveries whose captured replay metadata exceeded the recorder capacity"),
       ADD_STAT(dvrVectorProgramsBuilt, statistics::units::Count::get(),
                "Recorded slices materialized as DVR vector programs"),
       ADD_STAT(dvrVRATAllocations, statistics::units::Count::get(),
@@ -811,9 +811,9 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                statistics::units::Count::get(),
                "Peak DVR outstanding prefetched cache lines"),
       ADD_STAT(dvrReplaySupportedUops, statistics::units::Count::get(),
-               "Supported post-trigger uops in DVR replay templates"),
+               "Supported uops in scalar trigger-to-FLR replay prefixes"),
       ADD_STAT(dvrReplayUnsupportedUops, statistics::units::Count::get(),
-               "Unsupported post-trigger uops in DVR replay templates"),
+               "Unsupported uops in scalar trigger-to-FLR replay prefixes"),
       ADD_STAT(dvrReplayUnstableInputs, statistics::units::Count::get(),
                "Replay templates rejected due to changing external inputs"),
       ADD_STAT(dvrReplayAttempts, statistics::units::Count::get(),
@@ -1768,14 +1768,18 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 inst->seqNum > dvrDiscovery.triggerSeq()) {
                 const bool dispatch_tainted =
                     dvrDispatchTainted.erase(inst->seqNum) != 0;
+                const bool dispatch_recorded =
+                    dvrDispatchRecorded.erase(inst->seqNum) != 0;
                 const bool dispatch_dependent =
                     dvrDispatchDependentLoads.erase(inst->seqNum) != 0;
-                if (dispatch_tainted) {
+                if (dispatch_recorded) {
                     dvrInstructionRecorder.record(inst);
-                    dvrTraceDependency("tainted", curTick(),
-                        dvrCurrentTriggerPC, inst->pcState().instAddr(),
-                        inst->effAddrValid() ? inst->effAddr : 0,
-                        dvrTaintTracker.bits());
+                    if (dispatch_tainted)
+                        dvrTraceDependency("tainted", curTick(),
+                            dvrCurrentTriggerPC,
+                            inst->pcState().instAddr(),
+                            inst->effAddrValid() ? inst->effAddr : 0,
+                            dvrTaintTracker.bits());
                 }
                 if (dispatch_dependent) {
                     dvrLoopBoundDetector.updateFinalLoad(
@@ -2362,15 +2366,27 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
     auto replay = std::make_shared<DVRReplayTemplate>();
     replay->triggerPC = pc;
     /*
-     * Discovery continues to the next trigger so it can learn the loop
-     * boundary, but DVR replay must stop at the FLR.  Instructions consuming
-     * the FLR value (for example a scalar reduction accumulator) belong to
-     * the main thread and are not address-generation inputs.
+     * Keep the complete captured stream in the replay template.  The FLR is
+     * still the discovery marker and the first dependent target, but a
+     * control-flow instruction after the FLR must remain visible to VIR: the
+     * paper explicitly continues divergent lanes to the next stride PC when
+     * an intervening branch separates FLR and LCR.  The eight-uop front-end
+     * window is refilled while this template remains resident.
      */
-    replay->count = 0;
-    for (unsigned index = 1; index < dvrInstructionRecorder.size(); ++index) {
+    replay->count = dvrInstructionRecorder.size();
+    replay->scalarCount = 0;
+    for (unsigned index = 1; index < replay->count; ++index) {
         if (dvrInstructionRecorder[index].load)
-            replay->count = index + 1;
+            replay->scalarCount = index + 1;
+    }
+    const Addr lcr_pc = dvrLoopBoundDetector.branchPC();
+    for (unsigned index = replay->scalarCount; index < replay->count;
+         ++index) {
+        if (dvrInstructionRecorder[index].conditional &&
+            dvrInstructionRecorder[index].pc != lcr_pc) {
+            replay->continuePastFLR = true;
+            break;
+        }
     }
     // Source lanes begin at the next committed trigger occurrence.  The
     // replay register image must come from that same occurrence, otherwise
@@ -2379,7 +2395,7 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
     replay->initialRegs = finish_regs;
     if (replay->count != 0) {
         replay->triggerDestination = dvrInstructionRecorder[0].destination;
-        replay->valid = replay->count > 1 &&
+        replay->valid = replay->scalarCount > 1 &&
             replay->triggerDestination > 0 &&
             replay->triggerDestination <
                 DVRLoopBoundDetector::MaxArchitecturalIntRegs;
@@ -2390,8 +2406,9 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
             defined_regs |= uint32_t(1) << replay->triggerDestination;
         }
         bool unstable_input = false;
-        for (unsigned index = 0; index < replay->count; ++index) {
+        for (unsigned index = 0; index < replay->count; ++index)
             replay->uops[index] = dvrInstructionRecorder[index];
+        for (unsigned index = 0; index < replay->scalarCount; ++index) {
             if (index == 0)
                 continue;
             uint32_t external_sources =
@@ -2423,7 +2440,8 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
         replay->continuation =
             std::make_shared<DVRVectorInstructionRegister>();
         replay->continuation->initializeSourceContinuation(
-            replay->uops, replay->count, lanes, replay->initialRegs);
+            replay->uops, replay->count, lanes, replay->initialRegs,
+            replay->scalarCount, replay->continuePastFLR);
         ++cpuStats.dvrVIRContinuationContexts;
     }
 
@@ -2597,17 +2615,28 @@ CPU::launchDVRNestedPrefetches(
 {
     auto replay = std::make_shared<DVRReplayTemplate>();
     replay->triggerPC = dvrNestedContext.triggerPC;
-    replay->count = 0;
-    for (unsigned index = 1;
-         index < dvrNestedContext.recorder.size(); ++index) {
+    // Keep branches after FLR in the persistent template for the same
+    // divergent-path rule used by ordinary DVR replay.
+    replay->count = dvrNestedContext.recorder.size();
+    replay->scalarCount = 0;
+    for (unsigned index = 1; index < replay->count; ++index) {
         if (dvrNestedContext.recorder[index].load)
-            replay->count = index + 1;
+            replay->scalarCount = index + 1;
+    }
+    const Addr lcr_pc = dvrNestedContext.loopBound.branchPC();
+    for (unsigned index = replay->scalarCount; index < replay->count;
+         ++index) {
+        if (dvrNestedContext.recorder[index].conditional &&
+            dvrNestedContext.recorder[index].pc != lcr_pc) {
+            replay->continuePastFLR = true;
+            break;
+        }
     }
     replay->initialRegs = finish_regs;
     if (replay->count != 0) {
         replay->triggerDestination =
             dvrNestedContext.recorder[0].destination;
-        replay->valid = replay->count > 1 &&
+        replay->valid = replay->scalarCount > 1 &&
             replay->triggerDestination > 0 &&
             replay->triggerDestination <
                 DVRLoopBoundDetector::MaxArchitecturalIntRegs;
@@ -2617,8 +2646,9 @@ CPU::launchDVRNestedPrefetches(
                 DVRLoopBoundDetector::MaxArchitecturalIntRegs) {
             defined_regs |= uint32_t(1) << replay->triggerDestination;
         }
-        for (unsigned index = 0; index < replay->count; ++index) {
+        for (unsigned index = 0; index < replay->count; ++index)
             replay->uops[index] = dvrNestedContext.recorder[index];
+        for (unsigned index = 0; index < replay->scalarCount; ++index) {
             if (index == 0)
                 continue;
             uint32_t external = replay->uops[index].intSources &
@@ -2715,7 +2745,8 @@ CPU::launchDVRNestedPrefetches(
         replay->continuation =
             std::make_shared<DVRVectorInstructionRegister>();
         replay->continuation->initializeSourceContinuation(
-            replay->uops, replay->count, flattened, replay->initialRegs);
+            replay->uops, replay->count, flattened, replay->initialRegs,
+            replay->scalarCount, replay->continuePastFLR);
         ++cpuStats.dvrVIRContinuationContexts;
     }
     startDVRHelper(dvrNestedContext.triggerPC, replay->count,
@@ -3073,8 +3104,10 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
         }
         bool matched = dvrEnableDependentPrefetch &&
                        replayDVRSource(*state, value);
-        if (dvrEnableDependentPrefetch && !matched &&
-            (!state->replay || !state->replay->valid)) {
+        // Once a recorded replay template exists, an invalid or rejected
+        // template must terminate this lane.  Falling back to the older
+        // affine relation here can emit an address unrelated to the current
+        // dynamic chain and turns replay uncertainty into MMU faults.
             if (state->replay) {
                 ++cpuStats.dvrReplayFallbacks;
                 if (state->nested)
@@ -3188,7 +3221,8 @@ bool
 CPU::replayDVRSource(const DVRPrefetchSenderState &state,
                      RegVal source_value)
 {
-    if (!state.replay || !state.replay->valid)
+    if (!state.replay || !state.replay->valid ||
+        state.replay->scalarCount <= 1)
         return false;
 
     ++cpuStats.dvrReplayAttempts;
@@ -3198,7 +3232,7 @@ CPU::replayDVRSource(const DVRPrefetchSenderState &state,
     regs[0] = 0;
     regs[state.replay->triggerDestination] = source_value;
 
-    for (unsigned index = 1; index < state.replay->count; ++index) {
+    for (unsigned index = 1; index < state.replay->scalarCount; ++index) {
         const auto &uop = state.replay->uops[index];
         if (uop.source0 < 0 ||
             uop.source0 >= DVRLoopBoundDetector::MaxArchitecturalIntRegs)
@@ -3237,15 +3271,21 @@ CPU::replayDVRSource(const DVRPrefetchSenderState &state,
         if (is_replayed_load) {
             const auto relation_it = dvrAddressRelations.find(
                 DVRRelationKey{state.replay->triggerPC, uop.pc});
-            if (relation_it != dvrAddressRelations.end() &&
-                relation_it->second.trained) {
-                const auto &relation = relation_it->second;
-                const int64_t expected = relation.scale *
-                    static_cast<int64_t>(source_value) + relation.offset;
-                if (expected < 0 || static_cast<Addr>(expected) != result) {
-                    ++cpuStats.dvrReplayUnstableInputs;
-                    return false;
-                }
+            if (relation_it == dvrAddressRelations.end() ||
+                !relation_it->second.trained) {
+                // A replay template without a relation-specific training
+                // record must not fall through to an unchecked address.
+                ++cpuStats.dvrReplayUnstableInputs;
+                return false;
+            }
+            const auto &relation = relation_it->second;
+            const int64_t expected = relation.scale *
+                static_cast<int64_t>(source_value) + relation.offset;
+            if (expected < 0 || static_cast<Addr>(expected) != result ||
+                result < relation.minAddress ||
+                result > relation.maxAddress) {
+                ++cpuStats.dvrReplayUnstableInputs;
+                return false;
             }
             DVRPrefetchAddress dependent;
             dependent.address = static_cast<Addr>(result);
@@ -3452,6 +3492,7 @@ CPU::squashInstIt(const ListIt &instIt, ThreadID tid)
             dvrCommittedNestedCandidate = {};
             dvrDispatchTainted.clear();
             dvrDispatchDependentLoads.clear();
+            dvrDispatchRecorded.clear();
         }
 
         // Mark it as squashed.
@@ -3789,6 +3830,7 @@ CPU::observeDVRDispatch(const DynInstPtr &inst)
                 dvrInstructionRecorder.begin(inst);
                 dvrDispatchTainted.clear();
                 dvrDispatchDependentLoads.clear();
+                dvrDispatchRecorded.clear();
                 if (!dvrNestedDiscoveryMode.active())
                     dvrNestedDiscoveryMode.reset();
                 dvrCommittedNestedCandidate = {};
@@ -3807,11 +3849,14 @@ CPU::observeDVRDispatch(const DynInstPtr &inst)
         if (observation.taintedInstruction) {
             ++cpuStats.dvrTaintedInstructions;
             dvrDispatchTainted.insert(inst->seqNum);
+            dvrDispatchRecorded.insert(inst->seqNum);
         }
         if (observation.dependentLoad) {
             ++cpuStats.dvrDependentLoads;
             dvrDispatchDependentLoads.insert(inst->seqNum);
         }
+        if (inst->isCondCtrl() && inst->isDirectCtrl())
+            dvrDispatchRecorded.insert(inst->seqNum);
     }
 }
 
