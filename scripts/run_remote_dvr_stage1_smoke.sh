@@ -4,12 +4,14 @@ set -euo pipefail
 ROOT="${ROOT:-$HOME/dvr-repro/source/gem5-runahead-dev-pre}"
 RESULT_ROOT="${RESULT_ROOT:-$HOME/dvr-repro/results/dvr-stage1-smoke}"
 PYTHON_ROOT="${PYTHON_ROOT:-/nix/store/28wlfb25i3q4wq06ap0n9gb04qkjdjyn-python3-3.11.15}"
+GEM5="${GEM5:-$ROOT/build/RISCV/gem5.opt}"
+BENCH="${BENCH:-$ROOT/benchmarks/dvr_stride.riscv}"
 
 export LD_LIBRARY_PATH="$PYTHON_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 mkdir -p "$RESULT_ROOT"
 
-gem5="$ROOT/build/RISCV/gem5.opt"
-binary="$ROOT/benchmarks/dvr_stride.riscv"
+gem5="$GEM5"
+binary="$BENCH"
 test -x "$gem5"
 test -x "$binary"
 
