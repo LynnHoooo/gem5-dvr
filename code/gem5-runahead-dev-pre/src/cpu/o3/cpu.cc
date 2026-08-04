@@ -2424,6 +2424,9 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
             if (replay->uops[index].semantic ==
                 DVRInstructionRecorder::Uop::Semantic::Unsupported) {
                 ++cpuStats.dvrReplayUnsupportedUops;
+                dvrTraceDependency("replay_unsupported", curTick(), pc,
+                    replay->uops[index].pc,
+                    replay->uops[index].encoding, 0, 0);
                 replay->valid = false;
             } else {
                 ++cpuStats.dvrReplaySupportedUops;
@@ -2697,7 +2700,7 @@ CPU::launchDVRNestedPrefetches(
     // stride of the outer discovery candidate.
     const bool use_ndm_plan = dvrNestedDiscoveryMode.readyToVectorize();
     const unsigned invocations = use_ndm_plan ?
-        std::min<unsigned>(dvrNestedDiscoveryMode.outerInvocationCount(), 8) :
+        std::min<unsigned>(dvrNestedDiscoveryMode.outerInvocationCount(), 16) :
         std::min<unsigned>(dvrNestedInvocationBatch.count,
                            dvrNestedInvocationBatch.bases.size());
     const auto &ndm_invocations = dvrNestedDiscoveryMode.outerInvocations();
@@ -2732,6 +2735,12 @@ CPU::launchDVRNestedPrefetches(
     cpuStats.dvrNestedFlattenExpectedLanes += expected_flattened;
     if (flattened != expected_flattened)
         ++cpuStats.dvrNestedFlattenInvariantFailures;
+    // Record the exact outer-vector width used by this batch.  This is
+    // distinct from the flattened scalar-lane count: the paper permits up
+    // to 16 outer invocations, each contributing inner lanes, with the
+    // final stream truncated to 128 scalar-equivalent lanes.
+    dvrTraceVector("flatten_batch", curTick(), dvrNestedContext.triggerPC,
+                   0, flattened, static_cast<int>(invocations));
     if (replay->count > 1) {
         replay->continuation =
             std::make_shared<DVRVectorInstructionRegister>();

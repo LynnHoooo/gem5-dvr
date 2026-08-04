@@ -205,7 +205,10 @@ class DVRNestedDiscoveryMode
     Addr outerLoadPC = 0;
     Addr outerAddress = 0;
     int64_t outerStride = 0;
-    static constexpr unsigned MaxOuterInvocations = 8;
+    // The paper forms the outer vector from up to sixteen invocations.  The
+    // inner loop contributes up to eight scalar lanes per outer lane, for a
+    // maximum of 16 * 8 = 128 scalar-equivalent lanes.
+    static constexpr unsigned MaxOuterInvocations = 16;
     std::array<OuterInvocation, MaxOuterInvocations> invocations = {};
     unsigned invocationCount = 0;
     struct OuterProbe

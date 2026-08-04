@@ -1270,9 +1270,9 @@ class CPU : public BaseCPU
     struct DVRNestedInvocationBatch
     {
         Addr triggerPC = 0;
-        std::array<Addr, 8> bases = {};
-        std::array<unsigned, 8> innerLanes = {};
-        std::array<int64_t, 8> innerStrides = {};
+        std::array<Addr, 16> bases = {};
+        std::array<unsigned, 16> innerLanes = {};
+        std::array<int64_t, 16> innerStrides = {};
         unsigned count = 0;
 
         void reset()

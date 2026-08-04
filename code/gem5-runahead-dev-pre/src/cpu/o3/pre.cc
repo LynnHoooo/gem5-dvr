@@ -356,6 +356,8 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
         }
 
         // C.LW rd', uimm(rs1') -- RV64C quadrant 0, funct3 010.
+        // The helper only needs the effective address; the loaded word is
+        // supplied by the source-response path just like other loads.
         if (quadrant == 0 && funct3 == 2) {
             uop.semantic = Semantic::LoadAddress;
             uop.immediate =
