@@ -355,6 +355,17 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
             return;
         }
 
+        // C.LW rd', uimm(rs1') -- RV64C quadrant 0, funct3 010.
+        // The helper only needs the effective address; the loaded word is
+        // supplied by the source-response path just like other loads.
+        if (quadrant == 0 && funct3 == 2) {
+            uop.semantic = Semantic::LoadAddress;
+            uop.immediate =
+                ((compressed >> 10) & 0x7) << 3 |
+                ((compressed >> 5) & 0x3) << 1;
+            return;
+        }
+
         // C.SLLI rd, shamt -- quadrant 2, funct3 000.
         if (quadrant == 2 && funct3 == 0 &&
             ((compressed >> 7) & 0x1f) != 0) {
@@ -792,6 +803,13 @@ DVRVectorInstructionRegister::executeLanePC(
     std::array<bool, 128> lane_active = {};
     std::array<bool, DVRInstructionRecorder::MaxUops> pending_reconvergence =
         {};
+    // The paper's front-end buffer is a refill window.  VIR state (registers,
+    // lane PCs and reconvergence metadata) survives while the next window is
+    // decoded from the captured template.
+    unsigned window_start = start_index;
+    unsigned window_end = std::min(
+        start_index + DVRInstructionRecorder::FrontEndBufferUops,
+        program.size());
     const Addr entry = program[start_index].pc;
     for (unsigned lane = 0; lane < lanes; ++lane) {
         lane_active[lane] = true;
@@ -813,9 +831,25 @@ DVRVectorInstructionRegister::executeLanePC(
         for (unsigned lane = 0; lane < lanes; ++lane) {
             if (!lane_active[lane])
                 continue;
-            for (unsigned candidate = 0; candidate < program.size();
+            for (unsigned candidate = window_start; candidate < window_end;
                  ++candidate) {
                 if (program[candidate].pc == lanePC[lane]) {
+                    op_index = candidate;
+                    group_pc = lanePC[lane];
+                    break;
+                }
+            }
+            // A branch or the sequential successor may leave the current
+            // eight-uop front-end window. Refill it from the captured stream.
+            if (op_index < 0) {
+                for (unsigned candidate = 0; candidate < program.size();
+                     ++candidate) {
+                    if (program[candidate].pc != lanePC[lane])
+                        continue;
+                    window_start = candidate;
+                    window_end = std::min(
+                        candidate + DVRInstructionRecorder::FrontEndBufferUops,
+                        program.size());
                     op_index = candidate;
                     group_pc = lanePC[lane];
                     break;

@@ -142,7 +142,12 @@ class DVRVectorTaintTracker
 class DVRInstructionRecorder
 {
   public:
-    static constexpr unsigned MaxUops = 8;
+    // The paper's eight-entry front-end buffer is a refill window, not a
+    // limit on the complete trigger-to-FLR replay template.  Keep those
+    // concepts separate: the recorder can retain a whole short template,
+    // while the VIR/front-end integration can consume it in 8-uop windows.
+    static constexpr unsigned FrontEndBufferUops = 8;
+    static constexpr unsigned MaxUops = 256;
 
     struct ResourceCounts
     {

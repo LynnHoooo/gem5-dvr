@@ -43,12 +43,15 @@
 #ifndef __CPU_O3_CPU_HH__
 #define __CPU_O3_CPU_HH__
 
+#include <cstdio>
 #include <iostream>
 #include <list>
 #include <memory>
 #include <queue>
 #include <deque>
 #include <set>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -129,6 +132,7 @@ class CPU : public BaseCPU
 {
   public:
     typedef std::list<DynInstPtr>::iterator ListIt;
+    ~CPU() override;
 
     friend class ThreadContext;
 
@@ -788,6 +792,14 @@ class CPU : public BaseCPU
         statistics::Scalar dvrQualityIssuedBytes;
         statistics::Scalar dvrQualityCompletedBytes;
         statistics::Scalar dvrQualityDemandAddressesObserved;
+        statistics::Scalar dvrDependentDemandLoads;
+        statistics::Scalar dvrDependentDemandCovered;
+        statistics::Scalar dvrDependentDemandLate;
+        statistics::Scalar dvrHelperLaunchAttempts;
+        statistics::Scalar dvrHelperLaunchAdmitted;
+        statistics::Scalar dvrHelperLaunchCapacityDrops;
+        statistics::Scalar dvrHelperLaunchZeroLanes;
+        statistics::Scalar dvrPrefetchesDeduplicated;
     } cpuStats;
 
   public:
@@ -819,6 +831,7 @@ class CPU : public BaseCPU
 
     struct DVRReplayTemplate
     {
+        Addr triggerPC = 0;
         unsigned count = 0;
         int8_t triggerDestination = -1;
         std::array<DVRInstructionRecorder::Uop,
@@ -897,6 +910,21 @@ class CPU : public BaseCPU
     unsigned dvrMaxLanes;
     unsigned dvrHelperMaxUops;
     bool dvrEnableDependentPrefetch;
+    struct DVRTraceSink
+    {
+        FILE *workload = nullptr;
+        FILE *dependency = nullptr;
+        FILE *vectorization = nullptr;
+        FILE *events = nullptr;
+        bool enabled() const { return workload != nullptr; }
+    } dvrTrace;
+    void dvrTraceWorkload(const char *kind, Tick tick, InstSeqNum seq,
+                          Addr pc, Addr address);
+    void dvrTraceDependency(const char *kind, Tick tick, Addr trigger_pc,
+                            Addr pc, Addr address, uint32_t taint,
+                            int lanes = 0);
+    void dvrTraceVector(const char *kind, Tick tick, Addr pc, Addr address,
+                        int lanes, int invocation = -1);
     struct DVRPrefetchAddress
     {
         Addr address;
@@ -985,6 +1013,29 @@ class CPU : public BaseCPU
             state = fetchRemaining == 0 ? State::Idle : State::Fetch;
         }
 
+        void extend(Addr pc, unsigned uops, unsigned lanes,
+                    const DVRInstructionRecorder::ResourceCounts &resources)
+        {
+            if (state == State::Idle) {
+                begin(id, pc, uops, lanes, maxUops, resources);
+                return;
+            }
+
+            // A discovery may complete while an older generation is still
+            // draining.  Preserve both generations in the bounded helper
+            // stream instead of resetting the helper's frontend and issue
+            // budget to the newest one.
+            const uint64_t generation_uops =
+                std::min<uint64_t>(uint64_t(uops) * lanes, maxUops);
+            fetchRemaining += generation_uops;
+            maxUops += generation_uops;
+            aluRemaining += resources.alu * lanes;
+            shiftRemaining += resources.shift * lanes;
+            multiplyRemaining += resources.multiply * lanes;
+            if (state == State::Draining || state == State::Decode)
+                state = State::Fetch;
+        }
+
         unsigned advanceFrontend(unsigned fetch_width, unsigned decode_width)
         {
             if (state == State::Idle || state == State::Draining)
@@ -1041,6 +1092,23 @@ class CPU : public BaseCPU
                    issuedUops < maxUops && !computePending();
         }
 
+        void wakeForMemoryRequest()
+        {
+            if (computePending())
+                return;
+            if (state == State::Idle || state == State::Draining ||
+                (state == State::Running && readyUops == 0 &&
+                 fetchRemaining == 0 && decodeRemaining == 0)) {
+                state = State::Running;
+                readyUops = std::max(readyUops, 1u);
+            }
+            // External source responses can create replay loads after the
+            // captured frontend budget has been consumed.  Give each such
+            // queued request one bounded issue credit.
+            if (issuedUops >= maxUops)
+                maxUops = issuedUops + 1;
+        }
+
         void issue()
         {
             ++issuedUops;
@@ -1073,8 +1141,19 @@ class CPU : public BaseCPU
     unsigned dvrFetchWidth = 1;
     unsigned dvrDecodeWidth = 1;
     unsigned dvrLSUWidth = 1;
-    static constexpr unsigned DvrHelperIssueWidth = 1;
+    static constexpr unsigned DvrHelperIssueWidth = 4;
+    // Keep a small number of generations in flight.  Without this bound,
+    // dispatch can discover every loop iteration faster than the single
+    // residual LSU slot drains source lanes, burying dependent targets behind
+    // an unbounded source queue.
+    static constexpr unsigned DvrMaxQueuedPrefetches = 256;
     std::deque<DVRPrefetchAddress> dvrPrefetchQueue;
+    // Source values are lane-specific even when they share a cache line, so
+    // source requests are deduplicated by byte address.  Dependent loads only
+    // need one request per cache line.
+    std::unordered_set<Addr> dvrQueuedPrefetchAddresses;
+    std::unordered_set<Addr> dvrOutstandingPrefetchAddresses;
+    std::unordered_set<Addr> dvrQueuedDependentLines;
     struct DVRAddressRelation
     {
         bool hasPrevious = false;
@@ -1085,13 +1164,39 @@ class CPU : public BaseCPU
         int64_t offset = 0;
         RegVal stableMask = ~RegVal(0);
         RegVal pattern = 0;
+        Addr minAddress = 0;
+        Addr maxAddress = 0;
         unsigned samples = 0;
     };
-    std::unordered_map<Addr, DVRAddressRelation> dvrAddressRelations;
+    struct DVRRelationKey
+    {
+        Addr triggerPC;
+        Addr flrPC;
+
+        bool operator==(const DVRRelationKey &other) const
+        {
+            return triggerPC == other.triggerPC && flrPC == other.flrPC;
+        }
+    };
+    struct DVRRelationKeyHash
+    {
+        size_t operator()(const DVRRelationKey &key) const
+        {
+            const size_t lhs = std::hash<Addr>{}(key.triggerPC);
+            const size_t rhs = std::hash<Addr>{}(key.flrPC);
+            return lhs ^ (rhs + size_t(0x9e3779b9) + (lhs << 6) +
+                          (lhs >> 2));
+        }
+    };
+    std::unordered_map<DVRRelationKey, DVRAddressRelation,
+                       DVRRelationKeyHash> dvrAddressRelations;
     std::unordered_map<Addr, std::vector<Addr>> dvrTriggerRelations;
     std::unordered_map<Addr, unsigned> dvrOutstandingPrefetchLines;
     uint64_t dvrOutstandingPrefetchLinePeakValue = 0;
     std::unordered_map<Addr, Tick> dvrCompletedPrefetchLines;
+    std::unordered_set<Addr> dvrDependentLoadPCs;
+    std::unordered_map<Addr, unsigned> dvrDependentOutstandingLines;
+    std::unordered_set<Addr> dvrDependentCompletedLines;
     uint64_t dvrPrefetchQueuePeak = 0;
     uint64_t dvrNextPredicateGeneration = 1;
     uint64_t dvrNextHelperId = 1;
@@ -1156,9 +1261,9 @@ class CPU : public BaseCPU
     struct DVRNestedInvocationBatch
     {
         Addr triggerPC = 0;
-        std::array<Addr, 8> bases = {};
-        std::array<unsigned, 8> innerLanes = {};
-        std::array<int64_t, 8> innerStrides = {};
+        std::array<Addr, 16> bases = {};
+        std::array<unsigned, 16> innerLanes = {};
+        std::array<int64_t, 16> innerStrides = {};
         unsigned count = 0;
 
         void reset()
