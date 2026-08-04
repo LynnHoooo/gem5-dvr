@@ -165,8 +165,15 @@ CPU::CPU(const BaseO3CPUParams &params)
       dvrQualityTracker(1, 1),
       dvrMaxLanes(params.dvrMaxLanes),
       dvrHelperMaxUops(params.dvrHelperMaxUops),
-      dvrEnableDependentPrefetch(params.dvrEnableDependentPrefetch)
+      dvrEnableDependentPrefetch(params.dvrEnableDependentPrefetch),
+      dvrVectorChunkModel(params.dvrVectorChunkModel),
+      dvrVectorUnlimitedFU(params.dvrVectorUnlimitedFU),
+      dvrVectorElementBits(params.dvrVectorElementBits)
 {
+    if (dvrVectorElementBits == 0 ||
+        DvrVectorBits % dvrVectorElementBits != 0) {
+        fatal("DVR vector element width must divide 512 bits\n");
+    }
     if (const char *trace_dir = std::getenv("DVR_TRACE_DIR")) {
         char path[4096];
         auto open_trace = [&](const char *name) -> FILE * {
@@ -642,6 +649,24 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Helper compute uops granted a native O3 FU"),
       ADD_STAT(dvrHelperFUStalls, statistics::units::Count::get(),
                "Helper compute uops stalled by native FU availability"),
+      ADD_STAT(dvrVectorALUChunkIssues, statistics::units::Count::get(),
+               "DVR vector ALU chunks issued"),
+      ADD_STAT(dvrVectorShiftChunkIssues, statistics::units::Count::get(),
+               "DVR vector shift chunks issued"),
+      ADD_STAT(dvrVectorMultiplyChunkIssues, statistics::units::Count::get(),
+               "DVR vector multiply chunks issued"),
+      ADD_STAT(dvrVectorChunkRequests, statistics::units::Count::get(),
+               "DVR vector chunks requesting a shared FU"),
+      ADD_STAT(dvrVectorFUConflictCycles, statistics::units::Cycle::get(),
+               "Cycles with a constrained DVR vector FU conflict"),
+      ADD_STAT(dvrVectorLatencyCycles, statistics::units::Cycle::get(),
+               "Native FU latency cycles carried by DVR vector chunks"),
+      ADD_STAT(dvrVectorComputeWaitCycles, statistics::units::Cycle::get(),
+               "Cycles source replay waited for vector compute completion"),
+      ADD_STAT(dvrVectorActiveLanes, statistics::units::Count::get(),
+               "Sum of active lanes presented to DVR vector chunks"),
+      ADD_STAT(dvrVectorUtilization, statistics::units::Ratio::get(),
+               "Granted DVR vector chunks per vector chunk request"),
       ADD_STAT(dvrHelperALUOps, statistics::units::Count::get(),
                "Captured helper ALU/control uops profiled"),
       ADD_STAT(dvrHelperShiftOps, statistics::units::Count::get(),
@@ -900,6 +925,11 @@ CPU::CPUStats::CPUStats(CPU *cpu)
     dvrHelperReadyOccupancy.flags(statistics::nozero | statistics::nonan);
     dvrHelperReadyOccupancy =
         dvrHelperReadyUopCycles / dvrHelperReadyOccupancySamples;
+
+    dvrVectorUtilization.flags(statistics::nozero | statistics::nonan);
+    dvrVectorUtilization =
+        (dvrVectorALUChunkIssues + dvrVectorShiftChunkIssues +
+         dvrVectorMultiplyChunkIssues) / dvrVectorChunkRequests;
 
     intRegfileReads
         .prereq(intRegfileReads);
@@ -2914,13 +2944,32 @@ CPU::issueDVRHelperCompute()
     slots -= dvrHelperIssuesThisCycle;
 
     unsigned issued = 0;
-    auto issue_class = [&](unsigned &remaining, OpClass op_class) {
-        while (remaining != 0 && slots != 0) {
+    bool vector_fu_conflict = false;
+    if (dvrVectorChunkModel)
+        cpuStats.dvrHelperUopsBecameReady +=
+            dvrHelperThread.refillComputeReady();
+    auto issue_class = [&](unsigned &remaining, OpClass op_class,
+                           statistics::Scalar &chunk_issues) {
+        while (remaining != 0 && slots != 0 &&
+               (!dvrVectorChunkModel || dvrHelperThread.readyUops != 0)) {
             ++cpuStats.dvrHelperFURequests;
+            if (dvrVectorChunkModel)
+                ++cpuStats.dvrVectorChunkRequests;
             Cycles latency(1);
-            if (!iew.tryIssueDVRHelperFU(op_class, latency)) {
+            const bool granted = dvrVectorUnlimitedFU ||
+                iew.tryIssueDVRHelperFU(op_class, latency);
+            if (!granted) {
                 ++cpuStats.dvrHelperFUStalls;
+                if (dvrVectorChunkModel)
+                    vector_fu_conflict = true;
                 break;
+            }
+            if (dvrVectorChunkModel) {
+                dvrHelperThread.noteComputeLatency(
+                    curTick() + static_cast<uint64_t>(latency) *
+                        clockPeriod());
+                cpuStats.dvrVectorLatencyCycles +=
+                    static_cast<uint64_t>(latency);
             }
             --remaining;
             --slots;
@@ -2928,12 +2977,25 @@ CPU::issueDVRHelperCompute()
             ++dvrHelperComputeIssuesThisCycle;
             ++cpuStats.dvrHelperFUGrants;
             ++cpuStats.dvrHelperUopsIssued;
+            if (dvrVectorChunkModel)
+                dvrHelperThread.issueCompute();
+            if (dvrVectorChunkModel)
+                ++chunk_issues;
         }
     };
 
-    issue_class(dvrHelperThread.aluRemaining, IntAluOp);
-    issue_class(dvrHelperThread.shiftRemaining, IntAluOp);
-    issue_class(dvrHelperThread.multiplyRemaining, IntMultOp);
+    const OpClass alu_class = dvrVectorChunkModel ? SimdAluOp : IntAluOp;
+    const OpClass shift_class = dvrVectorChunkModel ? SimdShiftOp : IntAluOp;
+    const OpClass multiply_class =
+        dvrVectorChunkModel ? SimdMultOp : IntMultOp;
+    issue_class(dvrHelperThread.aluRemaining, alu_class,
+                cpuStats.dvrVectorALUChunkIssues);
+    issue_class(dvrHelperThread.shiftRemaining, shift_class,
+                cpuStats.dvrVectorShiftChunkIssues);
+    issue_class(dvrHelperThread.multiplyRemaining, multiply_class,
+                cpuStats.dvrVectorMultiplyChunkIssues);
+    if (vector_fu_conflict)
+        ++cpuStats.dvrVectorFUConflictCycles;
     return issued;
 }
 
@@ -2942,7 +3004,13 @@ CPU::serviceDVRPrefetchQueue()
 {
     if (dvrPrefetchQueue.empty())
         return;
-    dvrHelperThread.wakeForMemoryRequest();
+    if (dvrVectorChunkModel &&
+        !dvrHelperThread.computeComplete(curTick())) {
+        ++cpuStats.dvrVectorComputeWaitCycles;
+        return;
+    }
+    cpuStats.dvrHelperUopsBecameReady +=
+        dvrHelperThread.wakeForMemoryRequest();
     if (!dvrHelperThread.canIssue())
         return;
     if (dvrHelperIssuesThisCycle >= DvrHelperIssueWidth) {
@@ -3230,12 +3298,21 @@ CPU::startDVRHelper(
     if (program_uops == 0 || lanes == 0)
         return;
 
+    const unsigned work_units = dvrHelperWorkUnits(lanes);
+    DVRInstructionRecorder::ResourceCounts helper_resources = resources;
+    helper_resources.alu *= work_units;
+    helper_resources.shift *= work_units;
+    helper_resources.multiply *= work_units;
+    helper_resources.lsu *= work_units;
     if (dvrHelperThread.active()) {
-        dvrHelperThread.extend(trigger_pc, program_uops, lanes, resources);
+        dvrHelperThread.extend(trigger_pc, program_uops, work_units,
+                               helper_resources);
     } else {
         dvrHelperThread.begin(dvrNextHelperId++, trigger_pc, program_uops,
-                              lanes, dvrHelperMaxUops, resources);
+                              work_units, dvrHelperMaxUops, helper_resources);
     }
+    if (dvrVectorChunkModel)
+        cpuStats.dvrVectorActiveLanes += lanes;
     cpuStats.dvrHelperALUOps += resources.alu * lanes;
     cpuStats.dvrHelperShiftOps += resources.shift * lanes;
     cpuStats.dvrHelperMultiplyOps += resources.multiply * lanes;

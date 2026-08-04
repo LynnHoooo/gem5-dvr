@@ -713,6 +713,15 @@ class CPU : public BaseCPU
         statistics::Scalar dvrHelperFURequests;
         statistics::Scalar dvrHelperFUGrants;
         statistics::Scalar dvrHelperFUStalls;
+        statistics::Scalar dvrVectorALUChunkIssues;
+        statistics::Scalar dvrVectorShiftChunkIssues;
+        statistics::Scalar dvrVectorMultiplyChunkIssues;
+        statistics::Scalar dvrVectorChunkRequests;
+        statistics::Scalar dvrVectorFUConflictCycles;
+        statistics::Scalar dvrVectorLatencyCycles;
+        statistics::Scalar dvrVectorComputeWaitCycles;
+        statistics::Scalar dvrVectorActiveLanes;
+        statistics::Formula dvrVectorUtilization;
         statistics::Scalar dvrHelperALUOps;
         statistics::Scalar dvrHelperShiftOps;
         statistics::Scalar dvrHelperMultiplyOps;
@@ -923,6 +932,9 @@ class CPU : public BaseCPU
     unsigned dvrMaxLanes;
     unsigned dvrHelperMaxUops;
     bool dvrEnableDependentPrefetch;
+    bool dvrVectorChunkModel;
+    bool dvrVectorUnlimitedFU;
+    unsigned dvrVectorElementBits;
     struct DVRTraceSink
     {
         FILE *workload = nullptr;
@@ -971,7 +983,7 @@ class CPU : public BaseCPU
         Addr triggerPC = 0;
         unsigned programUops = 0;
         unsigned maxUops = 0;
-        unsigned laneCount = 0;
+        unsigned workUnits = 0;
         unsigned nextLane = 0;
         unsigned issuedUops = 0;
         unsigned outstanding = 0;
@@ -981,6 +993,7 @@ class CPU : public BaseCPU
         unsigned aluRemaining = 0;
         unsigned shiftRemaining = 0;
         unsigned multiplyRemaining = 0;
+        Tick computeReadyTick = 0;
 
         void reset()
         {
@@ -989,7 +1002,7 @@ class CPU : public BaseCPU
             triggerPC = 0;
             programUops = 0;
             maxUops = 0;
-            laneCount = 0;
+            workUnits = 0;
             nextLane = 0;
             issuedUops = 0;
             outstanding = 0;
@@ -999,38 +1012,38 @@ class CPU : public BaseCPU
             aluRemaining = 0;
             shiftRemaining = 0;
             multiplyRemaining = 0;
+            computeReadyTick = 0;
         }
 
         void begin(uint64_t helper_id, Addr pc, unsigned uops,
-                   unsigned lanes, unsigned budget,
+                   unsigned units, unsigned budget,
                    const DVRInstructionRecorder::ResourceCounts &resources)
         {
             id = helper_id;
             triggerPC = pc;
             programUops = uops;
             maxUops = budget;
-            laneCount = lanes;
+            workUnits = units;
             nextLane = 0;
             issuedUops = 0;
             outstanding = 0;
-            // Each logical lane executes the captured program.  The helper
-            // therefore has a real fetch/decode population of
-            // program_uops * lanes, bounded by the helper budget.
-            const uint64_t total_uops = uint64_t(programUops) * lanes;
+            // Each helper work unit executes the captured program.  A work
+            // unit is either a scalar lane or a 512-bit vector chunk.
+            const uint64_t total_uops = uint64_t(programUops) * units;
             fetchRemaining = std::min<uint64_t>(total_uops, maxUops);
             decodeRemaining = 0;
             readyUops = 0;
-            aluRemaining = resources.alu * lanes;
-            shiftRemaining = resources.shift * lanes;
-            multiplyRemaining = resources.multiply * lanes;
+            aluRemaining = resources.alu;
+            shiftRemaining = resources.shift;
+            multiplyRemaining = resources.multiply;
             state = fetchRemaining == 0 ? State::Idle : State::Fetch;
         }
 
-        void extend(Addr pc, unsigned uops, unsigned lanes,
+        void extend(Addr pc, unsigned uops, unsigned units,
                     const DVRInstructionRecorder::ResourceCounts &resources)
         {
             if (state == State::Idle) {
-                begin(id, pc, uops, lanes, maxUops, resources);
+                begin(id, pc, uops, units, maxUops, resources);
                 return;
             }
 
@@ -1039,12 +1052,12 @@ class CPU : public BaseCPU
             // stream instead of resetting the helper's frontend and issue
             // budget to the newest one.
             const uint64_t generation_uops =
-                std::min<uint64_t>(uint64_t(uops) * lanes, maxUops);
+                std::min<uint64_t>(uint64_t(uops) * units, maxUops);
             fetchRemaining += generation_uops;
             maxUops += generation_uops;
-            aluRemaining += resources.alu * lanes;
-            shiftRemaining += resources.shift * lanes;
-            multiplyRemaining += resources.multiply * lanes;
+            aluRemaining += resources.alu;
+            shiftRemaining += resources.shift;
+            multiplyRemaining += resources.multiply;
             if (state == State::Draining || state == State::Decode)
                 state = State::Fetch;
         }
@@ -1105,21 +1118,55 @@ class CPU : public BaseCPU
                    issuedUops < maxUops && !computePending();
         }
 
-        void wakeForMemoryRequest()
+        unsigned wakeForMemoryRequest()
         {
             if (computePending())
-                return;
+                return 0;
+            unsigned became_ready = 0;
             if (state == State::Idle || state == State::Draining ||
                 (state == State::Running && readyUops == 0 &&
                  fetchRemaining == 0 && decodeRemaining == 0)) {
                 state = State::Running;
                 readyUops = std::max(readyUops, 1u);
+                became_ready = 1;
             }
             // External source responses can create replay loads after the
             // captured frontend budget has been consumed.  Give each such
             // queued request one bounded issue credit.
             if (issuedUops >= maxUops)
                 maxUops = issuedUops + 1;
+            return became_ready;
+        }
+
+        void issueCompute()
+        {
+            assert(readyUops != 0);
+            ++issuedUops;
+            --readyUops;
+            if (issuedUops >= maxUops && readyUops == 0 &&
+                fetchRemaining == 0 && decodeRemaining == 0 &&
+                outstanding == 0)
+                state = State::Draining;
+        }
+
+        unsigned refillComputeReady()
+        {
+            if (!computePending() || readyUops != 0 ||
+                fetchRemaining != 0 || decodeRemaining != 0)
+                return 0;
+            state = State::Running;
+            readyUops = 1;
+            return 1;
+        }
+
+        void noteComputeLatency(Tick ready_tick)
+        {
+            computeReadyTick = std::max(computeReadyTick, ready_tick);
+        }
+
+        bool computeComplete(Tick now) const
+        {
+            return computeReadyTick <= now;
         }
 
         void issue()
@@ -1155,6 +1202,7 @@ class CPU : public BaseCPU
     unsigned dvrDecodeWidth = 1;
     unsigned dvrLSUWidth = 1;
     static constexpr unsigned DvrHelperIssueWidth = 4;
+    static constexpr unsigned DvrVectorBits = 512;
     // Keep a small number of generations in flight.  Without this bound,
     // dispatch can discover every loop iteration faster than the single
     // residual LSU slot drains source lanes, burying dependent targets behind
@@ -1321,6 +1369,14 @@ class CPU : public BaseCPU
                         unsigned lanes,
                         const DVRInstructionRecorder::ResourceCounts
                         &resources = {});
+    unsigned dvrHelperWorkUnits(unsigned lanes) const
+    {
+        if (!dvrVectorChunkModel)
+            return lanes;
+        const unsigned elements_per_chunk =
+            DvrVectorBits / dvrVectorElementBits;
+        return (lanes + elements_per_chunk - 1) / elements_per_chunk;
+    }
     unsigned issueDVRHelperCompute();
     Addr dvrPrefetchLine(Addr address) const;
     void accountDVRDemand(Addr address);
