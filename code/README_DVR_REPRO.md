@@ -1272,9 +1272,10 @@ conflicts=51594 issue_conflicts=10290 alu_conflicts=0 lsu_conflicts=41304
 main_issue=2003631 main_thread_suppressed=242974 dvr_issued=94199
 ```
 
-这完成了 P0 evaluator 的第一批可审计扩展，但不应写成“全部 opcode 覆盖”：
-`ADDW/SUBW`、word sign-extension、load width/sign-extension、RVC 变体、完整 branch
-path evaluator 和严格的论文 NDM branch inversion 仍然是后续缺口。当前 P0 状态应记录为：
+这完成了 P0 evaluator 的第一批可审计扩展。当前源码已经包含
+`ADDW/SUBW`、word shift、`LB/LH/LW/LWU/LD` 的 evaluator/replay 分支；但真实
+memory request 的 load width、sign/zero extension、RVC 变体、完整 branch path
+evaluator 和严格的论文 NDM branch inversion 仍然需要独立验收。当前 P0 状态应记录为：
 
 - Stage13 一键回归：已完成；
 - GAP 五 workload 六模式实验：已完成；
@@ -1321,3 +1322,50 @@ fetch/decode queues、IQ、ROB 或 commit；其 captured evaluator 仍由 DVR �
 状态机驱动，native O3 FU/LSQ 是接入的资源和 memory lifetime 后端。下一阶段若
 要达到论文级完整 helper，需要建立 helper-owned `DynInst`/IQ 生命周期、真实
 依赖 wakeup、FU completion/writeback 和独立 helper squash/recovery。
+
+## 18. DVR 第一阶段原配置锚定与 NDM 端到端验收
+
+当前 table1 配置已对齐论文中最重要的核心/缓存参数：5-wide、350-entry ROB、
+32KB L1D、24 L1D MSHR、256KB L2 和 8MB LLC。它仍是 gem5/RISC-V timing model，
+不是 Sniper/x86 的逐项等价替代，因此结果应称为机制锚定，而不是论文数值复现。
+
+原配置锚定脚本：
+
+```bash
+ROOT=/path/to/gem5-runahead-dev-pre \
+BENCH_ROOT=/path/to/benchmarks \
+BENCHES=dvr_dependent.riscv,dvr_ndm.riscv \
+bash scripts/run_remote_dvr_anchor.sh
+```
+
+脚本输出 trigger、discovery completion、loop-bound match、平均 lanes、dependent
+traffic、quality、DVR outstanding cache lines 和峰值。当前 dvr_dependent 结果显示
+Full DVR 平均 outstanding helper lines 为 5.65、峰值 18，但 loop-bound match
+只有 207/4421、coverage 为 0.007865，周期略慢于 baseline；这证明有 decoupled
+traffic，却不能称为已复现论文的 2.4x DVR。
+
+NDM 数据面验收脚本：
+
+```bash
+bash scripts/run_remote_dvr_ndm_e2e.sh
+```
+
+它强制检查 branch inversion、outer invocation、outer x inner flatten、dependent
+replay target，以及 helper generated/issued/completed 和逐 batch flatten 守恒。
+修复后的专项结果为 attempts=44、branch_inversions=44、outer_instances=2320、
+flattened_lanes=14478、replay_targets=3531、helper completed=9649，守恒失败为零。
+
+同一修复版二进制的 GAP scale-10 Nested 运行也全部进入数据面：
+
+| Workload | NDM attempts | Outer invocations | Nested batches | Outer instances | Flattened lanes | Helper completed |
+|---|---:|---:|---:|---:|---:|---:|
+| BC | 387 | 501 | 240 | 480 | 19859 | 18457 |
+| BFS | 40 | 74 | 33 | 66 | 4074 | 3662 |
+| CC | 49 | 80 | 34 | 68 | 4351 | 4094 |
+| PR | 5747 | 11242 | 5616 | 11232 | 408190 | 376417 |
+| SSSP | 56 | 50 | 21 | 42 | 2538 | 2397 |
+
+因此当前应把配置分层称为 DVR-Offload、DVR-Offload+Discovery、DVR-Nested，
+而不是直接把所有 Full/Nested 结果标为完整论文 DVR。只有简单间接 workload
+出现稳定、可解释的正收益，并且 outstanding misses、coverage、timeliness 和
+资源竞争都与收益一致后，才升级命名和论文结论。

@@ -1,0 +1,6 @@
+workload,mode,ndm_attempts,branch_inversions,outer_found,ndm_outer_invocations,nested_batches,outer_instances,inner_lanes,flattened_lanes,flatten_expected_lanes,flatten_invariant_failures,nested_helpers_generated,nested_helpers_issued,nested_helpers_completed,nested_replay_targets,nested_dependent_generated
+bc,nested,387,372,251,501,240,480,19859,19859,19859,0,19859,18457,18457,0,13150
+bfs,nested,40,40,38,74,33,66,4074,4074,4074,0,4074,3662,3662,188,3577
+cc,nested,49,49,40,80,34,68,4351,4351,4351,0,4351,4094,4094,0,3692
+pr,nested,5747,5747,5622,11242,5616,11232,408190,408190,408190,0,408190,376417,376417,0,376211
+sssp,nested,56,56,27,50,21,42,2538,2538,2538,0,2538,2397,2397,0,480

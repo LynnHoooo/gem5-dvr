@@ -1,0 +1,24 @@
+Experiment: Stage-1 DVR mechanism/configuration anchor
+Date: 2026-08-04 Asia/Shanghai
+Source repository: /home/lynnhoo/dvr-repro/source/gem5-dvr
+Source base commit: c7a74eb
+Binary: /home/lynnhoo/dvr-repro/source/gem5-dvr/code/gem5-runahead-dev-pre/build/RISCV/gem5.opt
+Binary timestamp: 2026-08-04 13:46:32 +0800
+Build command: cd code/gem5-runahead-dev-pre && scons build/RISCV/gem5.opt -j$(nproc)
+Configuration: configs/dvr/table1_se.py
+Core/cache anchor: 5-wide, 350-entry ROB, 32KiB L1D, 24 L1D MSHRs, 256KiB L2, 8MiB LLC
+Commands:
+  gem5.opt --outdir=<out> configs/dvr/table1_se.py --cmd=dvr_dependent.riscv --dvr-quality-probe
+  gem5.opt --outdir=<out> configs/dvr/table1_se.py --cmd=dvr_dependent.riscv --dvr --dvr-mode=offload --dvr-quality-probe
+  gem5.opt --outdir=<out> configs/dvr/table1_se.py --cmd=dvr_dependent.riscv --dvr --dvr-mode=full --dvr-quality-probe
+  gem5.opt --outdir=<out> configs/dvr/table1_se.py --cmd=gapbs/bfs --options='-g 10 -n 1' --dvr-quality-probe
+  gem5.opt --outdir=<out> configs/dvr/table1_se.py --cmd=gapbs/bfs --options='-g 10 -n 1' --dvr --dvr-mode=offload --dvr-quality-probe
+  gem5.opt --outdir=<out> configs/dvr/table1_se.py --cmd=gapbs/bfs --options='-g 10 -n 1' --dvr --dvr-mode=full --dvr-quality-probe
+Interpretation:
+  dvr_dependent Full has outstanding helper-line average 0.158 and peak 18,
+  but only 207 loop-bound matches out of 4421 completions and coverage 0.007865.
+  BFS Full has 0.33% lower ticks than baseline, coverage 0.030492, and
+  outstanding helper-line peak 10; demand misses increase, so this is a
+  mechanism anchor, not a claim of paper-level speedup.
+  outstanding_line_* is DVR outstanding prefetched cache-line state, not
+  total cache MSHR occupancy; it is a diagnostic lower-bound/proxy.

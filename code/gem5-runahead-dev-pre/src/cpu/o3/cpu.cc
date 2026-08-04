@@ -493,6 +493,15 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Inner lanes inferred across nested flatten batches"),
       ADD_STAT(dvrNestedFlattenedLanes, statistics::units::Count::get(),
                "Actual flattened nested lanes, capped at 128 per batch"),
+      ADD_STAT(dvrNestedFlattenInvariantChecks,
+               statistics::units::Count::get(),
+               "Nested flatten batches checked against the per-batch lane cap"),
+      ADD_STAT(dvrNestedFlattenInvariantFailures,
+               statistics::units::Count::get(),
+               "Nested flatten batches violating the per-batch lane invariant"),
+      ADD_STAT(dvrNestedFlattenExpectedLanes,
+               statistics::units::Count::get(),
+               "Expected nested lanes from per-batch min(128, inner lanes)"),
       ADD_STAT(dvrNestedVariableLaneBatches,
                statistics::units::Count::get(),
                "Nested batches containing independently different bounds"),
@@ -710,6 +719,15 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Demand loads to a line after a DVR prefetch completed"),
       ADD_STAT(dvrPrefetchesLate, statistics::units::Count::get(),
                "Demand loads to a line while a DVR prefetch was outstanding"),
+      ADD_STAT(dvrOutstandingPrefetchLineSamples,
+               statistics::units::Count::get(),
+               "Cycles sampled for DVR outstanding prefetched lines"),
+      ADD_STAT(dvrOutstandingPrefetchLineSum,
+               statistics::units::Count::get(),
+               "Sum of DVR outstanding prefetched lines across samples"),
+      ADD_STAT(dvrOutstandingPrefetchLinePeak,
+               statistics::units::Count::get(),
+               "Peak DVR outstanding prefetched cache lines"),
       ADD_STAT(dvrReplaySupportedUops, statistics::units::Count::get(),
                "Supported post-trigger uops in DVR replay templates"),
       ADD_STAT(dvrReplayUnsupportedUops, statistics::units::Count::get(),
@@ -872,6 +890,15 @@ CPU::tick()
     // after the normal pre-commit helper arbitration point.  Give that
     // newly-created queue one same-cycle, residual service opportunity.
     serviceDVRPrefetchQueue();
+
+    const uint64_t outstanding_lines = dvrOutstandingPrefetchLines.size();
+    ++cpuStats.dvrOutstandingPrefetchLineSamples;
+    cpuStats.dvrOutstandingPrefetchLineSum += outstanding_lines;
+    if (outstanding_lines > dvrOutstandingPrefetchLinePeakValue) {
+        dvrOutstandingPrefetchLinePeakValue = outstanding_lines;
+        cpuStats.dvrOutstandingPrefetchLinePeak =
+            dvrOutstandingPrefetchLinePeakValue;
+    }
 
     // Now advance the time buffers
     timeBuffer.advance();
@@ -1980,9 +2007,24 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 }
                 const bool launch_source_fallback =
                     vir_control_fallback && !dvrInstructionRecorder.overflow();
+                /*
+                 * NDM data-plane admission is deliberately independent of
+                 * the ordinary VIR control-flow admission above.  A
+                 * captured inner program can be unsuitable for the
+                 * single-invocation VIR path (for example because its
+                 * branch target leaves the short recorder), while still
+                 * being a valid NDM source/replay template.  Gating NDM on
+                 * helper_allowed silently drops the outer x inner plan and
+                 * leaves all workload-level flatten counters at zero.
+                 */
+                const bool ndm_capture_valid =
+                    dvrNestedDiscoveryMode.readyToVectorize() &&
+                    inference.matched && inference.lanes != 0 &&
+                    dvrTaintTracker.flr() != 0 &&
+                    dvrInstructionRecorder.size() > 1 &&
+                    !dvrInstructionRecorder.overflow();
                 bool ndm_launched = false;
-                if (helper_allowed &&
-                    dvrNestedDiscoveryMode.readyToVectorize()) {
+                if (ndm_capture_valid) {
                     dvrNestedContext.reset();
                     dvrNestedContext.active = true;
                     dvrNestedContext.tid = tid;
@@ -2313,7 +2355,18 @@ CPU::completeDVRNestedContext(
     bool helper_allowed = dvrNestedContext.recorder.size() > 1 &&
         dvrNestedContext.taint.flr() != 0 && inference.matched &&
         !dvrNestedContext.recorder.overflow();
-    if (helper_allowed) {
+    /*
+     * The NDM plan is a separate admission path from ordinary single
+     * invocation VIR.  Keep a valid child capture available for flattening
+     * even when VIR rejected a branch target outside its short recorder.
+     */
+    const bool ndm_capture_valid =
+        dvrNestedDiscoveryMode.readyToVectorize() &&
+        inference.matched && inference.lanes != 0 &&
+        dvrNestedContext.taint.flr() != 0 &&
+        dvrNestedContext.recorder.size() > 1 &&
+        !dvrNestedContext.recorder.overflow();
+    if (helper_allowed || ndm_capture_valid) {
         ++cpuStats.dvrNestedProgramsBuilt;
         cpuStats.dvrNestedVRATAllocations += dvrNestedContext.vrat.build(
             dvrNestedContext.recorder, inference.lanes);
@@ -2336,7 +2389,7 @@ CPU::completeDVRNestedContext(
         helper_allowed = !vir_result.timedOut &&
             !vir_result.stackOverflow && helper_allowed;
     }
-    if (helper_allowed) {
+    if (helper_allowed || ndm_capture_valid) {
         // When NDM has accepted an outer stride, every child completion is
         // one independently bounded outer invocation.  Do not flatten until
         // NDM has observed at least two such invocations; this is the point
@@ -2482,6 +2535,13 @@ CPU::launchDVRNestedPrefetches(
     cpuStats.dvrNestedFlattenedLanes += flattened;
     if (variable_lanes)
         ++cpuStats.dvrNestedVariableLaneBatches;
+    ++cpuStats.dvrNestedFlattenInvariantChecks;
+    const unsigned expected_flattened =
+        std::min<unsigned>(DVRLanePredicateTracker::MaxLanes,
+                           total_inner_lanes);
+    cpuStats.dvrNestedFlattenExpectedLanes += expected_flattened;
+    if (flattened != expected_flattened)
+        ++cpuStats.dvrNestedFlattenInvariantFailures;
     if (replay->count > 1) {
         replay->continuation =
             std::make_shared<DVRVectorInstructionRegister>();

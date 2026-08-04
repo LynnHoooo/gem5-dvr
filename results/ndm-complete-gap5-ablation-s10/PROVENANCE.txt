@@ -1,0 +1,23 @@
+Experiment: NDM workload-level data-plane validation
+Date: 2026-08-04 Asia/Shanghai
+Source repository: /home/lynnhoo/dvr-repro/source/gem5-dvr
+Source base commit: c7a74eb
+Working-tree change: NDM admission decoupled from ordinary VIR control-flow fallback; flatten invariant counters added
+Binary: /home/lynnhoo/dvr-repro/source/gem5-dvr/code/gem5-runahead-dev-pre/build/RISCV/gem5.opt
+Binary timestamp: 2026-08-04 13:46:32 +0800
+Binary size: 543538352 bytes
+Build command: cd code/gem5-runahead-dev-pre && scons build/RISCV/gem5.opt -j$(nproc)
+GAP source binaries: /home/lynnhoo/dvr-repro/source/gapbs/{bc,bfs,cc,pr,sssp}
+GAP input: --options='-g 10 -n 1'
+GAP command template:
+  gem5.opt --outdir=<out> configs/dvr/table1_se.py --cmd=<gap>/<workload> --options='-g 10 -n 1' --dvr --dvr-mode=nested --dvr-quality-probe
+Validation script: scripts/run_remote_dvr_ndm_e2e.sh
+Validation command:
+  ROOT=code/gem5-runahead-dev-pre BENCH=<dvr_ndm.riscv> OUT_ROOT=<out> scripts/run_remote_dvr_ndm_e2e.sh
+NDM e2e result:
+  attempts=44 branch_inversions=44 outer_found=44 ndm_outer=88 batches=1160 outer_instances=2320
+  inner_lanes=14486 flattened_lanes=14478 expected_flattened=14478 replay_targets=3531
+  generated=14478 issued=9649 completed=9649
+GAP result: see summary.csv. All five workloads have flatten_invariant_failures=0.
+Interpretation: this proves the NDM control-to-flatten data path and helper/cache completion path.
+It does not by itself prove paper-level speedup or complete helper-owned DynInst/IQ integration.

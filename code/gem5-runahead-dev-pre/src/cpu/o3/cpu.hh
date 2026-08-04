@@ -679,6 +679,9 @@ class CPU : public BaseCPU
         statistics::Scalar dvrNestedOuterInstances;
         statistics::Scalar dvrNestedInnerLanes;
         statistics::Scalar dvrNestedFlattenedLanes;
+        statistics::Scalar dvrNestedFlattenInvariantChecks;
+        statistics::Scalar dvrNestedFlattenInvariantFailures;
+        statistics::Scalar dvrNestedFlattenExpectedLanes;
         statistics::Scalar dvrNestedVariableLaneBatches;
         statistics::Scalar dvrNDMAttempts;
         statistics::Scalar dvrNDMOuterFound;
@@ -773,6 +776,9 @@ class CPU : public BaseCPU
         statistics::Scalar dvrPrefetchesSuperseded;
         statistics::Scalar dvrPrefetchesPossiblyUseful;
         statistics::Scalar dvrPrefetchesLate;
+        statistics::Scalar dvrOutstandingPrefetchLineSamples;
+        statistics::Scalar dvrOutstandingPrefetchLineSum;
+        statistics::Scalar dvrOutstandingPrefetchLinePeak;
         statistics::Scalar dvrReplaySupportedUops;
         statistics::Scalar dvrReplayUnsupportedUops;
         statistics::Scalar dvrReplayUnstableInputs;
@@ -1084,6 +1090,7 @@ class CPU : public BaseCPU
     std::unordered_map<Addr, DVRAddressRelation> dvrAddressRelations;
     std::unordered_map<Addr, std::vector<Addr>> dvrTriggerRelations;
     std::unordered_map<Addr, unsigned> dvrOutstandingPrefetchLines;
+    uint64_t dvrOutstandingPrefetchLinePeakValue = 0;
     std::unordered_map<Addr, Tick> dvrCompletedPrefetchLines;
     uint64_t dvrPrefetchQueuePeak = 0;
     uint64_t dvrNextPredicateGeneration = 1;
