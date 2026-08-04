@@ -258,6 +258,10 @@ class Request
          */
         DVR_PREFETCH                = 0x0001000000000000,
 
+        /** Provenance subtypes for DVR_PREFETCH requests. */
+        DVR_SOURCE                  = 0x0002000000000000,
+        DVR_DEPENDENT               = 0x0004000000000000,
+
         /**
          * These flags are *not* cleared when a Request object is
          * reused (assigned a new address).
@@ -1019,6 +1023,8 @@ class Request
     }
     bool isPrefetchEx() const { return _flags.isSet(PF_EXCLUSIVE); }
     bool isDVRPrefetch() const { return _flags.isSet(DVR_PREFETCH); }
+    bool isDVRSource() const { return _flags.isSet(DVR_SOURCE); }
+    bool isDVRDependent() const { return _flags.isSet(DVR_DEPENDENT); }
     bool isLLSC() const { return _flags.isSet(LLSC); }
     bool isPriv() const { return _flags.isSet(PRIVILEGED); }
     bool isLockedRMW() const { return _flags.isSet(LOCKED_RMW); }

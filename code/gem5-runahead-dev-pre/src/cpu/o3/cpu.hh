@@ -703,7 +703,11 @@ class CPU : public BaseCPU
         statistics::Scalar dvrHelperIssueCycles;
         statistics::Scalar dvrHelperFetchCycles;
         statistics::Scalar dvrHelperDecodeCycles;
-        statistics::Scalar dvrHelperReadyUops;
+        statistics::Scalar dvrHelperUopsBecameReady;
+        statistics::Scalar dvrHelperUopsIssued;
+        statistics::Scalar dvrHelperReadyUopCycles;
+        statistics::Scalar dvrHelperReadyOccupancySamples;
+        statistics::Formula dvrHelperReadyOccupancy;
         statistics::Scalar dvrHelperComputeCycles;
         statistics::Scalar dvrHelperComputeConflicts;
         statistics::Scalar dvrHelperFURequests;

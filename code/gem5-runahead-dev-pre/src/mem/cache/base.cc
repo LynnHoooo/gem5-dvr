@@ -402,6 +402,20 @@ BaseCache::handleTimingReqMiss(PacketPtr pkt, MSHR *mshr, CacheBlk *blk,
 void
 BaseCache::recvTimingReq(PacketPtr pkt)
 {
+    const bool dvr_source = pkt->req->isDVRSource();
+    const bool dvr_dependent = pkt->req->isDVRDependent();
+    const bool architectural_demand =
+        pkt->isDemand() && !pkt->req->isDVRPrefetch();
+    if (architectural_demand) {
+        ++stats.architecturalDemandAccesses;
+        stats.architecturalDemandBytes += pkt->getSize();
+    } else if (dvr_source) {
+        ++stats.dvrSourceIssued;
+        stats.dvrSourceBytes += pkt->getSize();
+    } else if (dvr_dependent) {
+        ++stats.dvrDependentIssued;
+        stats.dvrDependentBytes += pkt->getSize();
+    }
     if (pkt->req->isDVRPrefetch()) {
         ppDVRQuality->notify(DVRQualityEvent{
             DVRQualityEvent::Kind::Issue, pkt->getBlockAddr(blkSize),
@@ -451,6 +465,12 @@ BaseCache::recvTimingReq(PacketPtr pkt)
     pkt->headerDelay = pkt->payloadDelay = 0;
 
     if (satisfied) {
+        if (architectural_demand)
+            ++stats.architecturalDemandHits;
+        else if (dvr_source)
+            ++stats.dvrSourceHits;
+        else if (dvr_dependent)
+            ++stats.dvrDependentHits;
         if (pkt->req->isDVRPrefetch()) {
             ppDVRQuality->notify(DVRQualityEvent{
                 DVRQualityEvent::Kind::Complete,
@@ -475,6 +495,12 @@ BaseCache::recvTimingReq(PacketPtr pkt)
         }
         handleTimingReqHit(pkt, blk, request_time);
     } else {
+        if (architectural_demand)
+            ++stats.architecturalDemandMisses;
+        else if (dvr_source)
+            ++stats.dvrSourceMisses;
+        else if (dvr_dependent)
+            ++stats.dvrDependentMisses;
         if (!pkt->req->isDVRPrefetch() && !pkt->req->isPrefetch() &&
             pkt->isRequest() && (pkt->isRead() || pkt->isWrite())) {
             ppDVRQuality->notify(DVRQualityEvent{
@@ -2333,6 +2359,30 @@ BaseCache::CacheStats::CacheStats(BaseCache &c)
     ADD_STAT(overallAvgMshrUncacheableLatency, statistics::units::Rate<
                 statistics::units::Tick, statistics::units::Count>::get(),
              "average overall mshr uncacheable latency"),
+    ADD_STAT(architecturalDemandAccesses, statistics::units::Count::get(),
+             "architectural demand accesses, excluding DVR requests"),
+    ADD_STAT(architecturalDemandHits, statistics::units::Count::get(),
+             "architectural demand hits, excluding DVR requests"),
+    ADD_STAT(architecturalDemandMisses, statistics::units::Count::get(),
+             "architectural demand misses, excluding DVR requests"),
+    ADD_STAT(architecturalDemandBytes, statistics::units::Byte::get(),
+             "bytes in architectural demand accesses"),
+    ADD_STAT(dvrSourceIssued, statistics::units::Count::get(),
+             "DVR source requests observed at this cache"),
+    ADD_STAT(dvrSourceHits, statistics::units::Count::get(),
+             "DVR source requests hitting at this cache"),
+    ADD_STAT(dvrSourceMisses, statistics::units::Count::get(),
+             "DVR source requests missing at this cache"),
+    ADD_STAT(dvrSourceBytes, statistics::units::Byte::get(),
+             "bytes in DVR source requests"),
+    ADD_STAT(dvrDependentIssued, statistics::units::Count::get(),
+             "DVR dependent requests observed at this cache"),
+    ADD_STAT(dvrDependentHits, statistics::units::Count::get(),
+             "DVR dependent requests hitting at this cache"),
+    ADD_STAT(dvrDependentMisses, statistics::units::Count::get(),
+             "DVR dependent requests missing at this cache"),
+    ADD_STAT(dvrDependentBytes, statistics::units::Byte::get(),
+             "bytes in DVR dependent requests"),
     ADD_STAT(replacements, statistics::units::Count::get(),
              "number of replacements"),
     ADD_STAT(dataExpansions, statistics::units::Count::get(),

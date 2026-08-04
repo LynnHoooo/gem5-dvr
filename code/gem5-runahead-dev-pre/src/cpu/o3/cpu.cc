@@ -619,8 +619,19 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Cycles in which the DVR helper fetched captured uops"),
       ADD_STAT(dvrHelperDecodeCycles, statistics::units::Cycle::get(),
                "Cycles in which the DVR helper decoded captured uops"),
-      ADD_STAT(dvrHelperReadyUops, statistics::units::Count::get(),
-               "Captured helper uops made ready for issue"),
+      ADD_STAT(dvrHelperUopsBecameReady, statistics::units::Count::get(),
+               "Captured helper uops that became ready"),
+      ADD_STAT(dvrHelperUopsIssued, statistics::units::Count::get(),
+               "Captured helper uops successfully issued"),
+      ADD_STAT(dvrHelperReadyUopCycles, statistics::units::Count::get(),
+               "Sum of helper ready-queue occupancy across sampled cycles"),
+      ADD_STAT(dvrHelperReadyOccupancySamples,
+               statistics::units::Count::get(),
+               "Cycles sampled for helper ready-queue occupancy"),
+      ADD_STAT(dvrHelperReadyOccupancy, statistics::units::Rate<
+                   statistics::units::Count,
+                   statistics::units::Count>::get(),
+               "Average helper ready-queue occupancy"),
       ADD_STAT(dvrHelperComputeCycles, statistics::units::Cycle::get(),
                "Cycles in which captured helper compute uops executed"),
       ADD_STAT(dvrHelperComputeConflicts, statistics::units::Count::get(),
@@ -884,6 +895,12 @@ CPU::CPUStats::CPUStats(CPU *cpu)
         .precision(6);
     totalIpc = sum(committedInsts) / cpu->baseStats.numCycles;
 
+    dvrHelperReadyOccupancy
+        .precision(6);
+    dvrHelperReadyOccupancy.flags(statistics::nozero | statistics::nonan);
+    dvrHelperReadyOccupancy =
+        dvrHelperReadyUopCycles / dvrHelperReadyOccupancySamples;
+
     intRegfileReads
         .prereq(intRegfileReads);
 
@@ -951,15 +968,23 @@ CPU::tick()
     // demand pipeline so the main thread retains priority for shared
     // fetch/decode/issue resources, while its own ready queue is visible to
     // the residual issue arbitration below.
+    const unsigned ready_uops_before = dvrHelperThread.readyUops;
     const unsigned helper_frontend_work =
         dvrHelperThread.advanceFrontend(dvrFetchWidth, dvrDecodeWidth);
+    const unsigned ready_uops_after = dvrHelperThread.readyUops;
     if (helper_frontend_work != 0) {
         if (dvrHelperThread.fetchRemaining != 0 ||
             dvrHelperThread.decodeRemaining != 0)
             ++cpuStats.dvrHelperFetchCycles;
         if (dvrHelperThread.readyUops != 0)
             ++cpuStats.dvrHelperDecodeCycles;
-        cpuStats.dvrHelperReadyUops += dvrHelperThread.readyUops;
+        if (ready_uops_after >= ready_uops_before)
+            cpuStats.dvrHelperUopsBecameReady +=
+                ready_uops_after - ready_uops_before;
+    }
+    if (dvrHelperThread.active()) {
+        ++cpuStats.dvrHelperReadyOccupancySamples;
+        cpuStats.dvrHelperReadyUopCycles += dvrHelperThread.readyUops;
     }
 
     const unsigned helper_compute = issueDVRHelperCompute();
@@ -2902,6 +2927,7 @@ CPU::issueDVRHelperCompute()
             ++issued;
             ++dvrHelperComputeIssuesThisCycle;
             ++cpuStats.dvrHelperFUGrants;
+            ++cpuStats.dvrHelperUopsIssued;
         }
     };
 
@@ -2957,6 +2983,7 @@ CPU::serviceDVRPrefetchQueue()
     }
     Request::Flags flags;
     flags.set(Request::PREFETCH | Request::DVR_PREFETCH);
+    flags.set(prefetch.source ? Request::DVR_SOURCE : Request::DVR_DEPENDENT);
     RequestPtr req = std::make_shared<Request>(
         prefetch.address, prefetch.source ? SourceBytes : 1,
         flags, dataRequestorId(), prefetch.pc,
@@ -3021,6 +3048,7 @@ CPU::serviceDVRPrefetchQueue()
     ++cpuStats.dvrPrefetchesIssued;
     ++dvrHelperIssuesThisCycle;
     ++cpuStats.dvrHelperIssueCycles;
+    ++cpuStats.dvrHelperUopsIssued;
     dvrHelperThread.issue();
     dvrQualityTracker.issued(
         reinterpret_cast<uintptr_t>(pkt), dvrPrefetchLine(req->getPaddr()),
