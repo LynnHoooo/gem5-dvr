@@ -1,7 +1,7 @@
 Experiment: Stage-1 DVR mechanism/configuration anchor
 Date: 2026-08-04 Asia/Shanghai
 Source repository: /home/lynnhoo/dvr-repro/source/gem5-dvr
-Source base commit: c7a74eb
+Source commit: 953c81f
 Binary: /home/lynnhoo/dvr-repro/source/gem5-dvr/code/gem5-runahead-dev-pre/build/RISCV/gem5.opt
 Binary timestamp: 2026-08-04 13:46:32 +0800
 Build command: cd code/gem5-runahead-dev-pre && scons build/RISCV/gem5.opt -j$(nproc)
