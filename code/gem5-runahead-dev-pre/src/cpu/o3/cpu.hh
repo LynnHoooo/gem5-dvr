@@ -706,6 +706,12 @@ class CPU : public BaseCPU
         statistics::Scalar dvrHelperDecodeCycles;
         statistics::Scalar dvrHelperUopsBecameReady;
         statistics::Scalar dvrHelperUopsIssued;
+        statistics::Scalar dvrHelperDynUopsDecoded;
+        statistics::Scalar dvrHelperDynUopsIssued;
+        statistics::Scalar dvrHelperDynUopsCompleted;
+        statistics::Scalar dvrHelperVIRCapacityStalls;
+        statistics::Scalar dvrHelperVRATPrograms;
+        statistics::Scalar dvrHelperVRATWrites;
         statistics::Scalar dvrHelperReadyUopCycles;
         statistics::Scalar dvrHelperReadyOccupancySamples;
         statistics::Formula dvrHelperReadyOccupancy;
@@ -854,6 +860,93 @@ class CPU : public BaseCPU
     /** IEW dispatch 阶段观察指令并启动/推进 DVR Discovery。 */
     void observeDVRDispatch(const DynInstPtr &inst);
 
+    /**
+     * Private vector register file for one helper program.  It is deliberately
+     * separate from the main O3 physical register file: DVR is a transient,
+     * in-order subthread and must not create architectural rename/commit state.
+     */
+    struct DVRHelperVectorRegisterFile
+    {
+        static constexpr unsigned MaxLanes = DVRLanePredicateTracker::MaxLanes;
+        static constexpr unsigned NumArchitecturalRegs =
+            DVRLoopBoundDetector::MaxArchitecturalIntRegs;
+        static constexpr unsigned NumPhysicalRegs = 64;
+
+        struct PhysicalRegister
+        {
+            std::array<RegVal, MaxLanes> values = {};
+            std::array<Tick, MaxLanes> ready = {};
+            std::array<uint64_t, 2> valid = {};
+        };
+
+        std::array<int16_t, NumArchitecturalRegs> vrat = {};
+        std::array<PhysicalRegister, NumPhysicalRegs> physical = {};
+        unsigned nextPhysical = 0;
+
+        void reset()
+        {
+            nextPhysical = 0;
+            for (unsigned reg = 0; reg < NumArchitecturalRegs; ++reg)
+                vrat[reg] = -1;
+            for (auto &entry : physical) {
+                entry.values.fill(0);
+                entry.ready.fill(0);
+                entry.valid = {};
+            }
+        }
+
+        void initialize(const DVRLoopBoundDetector::RegisterSnapshot &regs)
+        {
+            reset();
+            for (unsigned arch = 0; arch < NumArchitecturalRegs; ++arch) {
+                vrat[arch] = nextPhysical++;
+                auto &entry = physical[vrat[arch]];
+                for (unsigned lane = 0; lane < MaxLanes; ++lane) {
+                    entry.values[lane] = regs[arch];
+                    entry.valid[lane / 64] |= uint64_t(1) << (lane % 64);
+                }
+            }
+        }
+
+        int16_t rename(unsigned arch)
+        {
+            if (arch >= NumArchitecturalRegs)
+                return -1;
+            if (nextPhysical >= NumPhysicalRegs)
+                nextPhysical = 0;
+            vrat[arch] = nextPhysical++;
+            physical[vrat[arch]] = PhysicalRegister();
+            return vrat[arch];
+        }
+
+        RegVal read(unsigned arch, unsigned lane) const
+        {
+            if (arch >= NumArchitecturalRegs || lane >= MaxLanes ||
+                vrat[arch] < 0)
+                return 0;
+            return physical[vrat[arch]].values[lane];
+        }
+
+        Tick readyAt(unsigned arch, unsigned lane) const
+        {
+            if (arch >= NumArchitecturalRegs || lane >= MaxLanes ||
+                vrat[arch] < 0)
+                return 0;
+            return physical[vrat[arch]].ready[lane];
+        }
+
+        void write(unsigned arch, unsigned lane, RegVal value, Tick ready_tick)
+        {
+            if (arch >= NumArchitecturalRegs || lane >= MaxLanes ||
+                vrat[arch] < 0)
+                return;
+            auto &entry = physical[vrat[arch]];
+            entry.values[lane] = value;
+            entry.ready[lane] = ready_tick;
+            entry.valid[lane / 64] |= uint64_t(1) << (lane % 64);
+        }
+    };
+
     struct DVRReplayTemplate
     {
         Addr triggerPC = 0;
@@ -867,6 +960,7 @@ class CPU : public BaseCPU
         std::array<DVRInstructionRecorder::Uop,
                    DVRInstructionRecorder::MaxUops> uops = {};
         DVRLoopBoundDetector::RegisterSnapshot initialRegs = {};
+        std::shared_ptr<DVRHelperVectorRegisterFile> helperRegs;
         std::shared_ptr<DVRVectorInstructionRegister> continuation;
         bool valid = false;
     };
@@ -1011,6 +1105,25 @@ class CPU : public BaseCPU
         Addr helperPC = 0;
 
         enum class ComputeKind { Alu, Shift, Multiply };
+        struct DVRDynUop
+        {
+            enum class State { Decoded, Ready, Issued, WaitingMemory,
+                               Completed };
+            std::shared_ptr<const DVRReplayTemplate> program;
+            unsigned uopIndex = 0;
+            OpClass opClass = SimdAluOp;
+            int8_t source0 = -1;
+            int8_t source1 = -1;
+            int8_t destination = -1;
+            Addr pc = 0;
+            std::array<uint64_t, 2> activeMask = {};
+            std::vector<unsigned> lanes;
+            unsigned chunksRemaining = 1;
+            Tick issueCycle = 0;
+            Tick completeCycle = 0;
+            State state = State::Decoded;
+        };
+        static constexpr unsigned VIRCapacity = 8;
         struct ReplayGeneration
         {
             std::shared_ptr<const DVRReplayTemplate> program;
@@ -1053,6 +1166,7 @@ class CPU : public BaseCPU
         std::deque<IssueEntry> issueQueue;
         std::deque<ReplayGeneration> replayGenerations;
         std::deque<ReplayLaneContext> replayLanes;
+        std::deque<DVRDynUop> virBuffer;
         std::array<Tick, ScoreboardRegisters> readyCycle = {};
 
         void reset()
@@ -1078,6 +1192,7 @@ class CPU : public BaseCPU
             issueQueue.clear();
             replayGenerations.clear();
             replayLanes.clear();
+            virBuffer.clear();
             readyCycle.fill(0);
         }
 
@@ -1109,6 +1224,7 @@ class CPU : public BaseCPU
             issueQueue.clear();
             replayGenerations.clear();
             replayLanes.clear();
+            virBuffer.clear();
             readyCycle.fill(0);
             state = fetchRemaining == 0 ? State::Idle : State::Fetch;
         }
@@ -1199,6 +1315,7 @@ class CPU : public BaseCPU
         {
             became_ready = 0;
             if (!sender.replay || sender.replay->count <= 1 ||
+                !sender.replay->helperRegs ||
                 sender.replay->triggerDestination < 0 ||
                 sender.replay->triggerDestination >=
                     DVRLoopBoundDetector::MaxArchitecturalIntRegs)
@@ -1218,6 +1335,9 @@ class CPU : public BaseCPU
             lane_context.tid = sender.tid;
             lane_context.triggerPC = sender.replay->triggerPC;
             lane_context.nested = sender.nested;
+            sender.replay->helperRegs->write(
+                sender.replay->triggerDestination, sender.lane,
+                source_value, 0);
             replayLanes.push_back(std::move(lane_context));
             became_ready = readyUops == 0 ? 1 : 0;
             if (became_ready != 0) {
@@ -1225,6 +1345,17 @@ class CPU : public BaseCPU
                 state = State::Running;
             }
             return true;
+        }
+
+        void retireCompletedVIR(Tick now)
+        {
+            for (auto it = virBuffer.begin(); it != virBuffer.end();) {
+                if (it->state == DVRDynUop::State::Completed &&
+                    it->completeCycle <= now)
+                    it = virBuffer.erase(it);
+                else
+                    ++it;
+            }
         }
 
         void refillIssueQueue()
