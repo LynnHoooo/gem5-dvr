@@ -1448,8 +1448,11 @@ class CPU : public BaseCPU
                         uop.semantic ==
                             DVRInstructionRecorder::Uop::Semantic::ShiftRightArithmeticWordImmediate) {
                         entry.kind = ComputeKind::Shift;
-                    } else if (uop.semantic ==
-                                   DVRInstructionRecorder::Uop::Semantic::Multiply) {
+                    } else if (
+                        uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::Multiply ||
+                        uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::MultiplyWord) {
                         entry.kind = ComputeKind::Multiply;
                     } else if (
                         uop.semantic ==

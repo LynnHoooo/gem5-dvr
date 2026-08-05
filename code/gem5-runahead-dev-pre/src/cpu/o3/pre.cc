@@ -441,6 +441,48 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
             return;
         }
 
+        // RV64C quadrant 1, funct3 100: compressed shifts, ANDI, and
+        // register logical operations.  These are common in compiler
+        // generated address/control paths and must not become a semantic
+        // fallback merely because they use a 16-bit encoding.
+        if (quadrant == 1 && funct3 == 4) {
+            const bool wide_register_op = ((compressed >> 12) & 0x1) != 0;
+            const unsigned op_select = (compressed >> 10) & 0x3;
+            if (op_select == 0) {
+                uop.semantic = Semantic::ShiftRightLogicalImmediate;
+                uop.immediate = ((compressed >> 12) & 0x1) << 5 |
+                    ((compressed >> 2) & 0x1f);
+                return;
+            }
+            if (op_select == 1) {
+                uop.semantic = Semantic::ShiftRightArithmeticImmediate;
+                uop.immediate = ((compressed >> 12) & 0x1) << 5 |
+                    ((compressed >> 2) & 0x1f);
+                return;
+            }
+            if (op_select == 2) {
+                uop.semantic = Semantic::AndImmediate;
+                uop.immediate = dvrSignExtend(
+                    (((compressed >> 12) & 0x1) << 5) |
+                    ((compressed >> 2) & 0x1f), 6);
+                return;
+            }
+            if (!wide_register_op && op_select == 3) {
+                switch ((compressed >> 5) & 0x3) {
+                  case 0: uop.semantic = Semantic::Sub; return;
+                  case 1: uop.semantic = Semantic::Xor; return;
+                  case 2: uop.semantic = Semantic::Or; return;
+                  case 3: uop.semantic = Semantic::And; return;
+                }
+            }
+            if (wide_register_op && op_select == 3) {
+                switch ((compressed >> 5) & 0x3) {
+                  case 0: uop.semantic = Semantic::SubWord; return;
+                  case 1: uop.semantic = Semantic::AddWord; return;
+                }
+            }
+        }
+
         // C.SLLI rd, shamt -- quadrant 2, funct3 000.
         if (quadrant == 2 && funct3 == 0 &&
             ((compressed >> 7) & 0x1f) != 0) {
@@ -496,6 +538,8 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
             uop.semantic = Semantic::AddWord;
         else if (funct3 == 0 && funct7 == 0x20)
             uop.semantic = Semantic::SubWord;
+        else if (funct3 == 0 && funct7 == 1)
+            uop.semantic = Semantic::MultiplyWord;
         return;
     }
 
@@ -634,6 +678,11 @@ DVRInstructionRecorder::Uop::evaluate(
         return true;
       case Semantic::Multiply:
         result = source0_value * source1_value;
+        return true;
+      case Semantic::MultiplyWord:
+        result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
+            static_cast<uint32_t>(source0_value) *
+            static_cast<uint32_t>(source1_value))));
         return true;
       case Semantic::AddWord:
         result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
@@ -846,7 +895,8 @@ DVRInstructionRecorder::resourceCounts() const
             ++resources.lsu;
             continue;
         }
-        if (uop.semantic == Uop::Semantic::Multiply) {
+        if (uop.semantic == Uop::Semantic::Multiply ||
+            uop.semantic == Uop::Semantic::MultiplyWord) {
             ++resources.multiply;
             continue;
         }
@@ -1098,6 +1148,12 @@ DVRVectorInstructionRegister::executeLanePC(
             if (!op.evaluate(lhs, rhs, value)) {
                 result.unsupportedControlFlow = true;
                 ++result.unsupportedSemanticLanes;
+                if (result.unsupportedSemanticPC == 0) {
+                    result.unsupportedSemanticPC = op.pc;
+                    result.unsupportedSemanticEncoding = op.encoding;
+                    result.unsupportedSemantic =
+                        static_cast<uint8_t>(op.semantic);
+                }
                 lane_active[lane] = false;
                 activeMask[lane / 64] &= ~(uint64_t(1) << (lane % 64));
                 continue;
@@ -1473,6 +1529,12 @@ DVRVectorInstructionRegister::resumeSourceLane(
         if (!op.evaluate(lhs, rhs, value)) {
             result.unsupportedControlFlow = true;
             ++result.unsupportedSemanticLanes;
+            if (result.unsupportedSemanticPC == 0) {
+                result.unsupportedSemanticPC = op.pc;
+                result.unsupportedSemanticEncoding = op.encoding;
+                result.unsupportedSemantic =
+                    static_cast<uint8_t>(op.semantic);
+            }
             laneActive[lane] = false;
             activeMask[lane / 64] &= ~(uint64_t(1) << (lane % 64));
             break;
@@ -1709,6 +1771,12 @@ DVRVectorInstructionRegister::resumeSourceLanes(
             if (!op.evaluate(lhs, rhs, value)) {
                 result.unsupportedControlFlow = true;
                 ++result.unsupportedSemanticLanes;
+                if (result.unsupportedSemanticPC == 0) {
+                    result.unsupportedSemanticPC = op.pc;
+                    result.unsupportedSemanticEncoding = op.encoding;
+                    result.unsupportedSemantic =
+                        static_cast<uint8_t>(op.semantic);
+                }
                 laneActive[candidate_lane] = false;
                 laneReady[candidate_lane] = false;
                 activeMask[candidate_lane / 64] &=

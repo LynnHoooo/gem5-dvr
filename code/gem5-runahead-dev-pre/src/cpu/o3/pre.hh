@@ -1,6 +1,7 @@
 #ifndef __CPU_O3_PRE_HH__
 #define __CPU_O3_PRE_HH__
 
+#include <algorithm>
 #include <array>
 #include <list>
 #include <optional>
@@ -188,6 +189,7 @@ class DVRInstructionRecorder
             ShiftRightLogical,
             ShiftRightArithmetic,
             Multiply,
+            MultiplyWord,
             AddWord,
             SubWord,
             AddImmediate,
@@ -266,6 +268,16 @@ class DVRInstructionRecorder
     /** Bind every conditional path to the DVR termination PC (the FLR). */
     void setReconvergencePC(Addr pc);
     void reset();
+    /**
+     * Limit a copied template to the trigger-to-FLR prefix used by the
+     * ordinary initial VIR audit.  Post-FLR control flow is kept in the
+     * persistent continuation template, but is not part of this bounded
+     * prefix unless the paper's divergent-path rule explicitly requires it.
+     */
+    void truncate(unsigned size)
+    {
+        count = std::min(count, size);
+    }
     unsigned size() const { return count; }
     bool overflow() const { return overflowed; }
     ResourceCounts resourceCounts() const;
@@ -357,6 +369,9 @@ class DVRVectorInstructionRegister
         unsigned alternatePathReconvergences = 0;
         unsigned pcGroups = 0;
         unsigned maxPCGroupLanes = 0;
+        Addr unsupportedSemanticPC = 0;
+        uint32_t unsupportedSemanticEncoding = 0;
+        uint8_t unsupportedSemantic = 0;
         bool timedOut = false;
         bool stackOverflow = false;
         // A lane selected a nonzero PC outside the captured recorder.

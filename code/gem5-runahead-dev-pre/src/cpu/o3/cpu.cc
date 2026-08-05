@@ -2260,9 +2260,34 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                     cpuStats.dvrVRATAllocations +=
                         dvrVectorRenameTable.build(
                             dvrInstructionRecorder, inference.lanes);
+                    // The ordinary initial VIR pass audits the same
+                    // trigger-to-FLR region that the paper vectorizes.  A
+                    // branch between FLR and LCR is the documented exception:
+                    // retain the full template so divergent lanes can keep
+                    // exploring toward the next stride PC.
+                    DVRInstructionRecorder vir_program =
+                        dvrInstructionRecorder;
+                    unsigned initial_vir_size = 0;
+                    for (unsigned index = 1;
+                         index < vir_program.size(); ++index) {
+                        if (vir_program[index].load)
+                            initial_vir_size = index + 1;
+                    }
+                    const Addr lcr_pc = dvrLoopBoundDetector.branchPC();
+                    bool continue_past_flr = false;
+                    for (unsigned index = initial_vir_size;
+                         index < vir_program.size(); ++index) {
+                        if (vir_program[index].conditional &&
+                            vir_program[index].pc != lcr_pc) {
+                            continue_past_flr = true;
+                            break;
+                        }
+                    }
+                    if (!continue_past_flr && initial_vir_size > 1)
+                        vir_program.truncate(initial_vir_size);
                     const auto vir_result =
                         dvrVectorInstructionRegister.execute(
-                            dvrInstructionRecorder, inference.lanes,
+                            vir_program, inference.lanes,
                             dvrHelperMaxUops, dvrDiscoveryStartRegs);
                     cpuStats.dvrVIRChunkIssues +=
                         vir_result.chunkIssues;
@@ -2280,6 +2305,14 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                         vir_result.externalPathLanes;
                     cpuStats.dvrVIRUnsupportedSemanticLanes +=
                         vir_result.unsupportedSemanticLanes;
+                    if (vir_result.unsupportedSemanticLanes != 0) {
+                        dvrTraceVector(
+                            "initial_vir_unsupported", curTick(),
+                            vir_result.unsupportedSemanticPC,
+                            vir_result.unsupportedSemanticEncoding,
+                            vir_result.unsupportedSemanticLanes,
+                            vir_result.unsupportedSemantic);
+                    }
                     cpuStats.dvrAlternatePathUopsReplayed +=
                         vir_result.alternatePathUops;
                     cpuStats.dvrReconvergenceResumeSuccesses +=
@@ -2736,6 +2769,14 @@ CPU::completeDVRNestedContext(
         cpuStats.dvrVIRExternalPathLanes += vir_result.externalPathLanes;
         cpuStats.dvrVIRUnsupportedSemanticLanes +=
             vir_result.unsupportedSemanticLanes;
+        if (vir_result.unsupportedSemanticLanes != 0) {
+            dvrTraceVector(
+                "nested_vir_unsupported", curTick(),
+                vir_result.unsupportedSemanticPC,
+                vir_result.unsupportedSemanticEncoding,
+                vir_result.unsupportedSemanticLanes,
+                vir_result.unsupportedSemantic);
+        }
         cpuStats.dvrAlternatePathUopsReplayed +=
             vir_result.alternatePathUops;
         cpuStats.dvrReconvergenceResumeSuccesses +=
@@ -3194,7 +3235,8 @@ CPU::issueDVRReplayLanes(unsigned slots)
         uop.semantic == Semantic::LoadWordUnsigned ||
         uop.semantic == Semantic::LoadDouble;
     const OpClass op_class = is_shift ? SimdShiftOp :
-        (uop.semantic == Semantic::Multiply ? SimdMultOp :
+        ((uop.semantic == Semantic::Multiply ||
+          uop.semantic == Semantic::MultiplyWord) ? SimdMultOp :
          (is_add ? SimdAddOp : SimdAluOp));
     ++cpuStats.dvrHelperFURequests;
     ++cpuStats.dvrVectorChunkRequests;
@@ -3265,7 +3307,8 @@ CPU::issueDVRReplayLanes(unsigned slots)
         ++cpuStats.dvrVectorAddChunkIssues;
     if (is_shift)
         ++cpuStats.dvrVectorShiftChunkIssues;
-    else if (uop.semantic == DVRInstructionRecorder::Uop::Semantic::Multiply)
+    else if (uop.semantic == DVRInstructionRecorder::Uop::Semantic::Multiply ||
+             uop.semantic == DVRInstructionRecorder::Uop::Semantic::MultiplyWord)
         ++cpuStats.dvrVectorMultiplyChunkIssues;
     else
         ++cpuStats.dvrVectorALUChunkIssues;
@@ -3779,6 +3822,14 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
                 response.externalPathLanes;
             cpuStats.dvrVIRSourceValueSemanticFailures +=
                 response.unsupportedSemanticLanes;
+            if (response.unsupportedSemanticLanes != 0) {
+                dvrTraceVector(
+                    "source_vir_unsupported", curTick(),
+                    response.unsupportedSemanticPC,
+                    response.unsupportedSemanticEncoding,
+                    response.unsupportedSemanticLanes,
+                    response.unsupportedSemantic);
+            }
             cpuStats.dvrAlternatePathUopsReplayed +=
                 response.alternatePathUops;
             cpuStats.dvrReconvergenceResumeSuccesses +=

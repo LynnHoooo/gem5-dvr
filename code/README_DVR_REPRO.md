@@ -635,8 +635,9 @@ unlimited vector FU，避免把资源模型变化误认为算法收益。
 
 #### 9.3.4 逐 lane evaluator 的 opcode 覆盖过窄
 
-当前已支持 `ADD/SUB/ADDW/SUBW`、立即数和逻辑/shift/MUL 子集，以及
-`LB/LH/LW/LWU/LD` 的宽度和扩展语义；RVC 测试覆盖 `C.ADD/C.SLLI/C.LW/C.LD`。
+当前已支持 `ADD/SUB/ADDW/SUBW`、`MUL/MULW`、立即数和逻辑/shift 子集，以及
+`LB/LH/LW/LWU/LD` 的宽度和扩展语义；RVC 测试覆盖
+`C.ADD/C.SUB/C.XOR/C.OR/C.AND/C.SLLI/C.SRLI/C.SRAI/C.ANDI/C.LW/C.LD`。
 不支持的 uop 会使 replay invalid，并回退到 learned
 仿射地址 relation。
 
@@ -646,7 +647,7 @@ unlimited vector FU，避免把资源模型变化误认为算法收益。
 - `AND/OR/XOR`；
 - `SLL/SRL/SRA` 及 immediate/word variants；
 - 尚未覆盖 `LBU/LHU` 以及更多 load/value 组合；
-- `MUL`；
+- 更多 `MUL/MULW` 组合；
 - 更多 RVC 地址生成形式。
 
 如果真实 workload 大量回退，实验主要验证的是 relation predictor，而不是 DVR
@@ -1288,8 +1289,8 @@ flattened lanes）。
 
 服务器最新提交上已扩展 `DVRInstructionRecorder::Semantic` 和逐 lane evaluator，
 新增 RV64 常见整数数据流：`SUB`、寄存器 `AND/OR/XOR`、寄存器移位
-`SLL/SRL/SRA`、`MUL`，以及 `ORI/XORI/SRLI/SRAI`。二元语义现在显式读取第二个
-source register；未覆盖指令仍返回 `Unsupported`，不会静默近似。
+`SLL/SRL/SRA`、`MUL/MULW`，以及 `ORI/XORI/SRLI/SRAI`。二元语义现在显式读取
+第二个 source register；未覆盖指令仍返回 `Unsupported`，不会静默近似。
 
 固定 Python 3.11/Nix 环境重新编译成功，Stage15 资源验证通过：
 
@@ -1300,9 +1301,10 @@ main_issue=2003631 main_thread_suppressed=242974 dvr_issued=94199
 ```
 
 这完成了 P0 evaluator 的第一批可审计扩展。当前源码已经包含
-`ADDW/SUBW`、word shift、`LB/LH/LW/LWU/LD` 的 evaluator/replay 分支；但真实
-memory request 的 load width、sign/zero extension、RVC 变体、完整 branch path
-evaluator 和严格的论文 NDM branch inversion 仍然需要独立验收。当前 P0 状态应记录为：
+`ADDW/SUBW`、`MULW`、word shift、`LB/LH/LW/LWU/LD` 以及一组 RV64C 逻辑/移位
+指令的 evaluator/replay 分支；但 `LBU/LHU`、更完整的 load/value 组合、完整
+branch path evaluator 和严格的论文 NDM branch inversion 仍然需要独立验收。当前
+P0 状态应记录为：
 
 - Stage13 一键回归：已完成；
 - GAP 五 workload 六模式实验：已完成；
@@ -1550,24 +1552,24 @@ late 较高                         = 预取发出过晚，不能及时隐藏 mi
 
 ```text
 RPT candidates                 8546
-Discovery starts/completions   2082/2074
-discoveries with FLR           2055
+Discovery starts/completions   2148/2065
+discoveries with FLR           2031
 loop-bound matches             2024
 source/dependent lanes         184120/8475
 VRAT programs/writes           2024/368240
 DynUop decoded/issued/done     205098/205098/205098
 VIR mask checks/failures       205098/0
+initial VIR unsupported        0/0 (control/semantic)
 multi-lane max group           8
 source/dependent issued/done   184120/184120, 8475/8475
 Full Vector speedup            1.034017x
 ```
 
 因此可以得出：Camel 已经验证普通 DVR data path 有实际执行和约 `1.034x`
-性能收益；它没有验证 NDM flatten，也没有验证主线程 SIMD 与 helper 的 FU
-竞争。当前 Camel 的 initial VIR audit 仍会对部分 captured semantic 产生
-unsupported 计数，并通过显式 source-helper control fallback 继续执行；这部分
-不能宣称为完整 initial VIR 语义覆盖。不过 persistent continuation 的 fallback、
-timeout 和 stack overflow 都应为 0，且本轮满足这一条件。另有 1 次 recorder
-overflow，应在后续长模板实验中消除。当前结果最准确的命名仍是
+性能收益；本轮 initial VIR audit 的 control/semantic failure 都是 0，且
+source-helper control fallback、persistent continuation fallback、timeout 和
+stack overflow 都是 0。它没有验证 NDM flatten，也没有验证主线程 SIMD 与
+helper 的 FU 竞争。另有 1 次 recorder overflow，应在后续长模板实验中消除。
+当前结果最准确的命名仍是
 `DVR-Offload+Discovery` 或 `ISA-adapted execution-driven DVR`，不是完整
 Sniper/DynInst bit-exact reproduction。
