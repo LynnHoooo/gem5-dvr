@@ -66,7 +66,7 @@ def write_svg(rows):
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" '
         'viewBox="0 0 %d %d">' % (width, height, width, height),
-        '<rect width="100%%" height="100%%" fill="#ffffff"/>',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
         '<text x="%d" y="30" font-family="sans-serif" font-size="20" '
         'font-weight="600">DVR performance normalized to baseline OoO</text>' % left,
         '<text transform="translate(20 %d) rotate(-90)" font-family="sans-serif" '
