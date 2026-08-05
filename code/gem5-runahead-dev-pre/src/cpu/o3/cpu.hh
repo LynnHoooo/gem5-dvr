@@ -730,6 +730,10 @@ class CPU : public BaseCPU
         statistics::Scalar dvrVectorShiftChunkIssues;
         statistics::Scalar dvrVectorMultiplyChunkIssues;
         statistics::Scalar dvrVectorChunkRequests;
+        statistics::Scalar dvrVectorizerSourceLanes;
+        statistics::Scalar dvrVectorizerDependentLanes;
+        statistics::Scalar dvrVIRActiveMaskChecks;
+        statistics::Scalar dvrVIRActiveMaskFailures;
         statistics::Scalar dvrVectorFUConflictCycles;
         statistics::Scalar dvrVectorLatencyCycles;
         statistics::Scalar dvrVectorComputeWaitCycles;
@@ -1371,15 +1375,20 @@ class CPU : public BaseCPU
             return true;
         }
 
-        void retireCompletedVIR(Tick now)
+        unsigned retireCompletedVIR(Tick now)
         {
+            unsigned retired = 0;
             for (auto it = virBuffer.begin(); it != virBuffer.end();) {
-                if (it->state == DVRDynUop::State::Completed &&
-                    it->completeCycle <= now)
+                if (it->state == DVRDynUop::State::Issued &&
+                    it->completeCycle <= now) {
+                    it->state = DVRDynUop::State::Completed;
+                    ++retired;
                     it = virBuffer.erase(it);
-                else
+                } else {
                     ++it;
+                }
             }
+            return retired;
         }
 
         void refillIssueQueue()

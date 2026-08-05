@@ -682,6 +682,14 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "DVR vector multiply chunks issued"),
       ADD_STAT(dvrVectorChunkRequests, statistics::units::Count::get(),
                "DVR vector chunks requesting a shared FU"),
+      ADD_STAT(dvrVectorizerSourceLanes, statistics::units::Count::get(),
+               "Source lanes materialized by the DVR vectorizer"),
+      ADD_STAT(dvrVectorizerDependentLanes, statistics::units::Count::get(),
+               "Dependent lanes materialized by the DVR vectorizer"),
+      ADD_STAT(dvrVIRActiveMaskChecks, statistics::units::Count::get(),
+               "VIR issue groups checked against their active lane mask"),
+      ADD_STAT(dvrVIRActiveMaskFailures, statistics::units::Count::get(),
+               "VIR issue groups whose active mask disagreed with the lane group"),
       ADD_STAT(dvrVectorFUConflictCycles, statistics::units::Cycle::get(),
                "Cycles with a constrained DVR vector FU conflict"),
       ADD_STAT(dvrVectorLatencyCycles, statistics::units::Cycle::get(),
@@ -1028,6 +1036,9 @@ CPU::tick()
     dvrMainIssuesThisCycle = 0;
     dvrMainALUIssuesThisCycle = 0;
     dvrMainLSUIssuesThisCycle = 0;
+    if (dvrVectorChunkModel)
+        cpuStats.dvrHelperDynUopsCompleted +=
+            dvrHelperThread.retireCompletedVIR(curTick());
 
 //    activity = false;
 
@@ -2622,6 +2633,9 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
         dvrPrefetchQueue.push_back(prefetch);
         dvrQueuedPrefetchAddresses.insert(prefetch.address);
         ++cpuStats.dvrPrefetchesGenerated;
+        ++cpuStats.dvrVectorizerSourceLanes;
+        dvrTraceVector("source_lane", curTick(), pc, address, 1,
+                       static_cast<int>(prefetch.lane));
     }
     updateDVRPrefetchQueuePeak();
 }
@@ -2648,6 +2662,9 @@ CPU::launchDVRVectorRunahead(ThreadID tid, Addr current_address,
         dvrPrefetchQueue.push_back(prefetch);
         dvrQueuedPrefetchAddresses.insert(prefetch.address);
         ++cpuStats.dvrPrefetchesGenerated;
+        ++cpuStats.dvrVectorizerDependentLanes;
+        dvrTraceVector("vr_lane", curTick(), pc, prefetch.address, 1,
+                       static_cast<int>(prefetch.lane));
     }
     updateDVRPrefetchQueuePeak();
 }
@@ -2947,6 +2964,7 @@ CPU::launchDVRNestedPrefetches(
         dvrQueuedPrefetchAddresses.insert(prefetch.address);
         ++cpuStats.dvrPrefetchesGenerated;
         ++cpuStats.dvrNestedHelpersGenerated;
+        ++cpuStats.dvrVectorizerSourceLanes;
         dvrTraceVector("nested_source_lane", curTick(), prefetch.pc,
             prefetch.address, 1, static_cast<int>(flat_lane));
       }
@@ -3045,7 +3063,6 @@ CPU::issueDVRReplayLanes(unsigned slots)
         dvrHelperThread.replayLanes.empty())
         return 0;
 
-    dvrHelperThread.retireCompletedVIR(curTick());
     if (dvrHelperThread.virBuffer.size() >=
         DVRHelperThread::VIRCapacity) {
         ++cpuStats.dvrHelperVIRCapacityStalls;
@@ -3182,6 +3199,15 @@ CPU::issueDVRReplayLanes(unsigned slots)
             dyn_uop.activeMask[lane->lane / 64] |=
                 uint64_t(1) << (lane->lane % 64);
     }
+    ++cpuStats.dvrVIRActiveMaskChecks;
+    const unsigned mask_lanes =
+        __builtin_popcountll(dyn_uop.activeMask[0]) +
+        __builtin_popcountll(dyn_uop.activeMask[1]);
+    if (mask_lanes != group.size())
+        ++cpuStats.dvrVIRActiveMaskFailures;
+    dvrTraceVector("vir_issue_group", curTick(), uop.pc, 0,
+                   static_cast<int>(group.size()),
+                   static_cast<int>(seed->lane));
     dvrHelperThread.virBuffer.push_back(std::move(dyn_uop));
     auto &issued_dyn_uop = dvrHelperThread.virBuffer.back();
     ++cpuStats.dvrHelperDynUopsDecoded;
@@ -3332,6 +3358,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
                 updateDVRPrefetchQueuePeak();
                 ++cpuStats.dvrDependentPrefetchesGenerated;
                 ++cpuStats.dvrReplayTargetsGenerated;
+                ++cpuStats.dvrVectorizerDependentLanes;
                 ++cpuStats.dvrPredicateSelections;
                 dvrTraceDependency("replay_target", curTick(),
                     lane->triggerPC, lane_uop.pc, result,
@@ -3362,8 +3389,8 @@ CPU::issueDVRReplayLanes(unsigned slots)
             lane->uopIndex = findPC(lane->program, lane->lanePC);
     }
     issued_dyn_uop.completeCycle = ready_tick;
-    issued_dyn_uop.state = DVRHelperThread::DVRDynUop::State::Completed;
-    ++cpuStats.dvrHelperDynUopsCompleted;
+    // Completion is accounted for by retireCompletedVIR() at completeCycle;
+    // the uop remains in the VIR while its modeled FU latency elapses.
     for (auto it = dvrHelperThread.replayLanes.begin();
          it != dvrHelperThread.replayLanes.end();) {
         if (!it->active)

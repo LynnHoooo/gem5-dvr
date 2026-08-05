@@ -1445,3 +1445,63 @@ flattened_lanes=14478、replay_targets=3531、helper completed=9649，守恒失�
 而不是直接把所有 Full/Nested 结果标为完整论文 DVR。只有简单间接 workload
 出现稳定、可解释的正收益，并且 outstanding misses、coverage、timeliness 和
 资源竞争都与收益一致后，才升级命名和论文结论。
+
+### 18.1 Camel Figure 3 架构验收（2026-08-05）
+
+使用当前 `gem5-dvr-next` 构建和
+`camel-dvr-trace-c_lw-full/camel.riscv`，验收脚本为：
+
+```bash
+BENCH=/home/lynnhoo/dvr-repro/results/camel-dvr-trace-c_lw-full/camel.riscv \
+  bash scripts/run_remote_dvr_camel_arch_check.sh
+```
+
+脚本不只比较最终结果，还检查 `Result`、`committedInsts`、VRAT/VIR/UOP
+守恒和 `DVR_TRACE_DIR` 生成的地址链。最近一次结果：
+
+```text
+Result                              33888308
+baseline simTicks                  208039500
+Full Vector simTicks               201195500
+Full Vector speedup                    1.034017x
+vectorizer source lanes               184120
+vectorizer dependent lanes              8475
+helper DynUops decoded/issued/completed 205098/205098/205098
+private VRAT programs/writes          2024/368240
+VIR active-mask checks/failures       205098/0
+maximum same-PC VIR group width             8
+dependent requests issued/completed    8475/8475
+possibly-useful / late prefetches    11416/175
+dependent demand covered / late       8149/3
+peak outstanding DVR lines               19
+```
+
+这组结果证明 Camel 中确实走过以下普通 DVR 数据路径：
+
+```text
+RPT candidate
+  -> Discovery + loop bound
+  -> source vector lanes
+  -> real source ReadReq through LSQ/cache
+  -> source value written to private VRAT lane
+  -> same-PC ready lanes grouped by VIR
+  -> helper DynUop uses native SimdAlu FU reservation
+  -> dependent replay target
+  -> real dependent SoftPFReq through LSQ/cache
+```
+
+`vectorization.csv` 与 `dependency_chain.csv` 还会检查：每个 VIR trace group
+不超过 8 个 64-bit elements；每个 dependent target 都有同一 trigger/lane
+更早到达的真实 `source_value`；source lane 的 lane 编号和 Camel 8-byte 地址
+对齐有效。所有消融模式的程序结果和 committed instructions 保持一致。
+
+该 Camel 程序没有短 inner-loop 的 outer invocation 结构，因此
+`nested_flatten_batches=0` 是预期结果，不能用它验收 NDM；NDM 仍由
+`run_remote_dvr_helper_regression.sh` 的 Nested microbenchmark 验收。
+
+同时，Camel 主线程没有使用 SIMD 指令，所以 `dvrVectorFUConflictCycles=0`，
+且 constrained/unlimited vector-FU 两次结果相同。这不表示资源模型已经验证了
+主线程 SIMD 竞争，只表示该 workload 没有提供这条证据。helper uop 使用的是
+独立 `DVRDynUop -> VIR -> IEW::tryIssueDVRHelperFU -> FUPool` 路径；它仍不进入
+主线程 `DynInst -> rename -> IQ -> ROB -> commit`，因此这里的结论是
+“ISA-adapted execution-driven helper”，不是 bit-exact 的 Sniper DVR。
