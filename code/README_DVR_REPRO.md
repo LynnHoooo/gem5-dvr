@@ -1284,7 +1284,8 @@ evaluator 和严格的论文 NDM branch inversion 仍然需要独立验收。当
 - Stage13 一键回归：已完成；
 - GAP 五 workload 六模式实验：已完成；
 - evaluator 常见整数语义：已扩展并编译/Stage15 验证；
-- 完整论文 NDM 与真实 FU pipeline：尚未完成。
+- 完整论文 NDM、branch inversion 和 shared fetch/decode contention：尚未完成；
+  普通 DVR 的独立 VIR/VRAT helper 路径已完成初步接入。
 
 ## 17. O3 pipeline 接入状态
 
@@ -1320,12 +1321,53 @@ helper_fetch=9394 helper_decode=9641 helper_compute=25288
 helper_issue_cycles=10414 dvr_issued=10414
 ```
 
-因此当前可以称为 **ISA-adapted, O3-pipeline-integrated helper resource and
-LSQ path**。边界仍需准确保留：helper 尚未作为真实 `DynInst` 插入主线程的
-fetch/decode queues、IQ、ROB 或 commit；其 captured evaluator 仍由 DVR 专用
-状态机驱动，native O3 FU/LSQ 是接入的资源和 memory lifetime 后端。下一阶段若
-要达到论文级完整 helper，需要建立 helper-owned `DynInst`/IQ 生命周期、真实
-依赖 wakeup、FU completion/writeback 和独立 helper squash/recovery。
+因此当前可以称为 **ISA-adapted, execution-driven, in-order vector helper
+with private VIR/VRAT and O3 FU/LSQ timing**。边界仍需准确保留：helper 不进入
+主线程的 `DynInst`、IQ、ROB 或 commit；这是符合论文独立 in-order subthread
+边界的选择。当前 helper 的 front-end 仍从 committed replay template 建立，尚未
+完成论文级的 decoded front-end buffer 和主线程 fetch/decode bandwidth arbitration。
+
+### 17.1 M1-M4：独立 helper 指令与私有 VIR/VRAT
+
+当前普通 DVR source-response 路径已不再直接调用旧的 evaluator 生成 dependent
+地址，而是经过以下对象和状态：
+
+```text
+source response
+  -> ReplayLaneContext
+  -> private DVRHelperVectorRegisterFile / VRAT
+  -> DVRDynUop (Decoded -> Ready -> Issued -> Completed)
+  -> finite VIR buffer (8 entries)
+  -> shared SimdAlu/SimdShift/SimdMult FU
+  -> dependent LSQ/cache request
+```
+
+对应实现位于 `src/cpu/o3/cpu.hh/.cc`：
+
+- `DVRHelperVectorRegisterFile`：每个 replay program 私有的架构寄存器到
+  helper vector physical register 映射、lane value、valid/ready 状态；不使用主线程
+  的物理寄存器文件，也不产生 commit 状态；
+- `DVRHelperThread::DVRDynUop`：保存 PC、operand、active lane mask、chunk 数量、
+  issue/complete tick 和生命周期状态；
+- `DVRHelperThread::virBuffer`：有限 8-entry 的 in-order VIR buffer；
+- `CPU::issueDVRReplayLanes()`：按相同 PC/uop 和 ready lane 形成最多 512-bit chunk，
+  预约原生 FU，并在完成地址计算后提交 dependent request。
+
+Camel 验收结果：
+
+```text
+dvrHelperDynUopsDecoded       2,212,641
+dvrHelperDynUopsIssued        2,212,641
+dvrHelperDynUopsCompleted     2,212,641
+dvrHelperVRATPrograms            17,251
+dvrHelperVRATWrites           3,942,774
+dvrVIRContinuationMaxGroupWidth        8
+dvrDependentDemandCovered        65,495
+dvrDependentDemandLate                 1
+```
+
+该路径仍需继续完成 M5 的显式 helper/main fetch-decode 仲裁、完整 branch
+divergence/reconvergence 和 NDM，不能描述为 Sniper 论文实现的 bit-exact reproduction。
 
 ## 18. DVR 第一阶段原配置锚定与 NDM 端到端验收
 

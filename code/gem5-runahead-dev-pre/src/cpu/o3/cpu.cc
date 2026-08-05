@@ -630,6 +630,18 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Captured helper uops that became ready"),
       ADD_STAT(dvrHelperUopsIssued, statistics::units::Count::get(),
                "Captured helper uops successfully issued"),
+      ADD_STAT(dvrHelperDynUopsDecoded, statistics::units::Count::get(),
+               "Helper-owned DVRDynUops admitted to the VIR"),
+      ADD_STAT(dvrHelperDynUopsIssued, statistics::units::Count::get(),
+               "Helper-owned DVRDynUops issued to a shared FU"),
+      ADD_STAT(dvrHelperDynUopsCompleted, statistics::units::Count::get(),
+               "Helper-owned DVRDynUops completed"),
+      ADD_STAT(dvrHelperVIRCapacityStalls, statistics::units::Count::get(),
+               "Helper uops blocked by the finite VIR capacity"),
+      ADD_STAT(dvrHelperVRATPrograms, statistics::units::Count::get(),
+               "Replay programs initialized with a private helper VRAT"),
+      ADD_STAT(dvrHelperVRATWrites, statistics::units::Count::get(),
+               "Lane writes into private helper vector registers"),
       ADD_STAT(dvrHelperReadyUopCycles, statistics::units::Count::get(),
                "Sum of helper ready-queue occupancy across sampled cycles"),
       ADD_STAT(dvrHelperReadyOccupancySamples,
@@ -2500,6 +2512,9 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
     // the source address and the non-trigger inputs belong to different
     // dynamic iterations.
     replay->initialRegs = finish_regs;
+    replay->helperRegs = std::make_shared<DVRHelperVectorRegisterFile>();
+    replay->helperRegs->initialize(replay->initialRegs);
+    ++cpuStats.dvrHelperVRATPrograms;
     if (replay->count != 0) {
         replay->triggerDestination = dvrInstructionRecorder[0].destination;
         replay->valid = replay->scalarCount > 1 &&
@@ -2751,6 +2766,9 @@ CPU::launchDVRNestedPrefetches(
         }
     }
     replay->initialRegs = finish_regs;
+    replay->helperRegs = std::make_shared<DVRHelperVectorRegisterFile>();
+    replay->helperRegs->initialize(replay->initialRegs);
+    ++cpuStats.dvrHelperVRATPrograms;
     if (replay->count != 0) {
         replay->triggerDestination =
             dvrNestedContext.recorder[0].destination;
@@ -3003,6 +3021,13 @@ CPU::issueDVRReplayLanes(unsigned slots)
         dvrHelperThread.replayLanes.empty())
         return 0;
 
+    dvrHelperThread.retireCompletedVIR(curTick());
+    if (dvrHelperThread.virBuffer.size() >=
+        DVRHelperThread::VIRCapacity) {
+        ++cpuStats.dvrHelperVIRCapacityStalls;
+        return 0;
+    }
+
     for (auto it = dvrHelperThread.replayLanes.begin();
          it != dvrHelperThread.replayLanes.end();) {
         if (!it->active || !it->program ||
@@ -3023,12 +3048,16 @@ CPU::issueDVRReplayLanes(unsigned slots)
             lane.uopIndex >= lane.program->count)
             continue;
         const auto &uop = lane.program->uops[lane.uopIndex];
+        const unsigned lane_id = lane.lane;
+        const auto &helper_regs = lane.program->helperRegs;
         const bool source0_ready = uop.source0 < 0 ||
             uop.source0 >= DVRLoopBoundDetector::MaxArchitecturalIntRegs ||
-            lane.readyCycle[uop.source0] <= curTick();
+            (helper_regs ? helper_regs->readyAt(uop.source0, lane_id) :
+             lane.readyCycle[uop.source0]) <= curTick();
         const bool source1_ready = uop.source1 < 0 ||
             uop.source1 >= DVRLoopBoundDetector::MaxArchitecturalIntRegs ||
-            lane.readyCycle[uop.source1] <= curTick();
+            (helper_regs ? helper_regs->readyAt(uop.source1, lane_id) :
+             lane.readyCycle[uop.source1]) <= curTick();
         if (!source0_ready || !source1_ready)
             continue;
         if (!seed) {
@@ -3081,6 +3110,28 @@ CPU::issueDVRReplayLanes(unsigned slots)
 
     const Tick ready_tick = curTick() +
         static_cast<uint64_t>(latency) * clockPeriod();
+    DVRHelperThread::DVRDynUop dyn_uop;
+    dyn_uop.program = seed->program;
+    dyn_uop.uopIndex = seed->uopIndex;
+    dyn_uop.opClass = op_class;
+    dyn_uop.source0 = uop.source0;
+    dyn_uop.source1 = uop.source1;
+    dyn_uop.destination = uop.destination;
+    dyn_uop.pc = uop.pc;
+    dyn_uop.issueCycle = curTick();
+    dyn_uop.state = DVRHelperThread::DVRDynUop::State::Ready;
+    dyn_uop.lanes.reserve(group.size());
+    for (Lane *lane : group) {
+        dyn_uop.lanes.push_back(lane->lane);
+        if (lane->lane < DVRHelperVectorRegisterFile::MaxLanes)
+            dyn_uop.activeMask[lane->lane / 64] |=
+                uint64_t(1) << (lane->lane % 64);
+    }
+    dvrHelperThread.virBuffer.push_back(std::move(dyn_uop));
+    auto &issued_dyn_uop = dvrHelperThread.virBuffer.back();
+    ++cpuStats.dvrHelperDynUopsDecoded;
+    issued_dyn_uop.state = DVRHelperThread::DVRDynUop::State::Issued;
+    ++cpuStats.dvrHelperDynUopsIssued;
     dvrHelperThread.issueReplayChunk(ready_tick);
     --slots;
     ++cpuStats.dvrHelperUopsIssued;
@@ -3098,10 +3149,14 @@ CPU::issueDVRReplayLanes(unsigned slots)
         const auto &lane_uop = lane->program->uops[lane->uopIndex];
         const RegVal source0 = lane_uop.source0 >= 0 &&
             lane_uop.source0 < DVRLoopBoundDetector::MaxArchitecturalIntRegs ?
-            lane->regs[lane_uop.source0] : 0;
+            (lane->program->helperRegs ?
+             lane->program->helperRegs->read(lane_uop.source0, lane->lane) :
+             lane->regs[lane_uop.source0]) : 0;
         const RegVal source1 = lane_uop.source1 >= 0 &&
             lane_uop.source1 < DVRLoopBoundDetector::MaxArchitecturalIntRegs ?
-            lane->regs[lane_uop.source1] : 0;
+            (lane->program->helperRegs ?
+             lane->program->helperRegs->read(lane_uop.source1, lane->lane) :
+             lane->regs[lane_uop.source1]) : 0;
         RegVal result = 0;
         bool valid = true;
         if (lane_uop.conditional) {
@@ -3127,11 +3182,17 @@ CPU::issueDVRReplayLanes(unsigned slots)
             for (unsigned relation = 0; relation < lane->relationCount;
                  ++relation) {
                 if (lane->relationCount > 1 &&
-                    (lane->regs[seed->program->triggerDestination] &
+                    ((lane->program->helperRegs ?
+                      lane->program->helperRegs->read(
+                          seed->program->triggerDestination, lane->lane) :
+                      lane->regs[seed->program->triggerDestination]) &
                      lane->masks[relation]) != lane->patterns[relation])
                     continue;
                 const int64_t expected = lane->scales[relation] *
                     static_cast<int64_t>(
+                        lane->program->helperRegs ?
+                        lane->program->helperRegs->read(
+                            seed->program->triggerDestination, lane->lane) :
                         lane->regs[seed->program->triggerDestination]) +
                     lane->offsets[relation];
                 if (expected == static_cast<int64_t>(result)) {
@@ -3184,12 +3245,19 @@ CPU::issueDVRReplayLanes(unsigned slots)
             lane_uop.destination < DVRLoopBoundDetector::MaxArchitecturalIntRegs) {
             lane->regs[lane_uop.destination] = result;
             lane->readyCycle[lane_uop.destination] = ready_tick;
+            if (lane->program->helperRegs)
+                lane->program->helperRegs->write(
+                    lane_uop.destination, lane->lane, result, ready_tick);
+            ++cpuStats.dvrHelperVRATWrites;
         }
         lane->regs[0] = 0;
         ++lane->uopIndex;
         if (lane->uopIndex >= lane->program->count)
             lane->active = false;
     }
+    issued_dyn_uop.completeCycle = ready_tick;
+    issued_dyn_uop.state = DVRHelperThread::DVRDynUop::State::Completed;
+    ++cpuStats.dvrHelperDynUopsCompleted;
     for (auto it = dvrHelperThread.replayLanes.begin();
          it != dvrHelperThread.replayLanes.end();) {
         if (!it->active)
