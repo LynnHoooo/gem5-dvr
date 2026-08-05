@@ -55,6 +55,7 @@ class CommitPolicy(ScopedEnum):
     vals = [ 'RoundRobin', 'OldestReady' ]
 
 class BaseO3CPU(BaseCPU):
+    dvr_icache_port = RequestPort("DVR helper instruction-cache port")
     type = 'BaseO3CPU'
     cxx_class = 'gem5::o3::CPU'
     cxx_header = 'cpu/o3/dyn_inst.hh'
@@ -176,6 +177,12 @@ class BaseO3CPU(BaseCPU):
     enablePREEarlyRecycle = Param.Bool(False, "Enable register early recycle "
                                        "in PRE")
     enableDVR = Param.Bool(False, "启用 DVR 发现阶段")
+    oraclePrefetch = Param.Bool(False,
+        "Prefetch future committed load addresses from an oracle trace")
+    oracleTraceFile = Param.String("",
+        "CSV trace containing future committed load addresses")
+    oracleLookahead = Param.Unsigned(32,
+        "Number of future load addresses exposed by the oracle")
     dvrMode = Param.String("nested",
         "DVR ablation mode: vr, offload, discovery, full, or nested")
     dvrRPTEntries = Param.Unsigned(32, "DVR 步幅检测表项数")

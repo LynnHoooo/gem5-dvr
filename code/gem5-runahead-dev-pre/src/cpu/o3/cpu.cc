@@ -44,7 +44,10 @@
 
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <limits>
+#include <fstream>
+#include <string>
 
 #include "mem/packet_access.hh"
 
@@ -92,7 +95,7 @@ namespace o3
 {
 
 CPU::DVRPrefetchSenderState::DVRPrefetchSenderState(
-    bool is_source, bool is_nested, unsigned relation_count,
+    bool is_source, bool is_nested, bool is_oracle, unsigned relation_count,
     const std::array<int64_t, MaxRelations> &relation_scales,
     const std::array<int64_t, MaxRelations> &relation_offsets,
     const std::array<RegVal, MaxRelations> &relation_masks,
@@ -101,7 +104,8 @@ CPU::DVRPrefetchSenderState::DVRPrefetchSenderState(
     std::shared_ptr<DVRPredicateGeneration> predicate_generation,
     unsigned lane_id,
     ThreadID thread)
-    : source(is_source), nested(is_nested), relationCount(relation_count),
+    : source(is_source), nested(is_nested), oracle(is_oracle),
+      relationCount(relation_count),
       scales(relation_scales), offsets(relation_offsets),
       masks(relation_masks), patterns(relation_patterns),
       replay(std::move(replay_template)),
@@ -120,6 +124,7 @@ CPU::CPU(const BaseO3CPUParams &params)
       instcount(0),
 #endif
       removeInstsThisCycle(false),
+      dvrInstructionPort(this),
       fetch(this, params),
       decode(this, params),
       rename(this, params),
@@ -169,6 +174,9 @@ CPU::CPU(const BaseO3CPUParams &params)
       dvrMaxLanes(params.dvrMaxLanes),
       dvrHelperMaxUops(params.dvrHelperMaxUops),
       dvrEnableDependentPrefetch(params.dvrEnableDependentPrefetch),
+      oraclePrefetch(params.oraclePrefetch),
+      oracleTraceFile(params.oracleTraceFile),
+      oracleLookahead(params.oracleLookahead),
       dvrVectorChunkModel(params.dvrVectorChunkModel),
       dvrVectorUnlimitedFU(params.dvrVectorUnlimitedFU),
       dvrVectorElementBits(params.dvrVectorElementBits)
@@ -176,6 +184,29 @@ CPU::CPU(const BaseO3CPUParams &params)
     if (dvrVectorElementBits == 0 ||
         DvrVectorBits % dvrVectorElementBits != 0) {
         fatal("DVR vector element width must divide 512 bits\n");
+    }
+    if (oraclePrefetch && oracleTraceFile.empty())
+        fatal("oraclePrefetch requires oracleTraceFile\n");
+    if (oraclePrefetch) {
+        std::ifstream trace(oracleTraceFile);
+        std::string line;
+        while (std::getline(trace, line)) {
+            if (line.empty() || line.rfind("tick,", 0) == 0)
+                continue;
+            const auto comma = line.rfind(',');
+            if (comma == std::string::npos)
+                continue;
+            const std::string address = line.substr(comma + 1);
+            try {
+                oracleLoadTrace.push_back(
+                    static_cast<Addr>(std::stoull(address, nullptr, 0)));
+            } catch (...) {
+                continue;
+            }
+        }
+        if (oracleLoadTrace.empty())
+            fatal("oracle trace contains no load addresses: %s\n",
+                  oracleTraceFile);
     }
     if (const char *trace_dir = std::getenv("DVR_TRACE_DIR")) {
         char path[4096];
@@ -417,6 +448,115 @@ CPU::regProbePoints()
     commit.regProbePoints();
 }
 
+bool
+CPU::DVRInstructionFetchPort::recvTimingResp(PacketPtr pkt)
+{
+    cpu->completeDVRInstructionFetch(pkt);
+    return true;
+}
+
+void
+CPU::DVRInstructionFetchPort::recvReqRetry()
+{
+    cpu->retryDVRInstructionFetch();
+}
+
+Port &
+CPU::getPort(const std::string &if_name, PortID idx)
+{
+    if (if_name == "dvr_icache_port")
+        return dvrInstructionPort;
+    return BaseCPU::getPort(if_name, idx);
+}
+
+bool
+CPU::requestDVRInstructionFetch(ThreadID tid, Addr pc,
+                                const StaticInstPtr &captured)
+{
+    if (!dvrInstructionPort.isConnected())
+        return false;
+
+    // A helper lane may revisit the same PC while its cache request is in
+    // flight.  Keep one request per PC and let the lane retry after fill.
+    if (dvrInstructionFetchPending.count(pc) != 0)
+        return true;
+    if (dvrInstructionRetryPkt != nullptr)
+        return true;
+    if (tid >= threadContexts.size() || !threadContexts[tid])
+        return false;
+
+    RequestPtr req = std::make_shared<Request>(
+        pc, 4, Request::INST_FETCH, instRequestorId(), pc,
+        thread[tid]->contextId());
+    req->taskId(taskId());
+    const Fault fault = mmu->translateFunctional(
+        req, thread[tid]->getTC(), BaseMMU::Execute);
+    if (fault != NoFault) {
+        ++cpuStats.dvrHelperInstructionFetchFaults;
+        ++cpuStats.dvrHelperDecodeFallbacks;
+        dvrHelperThread.decodedUopCache[pc] = captured;
+        return false;
+    }
+
+    PacketPtr pkt = new Packet(req, MemCmd::ReadReq);
+    pkt->dataDynamic(new uint8_t[4]);
+    auto *state = new DVRInstructionFetchState;
+    state->pc = pc;
+    state->tid = tid;
+    state->captured = captured;
+    pkt->senderState = state;
+    dvrInstructionFetchPending.insert(pc);
+    ++cpuStats.dvrHelperInstructionTimingRequests;
+    if (!dvrInstructionPort.sendTimingReq(pkt)) {
+        dvrInstructionRetryPkt = pkt;
+    }
+    return true;
+}
+
+void
+CPU::completeDVRInstructionFetch(PacketPtr pkt)
+{
+    auto *state = dynamic_cast<DVRInstructionFetchState *>(
+        pkt->senderState);
+    if (!state) {
+        delete pkt;
+        return;
+    }
+
+    StaticInstPtr decoded;
+    if (pkt->hasData() && pkt->getSize() >= 4 &&
+        state->tid < threadContexts.size() && threadContexts[state->tid]) {
+        uint32_t raw = 0;
+        std::memcpy(&raw, pkt->getConstPtr<uint8_t>(), sizeof(raw));
+        auto *decoder = dynamic_cast<RiscvISA::Decoder *>(
+            threadContexts[state->tid]->getDecoderPtr());
+        if (decoder)
+            decoded = decoder->decodeRaw(raw, state->pc);
+    }
+    if (decoded) {
+        dvrHelperThread.decodedUopCache[state->pc] = decoded;
+        ++cpuStats.dvrHelperInstructionsDecoded;
+    } else {
+        dvrHelperThread.decodedUopCache[state->pc] = state->captured;
+        ++cpuStats.dvrHelperDecodeFallbacks;
+    }
+    ++cpuStats.dvrHelperInstructionTimingResponses;
+    dvrInstructionFetchPending.erase(state->pc);
+    pkt->senderState = nullptr;
+    delete state;
+    delete pkt;
+}
+
+void
+CPU::retryDVRInstructionFetch()
+{
+    if (!dvrInstructionRetryPkt)
+        return;
+    ++cpuStats.dvrHelperInstructionTimingRetries;
+    if (dvrInstructionPort.sendTimingReq(dvrInstructionRetryPkt))
+        dvrInstructionRetryPkt = nullptr;
+}
+
 CPU::~CPU()
 {
     if (dvrTrace.workload) std::fclose(dvrTrace.workload);
@@ -475,6 +615,40 @@ CPU::dvrTraceVector(const char *kind, Tick tick, Addr pc, Addr address,
         static_cast<unsigned long long>(tick), kind,
         static_cast<unsigned long long>(pc),
         static_cast<unsigned long long>(address), lanes, invocation);
+}
+
+void
+CPU::oracleOnCommittedLoad(Addr address, ThreadID tid)
+{
+    if (!oraclePrefetch || oracleLoadTrace.empty())
+        return;
+    const uint64_t current = oracleLoadIndex++;
+    const uint64_t end = std::min<uint64_t>(oracleLoadTrace.size(),
+        current + 1 + oracleLookahead);
+    for (uint64_t index = current + 1; index < end; ++index) {
+        const Addr future = oracleLoadTrace[index];
+        if (future == 0 || dvrQueuedPrefetchAddresses.count(future) != 0 ||
+            dvrOutstandingPrefetchAddresses.count(future) != 0)
+            continue;
+        if (dvrPrefetchQueue.size() >= DvrMaxQueuedPrefetches)
+            break;
+        DVRPrefetchAddress prefetch;
+        prefetch.address = future;
+        prefetch.pc = 0;
+        prefetch.tid = tid;
+        prefetch.source = false;
+        prefetch.oracle = true;
+        dvrPrefetchQueue.push_back(prefetch);
+        dvrQueuedPrefetchAddresses.insert(future);
+        ++cpuStats.oraclePrefetchesGenerated;
+    }
+    updateDVRPrefetchQueuePeak();
+    const Addr line = dvrPrefetchLine(address);
+    auto completed = oracleCompletedLines.find(line);
+    if (completed != oracleCompletedLines.end()) {
+        ++cpuStats.oracleDemandCovered;
+        oracleCompletedLines.erase(completed);
+    }
 }
 
 CPU::CPUStats::CPUStats(CPU *cpu)
@@ -647,7 +821,7 @@ CPU::CPUStats::CPUStats(CPU *cpu)
       ADD_STAT(dvrHelperDecodedCacheMisses, statistics::units::Count::get(),
                "Helper decoded-uop cache misses"),
       ADD_STAT(dvrHelperInstructionFetches, statistics::units::Count::get(),
-               "Helper instruction bytes fetched from the live address space"),
+               "Helper instruction fetch attempts from the live address space"),
       ADD_STAT(dvrHelperInstructionFetchFaults,
                statistics::units::Count::get(),
                "Helper instruction fetches that could not be translated"),
@@ -655,6 +829,15 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Helper instructions decoded from fetched bytes"),
       ADD_STAT(dvrHelperDecodeFallbacks, statistics::units::Count::get(),
                "Helper decode fallbacks to captured metadata"),
+      ADD_STAT(dvrHelperInstructionTimingRequests,
+               statistics::units::Count::get(),
+               "Helper instruction-cache timing requests"),
+      ADD_STAT(dvrHelperInstructionTimingResponses,
+               statistics::units::Count::get(),
+               "Helper instruction-cache timing responses"),
+      ADD_STAT(dvrHelperInstructionTimingRetries,
+               statistics::units::Count::get(),
+               "Helper instruction-cache request retries"),
       ADD_STAT(dvrHelperFetchBlockedByMain, statistics::units::Cycle::get(),
                "Helper fetch cycles denied by main-thread priority"),
       ADD_STAT(dvrHelperDecodeBlockedByMain, statistics::units::Cycle::get(),
@@ -764,8 +947,6 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "DVR prefetch responses consumed by the CPU"),
       ADD_STAT(dvrPrefetchesDropped, statistics::units::Count::get(),
                "DVR prefetches dropped due to replacement or backpressure"),
-      ADD_STAT(dvrPrefetchesCrossingLine, statistics::units::Count::get(),
-               "DVR requests whose width crosses a cache line"),
       ADD_STAT(dvrPrefetchTranslationFaults, statistics::units::Count::get(),
                "DVR prefetch virtual-address translation faults"),
       ADD_STAT(dvrSourcePrefetchTranslationFaults,
@@ -920,6 +1101,16 @@ CPU::CPUStats::CPUStats(CPU *cpu)
       ADD_STAT(dvrAlternatePathIncompleteRejects,
                statistics::units::Count::get(),
                "Incomplete alternate-path entries rejected"),
+      ADD_STAT(dvrAlternatePathUnsupportedRejects,
+               statistics::units::Count::get(),
+               "Alternate paths rejected due to unsupported semantics"),
+      ADD_STAT(dvrAlternatePathControlRejects,
+               statistics::units::Count::get(),
+               "Alternate paths rejected due to unresolved control flow"),
+      ADD_STAT(dvrAlternatePathDirectJumps, statistics::units::Count::get(),
+               "Direct jumps retained as alternate-path control metadata"),
+      ADD_STAT(dvrAlternatePathSafeSkips, statistics::units::Count::get(),
+               "Unsupported non-stateful uops omitted from alternate paths"),
       ADD_STAT(dvrAlternatePathUopsReplayed, statistics::units::Count::get(),
                "Uops executed from alternate-path cache entries"),
       ADD_STAT(dvrAlternatePathDependentTargets,
@@ -927,9 +1118,6 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Dependent targets generated while executing alternate paths"),
       ADD_STAT(dvrAlternatePathDemandCovered, statistics::units::Count::get(),
                "Demand loads covered by alternate-path dependent targets"),
-      ADD_STAT(dvrAlternatePathReconvergenceFallbacks,
-               statistics::units::Count::get(),
-               "Alternate-path hits matched with a different reconvergence PC"),
       ADD_STAT(dvrReconvergenceResumeSuccesses,
                statistics::units::Count::get(),
                "Alternate paths that resumed at their reconvergence PC"),
@@ -955,7 +1143,15 @@ CPU::CPUStats::CPUStats(CPU *cpu)
       ADD_STAT(dvrHelperLaunchZeroLanes, statistics::units::Count::get(),
                "Source-helper launches with no inferred lane"),
       ADD_STAT(dvrPrefetchesDeduplicated, statistics::units::Count::get(),
-               "DVR candidates suppressed because an equivalent request was already active")
+               "DVR candidates suppressed because an equivalent request was already active"),
+      ADD_STAT(oraclePrefetchesGenerated, statistics::units::Count::get(),
+               "Future load addresses generated by the trace oracle"),
+      ADD_STAT(oraclePrefetchesIssued, statistics::units::Count::get(),
+               "Oracle requests accepted by L1D"),
+      ADD_STAT(oraclePrefetchesCompleted, statistics::units::Count::get(),
+               "Oracle request responses completed"),
+      ADD_STAT(oracleDemandCovered, statistics::units::Count::get(),
+               "Committed loads preceded by a completed oracle request")
 {
     // Register any of the O3CPU's stats here.
     timesIdled
@@ -1094,6 +1290,11 @@ CPU::tick()
     const unsigned helper_frontend_work =
         dvrHelperThread.advanceFrontend(helper_fetch_width,
                                         helper_decode_width);
+    // Front-end accounting above is now backed by a real helper fetch.  The
+    // helper owns the PC/window cursor; each fetched entry reads the current
+    // process bytes and is decoded by the ISA decoder before it can reach the
+    // VIR.  The captured Uop remains the dependency metadata and validation
+    // record, never the instruction-byte source.
     for (unsigned fetched = 0;
          fetched < dvrHelperThread.lastFetched &&
          dvrHelperThread.frontendReplay &&
@@ -1105,12 +1306,13 @@ CPU::tick()
             program->uops[dvrHelperThread.frontendUopIndex++];
         bool fetch_fault = false;
         bool cache_hit = false;
-        const auto decoded = fetchDecodeDVRUop(
+        fetchDecodeDVRUop(
             dvrHelperThread.frontendTid, frontend_uop.pc,
             frontend_uop.staticInst, fetch_fault, cache_hit);
         dvrHelperThread.helperPC = frontend_uop.pc;
-        if (!decoded)
-            ++cpuStats.dvrHelperDecodeFallbacks;
+        // Timing misses are accounted by request/response handlers.  A
+        // nullptr here means the helper front-end is waiting on its cache
+        // request, not that semantic metadata was used as a fallback.
     }
     const unsigned ready_uops_after = dvrHelperThread.readyUops;
     if (helper_frontend_work != 0) {
@@ -1926,6 +2128,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
         if (inst->isLoad() && inst->effAddrValid()) {
             dvrTraceWorkload("load", curTick(), inst->seqNum,
                              inst->pcState().instAddr(), inst->effAddr);
+            oracleOnCommittedLoad(inst->effAddr, tid);
         }
 
         if (enableDVR && !inPRE && !inst->isPRE()) {
@@ -1974,6 +2177,11 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
             const auto ndm_result = dvrNestedDiscoveryMode.observeCommit();
             if (dvrNestedDiscoveryMode.active() && inst->isCondCtrl() &&
                 inst->isDirectCtrl()) {
+                uint64_t encoded = 0;
+                const size_t encoded_size = inst->staticInst->asBytes(
+                    &encoded, sizeof(encoded));
+                const Addr fallthrough = inst->pcState().instAddr() +
+                    (encoded_size != 0 && (encoded & 0x3) != 0x3 ? 2 : 4);
                 const bool captured =
                     dvrNestedDiscoveryMode.observeInnerBranch(
                         inst->pcState().instAddr(),
@@ -1981,9 +2189,8 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                         // The generic PCState interface does not expose the
                         // ISA-specific npc accessor.  RV64C is decoded into
                         // the recorder with a fixed-width fall-through, so
-                        // use the same conservative architectural next-PC
-                        // model for the NDM control record.
-                        inst->pcState().instAddr() + 4,
+                        // Preserve the actual RVC/RV64 fall-through width.
+                        fallthrough,
                         inst->pcState().branching());
                 if (captured) {
                     ++cpuStats.dvrNDMBranchInversions;
@@ -2235,9 +2442,10 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                         result.triggerPC, dvrCurrentTriggerAddress,
                         inference.lanes);
                 }
-                const auto ndm_started = dvrNestedDiscoveryMode.start(
-                    result.triggerPC, inference.increment, inference.lanes);
-                if (ndm_started.event ==
+                if (dvrMode == "nested" &&
+                    dvrNestedDiscoveryMode.start(
+                        result.triggerPC, inference.increment,
+                        inference.lanes).event ==
                     DVRNestedDiscoveryMode::Event::Started) {
                     ++cpuStats.dvrNDMAttempts;
                     dvrTraceVector("ndm_start", curTick(), result.triggerPC,
@@ -2286,11 +2494,6 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                                       !dvrInstructionRecorder.overflow();
                 if (dvrInstructionRecorder.overflow()) {
                     ++cpuStats.dvrRecorderOverflows;
-                    dvrTraceVector(
-                        "recorder_overflow", curTick(), result.triggerPC,
-                        dvrTaintTracker.flr(),
-                        dvrInstructionRecorder.size(),
-                        dvrHelperMaxUops);
                     helper_allowed = false;
                 }
                 bool vir_control_fallback = false;
@@ -2385,6 +2588,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                  * leaves all workload-level flatten counters at zero.
                  */
                 const bool ndm_capture_valid =
+                    dvrMode == "nested" &&
                     dvrNestedDiscoveryMode.readyToVectorize() &&
                     inference.matched && inference.lanes != 0 &&
                     dvrTaintTracker.flr() != 0 &&
@@ -2436,6 +2640,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 dvrInstructionRecorder.reset();
                 dvrVectorRenameTable.reset();
                 dvrVectorInstructionRegister.reset();
+                dvrDiscoverySwitchedInnermost = false;
                 dvrCommittedNestedCandidate = {};
                 if (dvrNestedController.depth() > 1) {
                     ++cpuStats.dvrNestedParentResets;
@@ -2457,6 +2662,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 dvrTaintTracker.reset();
                 dvrLoopBoundDetector.reset();
                 dvrInstructionRecorder.reset();
+                dvrDiscoverySwitchedInnermost = false;
                 if (!dvrNestedDiscoveryMode.active())
                     dvrNestedDiscoveryMode.reset();
                 dvrCommittedNestedCandidate = {};
@@ -2471,6 +2677,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 dvrTaintTracker.reset();
                 dvrLoopBoundDetector.reset();
                 dvrInstructionRecorder.reset();
+                dvrDiscoverySwitchedInnermost = false;
                 if (!dvrNestedDiscoveryMode.active())
                     dvrNestedDiscoveryMode.reset();
                 dvrCommittedNestedCandidate = {};
@@ -2639,7 +2846,13 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
                 DVRLoopBoundDetector::MaxArchitecturalIntRegs) {
             defined_regs |= uint32_t(1) << replay->triggerDestination;
         }
-        bool unstable_input = false;
+        // Replay starts from the architectural image captured at the next
+        // trigger occurrence (finish_regs), not from the discovery-start
+        // image.  Therefore a loop-carried/live-in register changing across
+        // discovery is expected and must not invalidate the template.  The
+        // old start-vs-finish comparison rejected every Camel template and
+        // silently disabled dependent replay.  Keep the validation focused
+        // on representable register IDs and unsupported semantics below.
         for (unsigned index = 0; index < replay->count; ++index)
             replay->uops[index] = dvrInstructionRecorder[index];
         for (unsigned index = 0; index < replay->scalarCount; ++index) {
@@ -2650,25 +2863,32 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
             while (external_sources) {
                 const unsigned reg = __builtin_ctz(external_sources);
                 external_sources &= external_sources - 1;
-                if (dvrDiscoveryStartRegs[reg] != finish_regs[reg]) {
-                    unstable_input = true;
+                if (reg >= DVRLoopBoundDetector::MaxArchitecturalIntRegs)
                     replay->valid = false;
-                }
             }
-            if (replay->uops[index].semantic ==
-                DVRInstructionRecorder::Uop::Semantic::Unsupported) {
+            const auto &replay_uop = replay->uops[index];
+            const bool safe_unsupported =
+                replay_uop.semantic ==
+                    DVRInstructionRecorder::Uop::Semantic::Unsupported &&
+                !replay_uop.control && replay_uop.intDestinations == 0;
+            const bool direct_jump = replay_uop.control &&
+                !replay_uop.conditional && replay_uop.branchTargetPC != 0 &&
+                replay_uop.intDestinations == 0;
+            if (replay_uop.semantic ==
+                    DVRInstructionRecorder::Uop::Semantic::Unsupported &&
+                !safe_unsupported && !direct_jump) {
                 ++cpuStats.dvrReplayUnsupportedUops;
                 dvrTraceDependency("replay_unsupported", curTick(), pc,
-                    replay->uops[index].pc,
-                    replay->uops[index].encoding, 0, 0);
+                    replay_uop.pc, replay_uop.encoding, 0, 0);
                 replay->valid = false;
             } else {
                 ++cpuStats.dvrReplaySupportedUops;
             }
             defined_regs |= replay->uops[index].intDestinations;
         }
-        if (unstable_input)
-            ++cpuStats.dvrReplayUnstableInputs;
+        // No start-vs-finish equality is required for live-ins.  A template
+        // that reaches this point has a complete register image in
+        // replay->initialRegs and can be evaluated for the source lane.
     }
     if (replay->count > 1) {
         replay->continuation =
@@ -2728,7 +2948,7 @@ CPU::launchDVRVectorRunahead(ThreadID tid, Addr current_address,
     dvrQueuedDependentLines.clear();
     DVRInstructionRecorder::ResourceCounts vector_resources;
     vector_resources.lsu = 1;
-    startDVRHelper(pc, 1, lanes, vector_resources, nullptr, tid);
+        startDVRHelper(pc, 1, lanes, vector_resources, nullptr, tid);
     for (unsigned lane = 1; lane <= lanes; ++lane) {
         DVRPrefetchAddress prefetch;
         prefetch.address = current_address + stride * lane;
@@ -2787,6 +3007,7 @@ CPU::completeDVRNestedContext(
      * even when VIR rejected a branch target outside its short recorder.
      */
     const bool ndm_capture_valid =
+        dvrMode == "nested" &&
         dvrNestedDiscoveryMode.readyToVectorize() &&
         inference.matched && inference.lanes != 0 &&
         dvrNestedContext.taint.flr() != 0 &&
@@ -2918,11 +3139,20 @@ CPU::launchDVRNestedPrefetches(
             while (external) {
                 const unsigned reg = __builtin_ctz(external);
                 external &= external - 1;
-                if (dvrNestedContext.startRegs[reg] != finish_regs[reg])
+                if (reg >= DVRLoopBoundDetector::MaxArchitecturalIntRegs)
                     replay->valid = false;
             }
-            if (replay->uops[index].semantic ==
-                DVRInstructionRecorder::Uop::Semantic::Unsupported) {
+            const auto &replay_uop = replay->uops[index];
+            const bool safe_unsupported =
+                replay_uop.semantic ==
+                    DVRInstructionRecorder::Uop::Semantic::Unsupported &&
+                !replay_uop.control && replay_uop.intDestinations == 0;
+            const bool direct_jump = replay_uop.control &&
+                !replay_uop.conditional && replay_uop.branchTargetPC != 0 &&
+                replay_uop.intDestinations == 0;
+            if (replay_uop.semantic ==
+                    DVRInstructionRecorder::Uop::Semantic::Unsupported &&
+                !safe_unsupported && !direct_jump) {
                 replay->valid = false;
             }
             defined_regs |= replay->uops[index].intDestinations;
@@ -3210,12 +3440,8 @@ CPU::issueDVRReplayLanes(unsigned slots)
         while (lane.reconvergenceDepth != 0 &&
                lane.lanePC == lane.reconvergenceStack[
                    lane.reconvergenceDepth - 1].pc) {
-            const bool alternate_frame = lane.reconvergenceStack[
-                lane.reconvergenceDepth - 1].alternatePath;
             --lane.reconvergenceDepth;
             ++cpuStats.dvrReconvergences;
-            if (alternate_frame)
-                ++cpuStats.dvrReconvergenceResumeSuccesses;
         }
         const unsigned pc_index = findPC(lane.program, lane.lanePC);
         if (pc_index == std::numeric_limits<unsigned>::max()) {
@@ -3253,7 +3479,20 @@ CPU::issueDVRReplayLanes(unsigned slots)
         return 0;
 
     const auto &uop = seed->program->uops[seed->uopIndex];
-    const bool alternate_group = uop.alternatePath;
+    bool decoded_cache_hit = false;
+    bool instruction_fetch_fault = false;
+    const StaticInstPtr decoded_inst = fetchDecodeDVRUop(
+        seed->tid, uop.pc, uop.staticInst, instruction_fetch_fault,
+        decoded_cache_hit);
+    if (!decoded_inst) {
+        // The independent instruction-cache request is still outstanding.
+        // Do not consume a FU slot or remove the lanes; they will become
+        // eligible after completeDVRInstructionFetch fills the decode cache.
+        return 0;
+    }
+    if (instruction_fetch_fault)
+        DPRINTF(O3CPU, "DVR helper fetch fault at pc=%#x; using captured "
+                "semantic metadata\n", uop.pc);
     using Semantic = DVRInstructionRecorder::Uop::Semantic;
     const bool is_shift =
         uop.semantic == Semantic::ShiftLeft ||
@@ -3274,7 +3513,9 @@ CPU::issueDVRReplayLanes(unsigned slots)
         uop.semantic == Semantic::AddWordImmediate ||
         uop.semantic == Semantic::LoadAddress ||
         uop.semantic == Semantic::LoadByteSigned ||
+        uop.semantic == Semantic::LoadByteUnsigned ||
         uop.semantic == Semantic::LoadHalfSigned ||
+        uop.semantic == Semantic::LoadHalfUnsigned ||
         uop.semantic == Semantic::LoadWordSigned ||
         uop.semantic == Semantic::LoadWordUnsigned ||
         uop.semantic == Semantic::LoadDouble;
@@ -3305,11 +3546,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
         static_cast<uint64_t>(latency) * clockPeriod();
     DVRHelperThread::DVRDynUop dyn_uop;
     dyn_uop.program = seed->program;
-    bool decoded_cache_hit = false;
-    bool instruction_fetch_fault = false;
-    dyn_uop.staticInst = fetchDecodeDVRUop(
-        seed->tid, uop.pc, uop.staticInst, instruction_fetch_fault,
-        decoded_cache_hit);
+    dyn_uop.staticInst = decoded_inst;
     dyn_uop.uopIndex = seed->uopIndex;
     dyn_uop.opClass = op_class;
     dyn_uop.source0 = uop.source0;
@@ -3334,15 +3571,6 @@ CPU::issueDVRReplayLanes(unsigned slots)
     dvrTraceVector("vir_issue_group", curTick(), uop.pc, 0,
                    static_cast<int>(group.size()),
                    static_cast<int>(seed->lane));
-    if (alternate_group) {
-        // This is deliberately counted at the persistent VIR issue point.
-        // A reconvergence frame only records control state; it is not proof
-        // that an alternate-path instruction was executed.
-        cpuStats.dvrAlternatePathUopsReplayed += group.size();
-        dvrTraceVector("alternate_path_uop", curTick(), uop.pc, 0,
-                       static_cast<int>(group.size()),
-                       static_cast<int>(seed->lane));
-    }
     dvrHelperThread.virBuffer.push_back(std::move(dyn_uop));
     auto &issued_dyn_uop = dvrHelperThread.virBuffer.back();
     ++cpuStats.dvrHelperDynUopsDecoded;
@@ -3363,50 +3591,6 @@ CPU::issueDVRReplayLanes(unsigned slots)
         ++cpuStats.dvrVectorMultiplyChunkIssues;
     else
         ++cpuStats.dvrVectorALUChunkIssues;
-
-    // A VIR issue group is the unit at which SIMT divergence is observed.
-    // Counting while walking individual lanes misses the case where one
-    // lane reaches the reconvergence PC and another lane takes the deferred
-    // path first.  Evaluate the complete same-PC group before updating lane
-    // PCs, then account for one divergent branch for the mixed mask.
-    if (uop.conditional) {
-        // Replay lanes originate from a completed source response.  Count
-        // the conditional group here as well as divergence below; otherwise
-        // this statistic only described the retired evaluator fallback and
-        // incorrectly stayed zero for the persistent helper path.
-        ++cpuStats.dvrVIRSourceValueBranches;
-        unsigned taken_lanes = 0;
-        unsigned fallthrough_lanes = 0;
-        for (Lane *lane : group) {
-            const auto &branch_uop = lane->program->uops[lane->uopIndex];
-            const RegVal source0 = branch_uop.source0 >= 0 &&
-                branch_uop.source0 <
-                    DVRLoopBoundDetector::MaxArchitecturalIntRegs ?
-                (lane->program->helperRegs ?
-                 lane->program->helperRegs->read(
-                     branch_uop.source0, lane->lane) :
-                 lane->regs[branch_uop.source0]) : 0;
-            const RegVal source1 = branch_uop.source1 >= 0 &&
-                branch_uop.source1 <
-                    DVRLoopBoundDetector::MaxArchitecturalIntRegs ?
-                (lane->program->helperRegs ?
-                 lane->program->helperRegs->read(
-                     branch_uop.source1, lane->lane) :
-                 lane->regs[branch_uop.source1]) : 0;
-            bool taken = false;
-            if (!branch_uop.evaluateBranch(source0, source1, taken))
-                continue;
-            if (taken)
-                ++taken_lanes;
-            else
-                ++fallthrough_lanes;
-        }
-        if (taken_lanes != 0 && fallthrough_lanes != 0) {
-            ++cpuStats.dvrDivergentBranches;
-            dvrTraceVector("vir_branch", curTick(), uop.pc,
-                           uop.branchTargetPC, group.size(), taken_lanes);
-        }
-    }
 
     for (Lane *lane : group) {
         const auto &lane_uop = lane->program->uops[lane->uopIndex];
@@ -3443,40 +3627,6 @@ CPU::issueDVRReplayLanes(unsigned slots)
             }
             const unsigned next_index = findPC(lane->program, next_pc);
             if (next_index == std::numeric_limits<unsigned>::max()) {
-                // The alternate target may be outside the captured rolling
-                // window.  Keep the lane alive at the recorded boundary so
-                // the captured path can reconverge instead of dropping this
-                // lane for the rest of the helper generation.  The external
-                // path is still counted and is not treated as if its uops
-                // were executed.
-                if (lane_uop.reconvergencePC != 0 &&
-                    next_pc != lane_uop.reconvergencePC) {
-                    if (lane->reconvergenceDepth >=
-                        Lane::ReconvergenceEntries) {
-                        lane->active = false;
-                        ++cpuStats.dvrReconvergenceStackOverflows;
-                        ++lane->helperUops;
-                        continue;
-                    }
-                    auto &frame = lane->reconvergenceStack[
-                        lane->reconvergenceDepth++];
-                    frame.pc = lane_uop.reconvergencePC;
-                    frame.deferredPC = captured_pc == next_pc ?
-                        (taken ? lane_uop.fallthroughPC :
-                                 lane_uop.branchTargetPC) : captured_pc;
-                    frame.alternatePath = true;
-                    const unsigned reconvergence_index = findPC(
-                        lane->program, lane_uop.reconvergencePC);
-                    if (reconvergence_index !=
-                        std::numeric_limits<unsigned>::max()) {
-                        lane->lanePC = lane_uop.reconvergencePC;
-                        lane->uopIndex = reconvergence_index;
-                        ++cpuStats.dvrVIRExternalPathLanes;
-                        ++lane->helperUops;
-                        if (lane->helperUops < dvrHelperMaxUops)
-                            continue;
-                    }
-                }
                 lane->active = false;
                 ++cpuStats.dvrVIRExternalPathLanes;
                 ++lane->helperUops;
@@ -3497,6 +3647,9 @@ CPU::issueDVRReplayLanes(unsigned slots)
                     (taken ? lane_uop.fallthroughPC :
                              lane_uop.branchTargetPC) : captured_pc;
                 frame.alternatePath = next_pc != captured_pc;
+                ++cpuStats.dvrDivergentBranches;
+                if (frame.alternatePath)
+                    ++cpuStats.dvrAlternatePathUopsReplayed;
             }
             lane->lanePC = next_pc;
             lane->uopIndex = next_index;
@@ -3519,26 +3672,56 @@ CPU::issueDVRReplayLanes(unsigned slots)
                 ++cpuStats.dvrPredicateMisses;
                 continue;
             }
+            // NDM flattening can combine invocations with different learned
+            // relation sets.  Validate against the exact replay load PC
+            // first, rather than applying the aggregate sender predicate to
+            // every flattened lane.
             bool relation_match = lane->relationCount == 0;
-            for (unsigned relation = 0; relation < lane->relationCount;
-                 ++relation) {
-                if (lane->relationCount > 1 &&
-                    ((lane->program->helperRegs ?
-                      lane->program->helperRegs->read(
-                          seed->program->triggerDestination, lane->lane) :
-                      lane->regs[seed->program->triggerDestination]) &
-                     lane->masks[relation]) != lane->patterns[relation])
-                    continue;
-                const int64_t expected = lane->scales[relation] *
-                    static_cast<int64_t>(
-                        lane->program->helperRegs ?
-                        lane->program->helperRegs->read(
-                            seed->program->triggerDestination, lane->lane) :
-                        lane->regs[seed->program->triggerDestination]) +
-                    lane->offsets[relation];
-                if (expected == static_cast<int64_t>(result)) {
-                    relation_match = true;
-                    break;
+            const auto exact_relation = dvrAddressRelations.find(
+                DVRRelationKey{lane->triggerPC, lane_uop.pc});
+            if (exact_relation != dvrAddressRelations.end() &&
+                exact_relation->second.trained) {
+                const auto &relation = exact_relation->second;
+                const RegVal trigger_value = lane->program->helperRegs ?
+                    lane->program->helperRegs->read(
+                        seed->program->triggerDestination, lane->lane) :
+                    lane->regs[seed->program->triggerDestination];
+                const bool mask_match =
+                    (trigger_value & relation.stableMask) ==
+                    (relation.pattern & relation.stableMask);
+                const int64_t expected = relation.scale *
+                    static_cast<int64_t>(trigger_value) + relation.offset;
+                relation_match = mask_match &&
+                    expected == static_cast<int64_t>(result) &&
+                    result >= relation.minAddress &&
+                    result <= relation.maxAddress;
+            } else {
+                // The replayed load address is already computed from the
+                // recorded dependency slice.  An aggregate relation may
+                // belong to a different load PC (or be absent for pointer
+                // chasing), so do not reject this exact semantic result just
+                // because no affine training record exists.
+                relation_match = true;
+                for (unsigned relation = 0; relation < lane->relationCount;
+                     ++relation) {
+                    if (lane->relationCount > 1 &&
+                        ((lane->program->helperRegs ?
+                          lane->program->helperRegs->read(
+                              seed->program->triggerDestination, lane->lane) :
+                          lane->regs[seed->program->triggerDestination]) &
+                         lane->masks[relation]) != lane->patterns[relation])
+                        continue;
+                    const int64_t expected = lane->scales[relation] *
+                        static_cast<int64_t>(
+                            lane->program->helperRegs ?
+                            lane->program->helperRegs->read(
+                                seed->program->triggerDestination, lane->lane) :
+                            lane->regs[seed->program->triggerDestination]) +
+                        lane->offsets[relation];
+                    if (expected == static_cast<int64_t>(result)) {
+                        relation_match = true;
+                        break;
+                    }
                 }
             }
             if (!relation_match) {
@@ -3547,11 +3730,6 @@ CPU::issueDVRReplayLanes(unsigned slots)
                 continue;
             }
             const Addr line = dvrPrefetchLine(result);
-            if (lane_uop.alternatePath) {
-                ++cpuStats.dvrAlternatePathDependentTargets;
-                dvrTraceDependency("alternate_replay_target", curTick(),
-                    lane->triggerPC, lane_uop.pc, result, 1, lane->lane);
-            }
             if (dvrQueuedDependentLines.count(line) == 0 &&
                 dvrDependentOutstandingLines.count(line) == 0 &&
                 dvrDependentCompletedLines.count(line) == 0 &&
@@ -3570,16 +3748,17 @@ CPU::issueDVRReplayLanes(unsigned slots)
                 dependent.replay = lane->program;
                 dependent.predicate = lane->predicate;
                 dependent.lane = lane->lane;
-                dependent.alternatePath = lane_uop.alternatePath;
                 dvrPrefetchQueue.push_front(dependent);
                 dvrQueuedPrefetchAddresses.insert(result);
                 dvrQueuedDependentLines.insert(line);
-                if (lane_uop.alternatePath)
-                    dvrAlternateDependentLines.insert(line);
                 updateDVRPrefetchQueuePeak();
                 ++cpuStats.dvrDependentPrefetchesGenerated;
                 ++cpuStats.dvrReplayTargetsGenerated;
                 ++cpuStats.dvrVectorizerDependentLanes;
+                if (lane->nested) {
+                    ++cpuStats.dvrNestedReplayTargetsGenerated;
+                    ++cpuStats.dvrNestedDependentGenerated;
+                }
                 ++cpuStats.dvrPredicateSelections;
                 dvrTraceDependency("replay_target", curTick(),
                     lane->triggerPC, lane_uop.pc, result,
@@ -3587,27 +3766,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
             } else {
                 ++cpuStats.dvrPrefetchesDeduplicated;
             }
-            ++lane->helperUops;
-            // The paper's FLR is a data-flow stop for the ordinary replay
-            // prefix, not necessarily the end of the helper instruction
-            // stream.  If a branch lies between FLR and LCR, keep this lane's
-            // PC alive so the persistent VIR can explore that path and later
-            // reconverge.  Without this, the helper always terminated at the
-            // first dependent load and silently dropped post-FLR control.
-            const unsigned next_index = lane->uopIndex + 1;
-            if (!lane->program->continuePastFLR ||
-                next_index >= lane->program->count) {
-                lane->active = false;
-                continue;
-            }
-            lane->lanePC = lane->program->uops[next_index].pc;
-            if (lane->lanePC == 0 || lane->lanePC == lane->triggerPC ||
-                lane->helperUops >= dvrHelperMaxUops) {
-                lane->active = false;
-                ++cpuStats.dvrVIRNormalTerminatedLanes;
-                continue;
-            }
-            lane->uopIndex = next_index;
+            lane->active = false;
             continue;
         }
 
@@ -3774,21 +3933,14 @@ CPU::serviceDVRPrefetchQueue()
     dvrQueuedPrefetchAddresses.erase(prefetch.address);
     if (!prefetch.source)
         dvrQueuedDependentLines.erase(dvrPrefetchLine(prefetch.address));
-    unsigned request_bytes = dvrPrefetchBytes(prefetch);
+    const unsigned request_bytes = dvrPrefetchBytes(prefetch);
     const unsigned line_offset = prefetch.address & (cacheLineSize() - 1);
-    if (line_offset + request_bytes > cacheLineSize()) {
-        ++cpuStats.dvrPrefetchesCrossingLine;
-        if (prefetch.source) {
-            // The helper packet bypasses the architectural load-splitting
-            // path.  Never consume a partial scalar as a trigger value.
-            ++cpuStats.dvrPrefetchesDropped;
-            retireDVRPredicateLane(prefetch.predicate, prefetch.lane, false);
-            return;
-        }
-        // Dependent requests only warm the target line and do not return an
-        // architectural value.  A one-byte packet preserves that behavior
-        // while satisfying BaseCache's single-line packet contract.
-        request_bytes = 1;
+    if (prefetch.source && line_offset + request_bytes > cacheLineSize()) {
+        // The helper packet bypasses the architectural load-splitting path.
+        // Never consume a partial scalar as a trigger value.
+        ++cpuStats.dvrPrefetchesDropped;
+        retireDVRPredicateLane(prefetch.predicate, prefetch.lane, false);
+        return;
     }
     Request::Flags flags;
     flags.set(Request::PREFETCH | Request::DVR_PREFETCH);
@@ -3824,7 +3976,8 @@ CPU::serviceDVRPrefetchQueue()
         req, prefetch.source ? MemCmd::ReadReq : MemCmd::SoftPFReq);
     pkt->allocate();
     pkt->senderState = new DVRPrefetchSenderState(
-        prefetch.source, prefetch.nested, prefetch.relationCount, prefetch.scales,
+        prefetch.source, prefetch.nested, prefetch.oracle,
+        prefetch.relationCount, prefetch.scales,
         prefetch.offsets, prefetch.masks, prefetch.patterns, prefetch.replay,
         prefetch.predicate, prefetch.lane, prefetch.tid);
     auto &port = iew.ldstQueue.getDataPort();
@@ -3836,7 +3989,7 @@ CPU::serviceDVRPrefetchQueue()
         // by ordinary LSU traffic.
         dvrPrefetchQueue.push_front(prefetch);
         dvrQueuedPrefetchAddresses.insert(prefetch.address);
-        if (!prefetch.source)
+        if (!prefetch.source && !prefetch.oracle)
             dvrQueuedDependentLines.insert(dvrPrefetchLine(prefetch.address));
         delete pkt->senderState;
         pkt->senderState = nullptr;
@@ -3847,7 +4000,7 @@ CPU::serviceDVRPrefetchQueue()
         ++cpuStats.dvrPrefetchesRejectedBackpressure;
         dvrPrefetchQueue.push_front(prefetch);
         dvrQueuedPrefetchAddresses.insert(prefetch.address);
-        if (!prefetch.source)
+        if (!prefetch.source && !prefetch.oracle)
             dvrQueuedDependentLines.insert(dvrPrefetchLine(prefetch.address));
         delete pkt->senderState;
         pkt->senderState = nullptr;
@@ -3866,8 +4019,12 @@ CPU::serviceDVRPrefetchQueue()
     ++dvrOutstandingPrefetchLines[dvrPrefetchLine(prefetch.address)];
     dvrOutstandingPrefetchAddresses.insert(prefetch.address);
     if (!prefetch.source) {
-        ++cpuStats.dvrDependentPrefetchesIssued;
-        ++dvrDependentOutstandingLines[dvrPrefetchLine(prefetch.address)];
+        if (prefetch.oracle)
+            ++cpuStats.oraclePrefetchesIssued;
+        else
+            ++cpuStats.dvrDependentPrefetchesIssued;
+        if (!prefetch.oracle)
+            ++dvrDependentOutstandingLines[dvrPrefetchLine(prefetch.address)];
     } else {
         ++cpuStats.dvrSourcePrefetchesIssued;
     }
@@ -3881,6 +4038,10 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
     auto *state = dynamic_cast<DVRPrefetchSenderState*>(pkt->senderState);
     assert(state);
     ++cpuStats.dvrPrefetchesCompleted;
+    if (state->oracle) {
+        ++cpuStats.oraclePrefetchesCompleted;
+        oracleCompletedLines.insert(dvrPrefetchLine(pkt->req->getVaddr()));
+    }
     dvrQualityTracker.completed(reinterpret_cast<uintptr_t>(pkt), curTick());
     cpuStats.dvrQualityCompletedBytes += pkt->getSize();
     // observeDVRLoad 使用架构有效虚拟地址，因此质量统计也使用请求虚拟地址。
@@ -3891,7 +4052,7 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
         if (--outstanding->second == 0)
             dvrOutstandingPrefetchLines.erase(outstanding);
     }
-    if (!state->source) {
+    if (!state->source && !state->oracle) {
         auto dependent_outstanding = dvrDependentOutstandingLines.find(line);
         if (dependent_outstanding != dvrDependentOutstandingLines.end()) {
             if (--dependent_outstanding->second == 0) {
@@ -3920,9 +4081,15 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
                 value = static_cast<RegVal>(static_cast<int64_t>(
                     static_cast<int8_t>(raw)));
                 break;
+              case Semantic::LoadByteUnsigned:
+                value = static_cast<RegVal>(static_cast<uint8_t>(raw));
+                break;
               case Semantic::LoadHalfSigned:
                 value = static_cast<RegVal>(static_cast<int64_t>(
                     static_cast<int16_t>(raw)));
+                break;
+              case Semantic::LoadHalfUnsigned:
+                value = static_cast<RegVal>(static_cast<uint16_t>(raw));
                 break;
               case Semantic::LoadWordSigned:
                 value = static_cast<RegVal>(static_cast<int64_t>(
@@ -3946,6 +4113,8 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
         if (dvrVectorChunkModel && state->replay &&
             state->replay->count > 1) {
             ++cpuStats.dvrReplayAttempts;
+            if (state->nested)
+                ++cpuStats.dvrNestedReplayAttempts;
             unsigned became_ready = 0;
             helper_replay_enqueued = dvrHelperThread.enqueueReplayLane(
                 *state, value, became_ready);
@@ -4078,7 +4247,7 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
             retireDVRPredicateLane(
                 state->predicate, state->lane, false);
         ++cpuStats.dvrSourcePrefetchesCompleted;
-    } else {
+    } else if (!state->oracle) {
         ++cpuStats.dvrDependentPrefetchesCompleted;
     }
     if (state->nested)
@@ -4131,61 +4300,6 @@ CPU::startDVRHelper(
             "DVR helper start id=%llu trigger=%#x uops=%u lanes=%u budget=%u\n",
             static_cast<unsigned long long>(dvrHelperThread.id), trigger_pc,
             program_uops, lanes, dvrHelperMaxUops);
-}
-
-StaticInstPtr
-CPU::fetchDecodeDVRUop(ThreadID tid, Addr pc,
-                       const StaticInstPtr &captured,
-                       bool &fetch_fault, bool &cache_hit)
-{
-    fetch_fault = false;
-    cache_hit = false;
-    auto cached = dvrHelperThread.decodedUopCache.find(pc);
-    if (cached != dvrHelperThread.decodedUopCache.end()) {
-        cache_hit = true;
-        ++cpuStats.dvrHelperDecodedCacheHits;
-        return cached->second;
-    }
-
-    ++cpuStats.dvrHelperDecodedCacheMisses;
-    ++cpuStats.dvrHelperInstructionFetches;
-    if (tid >= threadContexts.size() || !threadContexts[tid]) {
-        fetch_fault = true;
-        ++cpuStats.dvrHelperInstructionFetchFaults;
-        ++cpuStats.dvrHelperDecodeFallbacks;
-        return captured;
-    }
-
-    SETranslatingPortProxy proxy(threadContexts[tid]);
-    uint16_t half = 0;
-    if (!proxy.tryReadBlob(pc, &half, sizeof(half))) {
-        fetch_fault = true;
-        ++cpuStats.dvrHelperInstructionFetchFaults;
-        ++cpuStats.dvrHelperDecodeFallbacks;
-        return captured;
-    }
-
-    uint32_t raw = half;
-    if ((half & 0x3) == 0x3 &&
-        !proxy.tryReadBlob(pc, &raw, sizeof(raw))) {
-        fetch_fault = true;
-        ++cpuStats.dvrHelperInstructionFetchFaults;
-        ++cpuStats.dvrHelperDecodeFallbacks;
-        return captured;
-    }
-
-    StaticInstPtr decoded;
-    auto *decoder = dynamic_cast<RiscvISA::Decoder *>(
-        threadContexts[tid]->getDecoderPtr());
-    if (decoder)
-        decoded = decoder->decodeRaw(raw, pc);
-    if (!decoded) {
-        ++cpuStats.dvrHelperDecodeFallbacks;
-        return captured;
-    }
-    dvrHelperThread.decodedUopCache.emplace(pc, decoded);
-    ++cpuStats.dvrHelperInstructionsDecoded;
-    return decoded;
 }
 
 bool
@@ -4271,34 +4385,65 @@ CPU::replayDVRSource(const DVRPrefetchSenderState &state,
             index = next_index;
             continue;
         }
+
+        if (uop.control && !uop.conditional && uop.branchTargetPC != 0) {
+            if (uop.intDestinations != 0)
+                return false;
+            const Addr next_pc = uop.branchTargetPC;
+            if (alternate_active && alternate_reconvergence != 0 &&
+                next_pc == alternate_reconvergence) {
+                ++cpuStats.dvrReconvergenceResumeSuccesses;
+                alternate_active = false;
+                alternate_reconvergence = 0;
+            }
+            unsigned next_index = state.replay->count;
+            for (unsigned candidate = 1; candidate < state.replay->count;
+                 ++candidate) {
+                if (state.replay->uops[candidate].pc == next_pc) {
+                    next_index = candidate;
+                    break;
+                }
+            }
+            if (next_index == state.replay->count)
+                return false;
+            index = next_index;
+            continue;
+        }
+
+        // Stores, fences and other unsupported operations with no integer
+        // destination cannot change a later replay address.  They are
+        // intentionally omitted from the prefetch-only helper path.
+        if (uop.semantic == DVRInstructionRecorder::Uop::Semantic::Unsupported &&
+            !uop.control && uop.intDestinations == 0) {
+            ++index;
+            continue;
+        }
         RegVal result = 0;
         if (!uop.evaluate(source0, source1, result))
             return false;
         const bool is_replayed_load =
             uop.semantic == DVRInstructionRecorder::Uop::Semantic::LoadAddress ||
             uop.semantic == DVRInstructionRecorder::Uop::Semantic::LoadByteSigned ||
+            uop.semantic == DVRInstructionRecorder::Uop::Semantic::LoadByteUnsigned ||
             uop.semantic == DVRInstructionRecorder::Uop::Semantic::LoadHalfSigned ||
+            uop.semantic == DVRInstructionRecorder::Uop::Semantic::LoadHalfUnsigned ||
             uop.semantic == DVRInstructionRecorder::Uop::Semantic::LoadWordSigned ||
             uop.semantic == DVRInstructionRecorder::Uop::Semantic::LoadWordUnsigned ||
             uop.semantic == DVRInstructionRecorder::Uop::Semantic::LoadDouble;
         if (is_replayed_load) {
             const auto relation_it = dvrAddressRelations.find(
                 DVRRelationKey{state.replay->triggerPC, uop.pc});
-            if (relation_it == dvrAddressRelations.end() ||
-                !relation_it->second.trained) {
-                // A replay template without a relation-specific training
-                // record must not fall through to an unchecked address.
-                ++cpuStats.dvrReplayUnstableInputs;
-                return false;
-            }
-            const auto &relation = relation_it->second;
-            const int64_t expected = relation.scale *
-                static_cast<int64_t>(source_value) + relation.offset;
-            if (expected < 0 || static_cast<Addr>(expected) != result ||
-                result < relation.minAddress ||
-                result > relation.maxAddress) {
-                ++cpuStats.dvrReplayUnstableInputs;
-                return false;
+            if (relation_it != dvrAddressRelations.end() &&
+                relation_it->second.trained) {
+                const auto &relation = relation_it->second;
+                const int64_t expected = relation.scale *
+                    static_cast<int64_t>(source_value) + relation.offset;
+                if (expected < 0 || static_cast<Addr>(expected) != result ||
+                    result < relation.minAddress ||
+                    result > relation.maxAddress) {
+                    ++cpuStats.dvrReplayUnstableInputs;
+                    return false;
+                }
             }
             DVRPrefetchAddress dependent;
             dependent.address = static_cast<Addr>(result);
@@ -4361,6 +4506,79 @@ CPU::replayDVRSource(const DVRPrefetchSenderState &state,
         index = next_index;
     }
     return false;
+}
+
+StaticInstPtr
+CPU::fetchDecodeDVRUop(ThreadID tid, Addr pc,
+                       const StaticInstPtr &captured,
+                       bool &fetch_fault, bool &cache_hit)
+{
+    fetch_fault = false;
+    cache_hit = false;
+    auto cached = dvrHelperThread.decodedUopCache.find(pc);
+    if (cached != dvrHelperThread.decodedUopCache.end()) {
+        cache_hit = true;
+        ++cpuStats.dvrHelperDecodedCacheHits;
+        return cached->second;
+    }
+
+    ++cpuStats.dvrHelperDecodedCacheMisses;
+    if (tid >= threadContexts.size() || !threadContexts[tid]) {
+        fetch_fault = true;
+        ++cpuStats.dvrHelperInstructionFetchFaults;
+        ++cpuStats.dvrHelperDecodeFallbacks;
+        return captured;
+    }
+
+    ++cpuStats.dvrHelperInstructionFetches;
+    if (dvrInstructionPort.isConnected()) {
+        // A timing miss is intentionally represented by nullptr.  The
+        // caller keeps the replay lane active and retries this PC after the
+        // response populates decodedUopCache.
+        if (requestDVRInstructionFetch(tid, pc, captured))
+            return nullptr;
+        auto fallback = dvrHelperThread.decodedUopCache.find(pc);
+        if (fallback != dvrHelperThread.decodedUopCache.end())
+            return fallback->second;
+        return captured;
+    }
+
+    // The helper has its own PC and front-end timing, but uses the process's
+    // instruction address space for the actual bytes.  This is a functional
+    // read, analogous to the SE fetch path; it does not touch architectural
+    // registers or the main fetch decoder state.
+    SETranslatingPortProxy proxy(threadContexts[tid]);
+    uint16_t half = 0;
+    if (!proxy.tryReadBlob(pc, &half, sizeof(half))) {
+        fetch_fault = true;
+        ++cpuStats.dvrHelperInstructionFetchFaults;
+        ++cpuStats.dvrHelperDecodeFallbacks;
+        return captured;
+    }
+
+    uint32_t raw = half;
+    if ((half & 0x3) == 0x3) {
+        if (!proxy.tryReadBlob(pc, &raw, sizeof(raw))) {
+            fetch_fault = true;
+            ++cpuStats.dvrHelperInstructionFetchFaults;
+            ++cpuStats.dvrHelperDecodeFallbacks;
+            return captured;
+        }
+    }
+
+    StaticInstPtr decoded;
+    auto *decoder = dynamic_cast<RiscvISA::Decoder *>(
+        threadContexts[tid]->getDecoderPtr());
+    if (decoder)
+        decoded = decoder->decodeRaw(raw, pc);
+
+    if (!decoded) {
+        ++cpuStats.dvrHelperDecodeFallbacks;
+        return captured;
+    }
+    dvrHelperThread.decodedUopCache.emplace(pc, decoded);
+    ++cpuStats.dvrHelperInstructionsDecoded;
+    return decoded;
 }
 
 void
@@ -4432,21 +4650,77 @@ CPU::recordDVRAlternatePaths(const DVRInstructionRecorder &recorder,
                 break;
             }
         }
-        // In the current discovery representation FLR is also used as the
-        // provisional reconvergence boundary.  Include that terminal load in
-        // the cached suffix; otherwise alternate replay can execute address
-        // arithmetic but can never issue the path's dependent load.
-        unsigned path_end = end;
-        if (end < recorder.size() && recorder[end].load)
-            path_end = end + 1;
-        path.complete = end < recorder.size() && path_end > branch + 1;
+        path.complete = end < recorder.size() && end > branch + 1;
         uint32_t defined = 0;
+        uint32_t live_out = 0;
         if (path.complete) {
-            for (unsigned index = branch + 1; index < path_end; ++index) {
+            for (unsigned index = end; index < recorder.size(); ++index)
+                live_out |= recorder[index].intSources;
+        }
+        if (path.complete) {
+            const auto captured_pc = [&](Addr pc) {
+                if (pc == reconvergence)
+                    return true;
+                for (unsigned candidate = branch + 1; candidate < end;
+                     ++candidate) {
+                    if (recorder[candidate].pc == pc)
+                        return true;
+                }
+                return false;
+            };
+            for (unsigned index = branch + 1; index < end; ++index) {
                 const auto &path_uop = recorder[index];
-                if (path_uop.control || path_uop.conditional ||
-                    path_uop.semantic ==
-                        DVRInstructionRecorder::Uop::Semantic::Unsupported) {
+                // A cached alternate path may contain another direct
+                // conditional branch.  The SIMT VIR/reconvergence stack can
+                // execute that branch, so rejecting every control uop here
+                // made all discovered paths permanently incomplete.  Reject
+                // only unsupported semantics and controls whose target
+                // cannot be represented in the captured PC stream (typically
+                // indirect/unresolved control flow).
+                const bool direct_jump = path_uop.control &&
+                    !path_uop.conditional && path_uop.branchTargetPC != 0;
+                if (direct_jump && path_uop.intDestinations == 0 &&
+                    captured_pc(path_uop.branchTargetPC)) {
+                    ++cpuStats.dvrAlternatePathDirectJumps;
+                    auto cached_uop = path_uop;
+                    cached_uop.alternatePath = true;
+                    path.uops.push_back(cached_uop);
+                    continue;
+                }
+                if (path_uop.semantic ==
+                    DVRInstructionRecorder::Uop::Semantic::Unsupported) {
+                    // Non-register-writing operations (stores, fences and
+                    // cache hints) do not contribute to a prefetch address
+                    // and can be omitted from a speculative alternate path.
+                    // An unsupported operation that writes a register used
+                    // later would change control/address state, so reject
+                    // that path instead of guessing its semantics.
+                    bool writes_live_value = false;
+                    if (path_uop.intDestinations != 0) {
+                        for (unsigned later = index + 1;
+                             later < end; ++later) {
+                            if (path_uop.intDestinations &
+                                recorder[later].intSources) {
+                                writes_live_value = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (path_uop.control || writes_live_value ||
+                        (path_uop.intDestinations & live_out) != 0) {
+                        ++cpuStats.dvrAlternatePathUnsupportedRejects;
+                        path.complete = false;
+                        break;
+                    }
+                    ++cpuStats.dvrAlternatePathSafeSkips;
+                    continue;
+                }
+                if (path_uop.control && path_uop.conditional &&
+                    (path_uop.branchTargetPC == 0 ||
+                     path_uop.fallthroughPC == 0 ||
+                     !captured_pc(path_uop.branchTargetPC) ||
+                     !captured_pc(path_uop.fallthroughPC))) {
+                    ++cpuStats.dvrAlternatePathControlRejects;
                     path.complete = false;
                     break;
                 }
@@ -4479,23 +4753,29 @@ CPU::augmentDVRAlternatePaths(
     DVRInstructionRecorder &recorder, ContextID address_space_id,
     const DVRLoopBoundDetector::RegisterSnapshot &initial_regs)
 {
-    std::vector<DVRInstructionRecorder::Uop> branches;
+    struct BranchOccurrence
+    {
+        unsigned index;
+        DVRInstructionRecorder::Uop op;
+    };
+    std::vector<BranchOccurrence> branches;
     for (unsigned index = 0; index < recorder.size(); ++index) {
         if (recorder[index].conditional)
-            branches.push_back(recorder[index]);
+            branches.push_back({index, recorder[index]});
     }
-    for (const auto &op : branches) {
+    // Insert from the end of the captured stream.  Insertion before a
+    // reconvergence point shifts later occurrences, but cannot invalidate an
+    // earlier occurrence.  This matters when a loop executes the same branch
+    // PC multiple times in one discovery: selecting the first matching PC
+    // can splice an alternate suffix into the wrong dynamic iteration.
+    for (auto occurrence = branches.rbegin(); occurrence != branches.rend();
+         ++occurrence) {
+        const auto &op = occurrence->op;
         if (!op.conditional || op.reconvergencePC == 0)
             continue;
 
-        unsigned branch = recorder.size();
-        for (unsigned index = 0; index < recorder.size(); ++index) {
-            if (recorder[index].pc == op.pc) {
-                branch = index;
-                break;
-            }
-        }
-        if (branch == recorder.size())
+        const unsigned branch = occurrence->index;
+        if (branch >= recorder.size() || recorder[branch].pc != op.pc)
             continue;
 
         const Addr alternate_target = op.branchTaken ? op.fallthroughPC :
@@ -4518,28 +4798,7 @@ CPU::augmentDVRAlternatePaths(
         ++cpuStats.dvrAlternatePathLookups;
         const DVRAlternatePathKey key{op.pc, alternate_target,
                                       op.reconvergencePC, address_space_id};
-        auto found = dvrAlternatePathCache.find(key);
-        if (found == dvrAlternatePathCache.end()) {
-            // FLR is path-specific: taken and fall-through discoveries can
-            // terminate at different dependent loads even though they share
-            // the same branch join.  The cached suffix is still valid when
-            // its branch/target/address-space match; it is inserted at the
-            // current discovery's reconvergence point below.
-            for (auto candidate = dvrAlternatePathCache.begin();
-                 candidate != dvrAlternatePathCache.end(); ++candidate) {
-                if (candidate->first.branchPC == op.pc &&
-                    candidate->first.targetPC == alternate_target &&
-                    candidate->first.addressSpaceID == address_space_id) {
-                    found = candidate;
-                    ++cpuStats.dvrAlternatePathReconvergenceFallbacks;
-                    dvrTraceVector("alternate_path_reconvergence_fallback",
-                        curTick(), op.pc, alternate_target,
-                        candidate->second.uops.size(),
-                        static_cast<int>(address_space_id));
-                    break;
-                }
-            }
-        }
+        const auto found = dvrAlternatePathCache.find(key);
         if (found == dvrAlternatePathCache.end())
             continue;
         ++cpuStats.dvrAlternatePathHits;
@@ -4993,6 +5252,7 @@ CPU::beginDVRDiscoveryAtDispatch(
     } else {
         dvrDiscovery.arm(candidate, inst->seqNum);
     }
+    dvrDiscoverySwitchedInnermost = restart;
     dvrStrideDetector.beginDiscovery(candidate.pc);
     ++cpuStats.dvrDiscoveryStarts;
 
@@ -5032,14 +5292,26 @@ CPU::observeDVRDispatch(const DynInstPtr &inst)
             dvrDiscovery.isDiscovering() ? dvrCurrentTriggerPC : 0);
         if (candidate) {
             ++cpuStats.dvrStrideCandidates;
-            if (dvrMode == "vr") {
+            if (dvrMode == "vr" &&
+                rob.isFull(inst->threadNumber)) {
                 launchDVRVectorRunahead(inst->threadNumber, candidate->address,
                                         candidate->pc, candidate->stride);
-            } else if (candidate->repeatedDuringDiscovery &&
+            } else if (dvrMode == "offload") {
+                // Figure 8 Offload starts the same vector-runahead work
+                // proactively, without waiting for a full ROB or Discovery.
+                launchDVRVectorRunahead(inst->threadNumber, candidate->address,
+                                        candidate->pc, candidate->stride);
+            } else if (!dvrDiscoverySwitchedInnermost &&
+                       candidate->repeatedDuringDiscovery &&
                        dvrDiscovery.isDiscovering() &&
                        candidate->pc != dvrCurrentTriggerPC) {
                 ++cpuStats.dvrDiscoveryInnermostSwitches;
+                dvrDiscoverySwitchedInnermost = true;
                 beginDVRDiscoveryAtDispatch(inst, *candidate, true);
+            } else if (dvrMode == "vr") {
+                // Classic VR only enters runahead after the ROB trigger;
+                // do not accidentally arm the DVR Discovery path for every
+                // stride observed while the ROB still has free entries.
             } else if (dvrDiscovery.isDiscovering() ||
                        dvrNestedDiscoveryMode.active()) {
                 if (!dvrPendingNestedCandidate.valid ||

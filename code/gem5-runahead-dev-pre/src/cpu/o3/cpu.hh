@@ -438,6 +438,20 @@ class CPU : public BaseCPU
     bool removeInstsThisCycle;
 
   protected:
+    class DVRInstructionFetchPort : public RequestPort
+    {
+      private:
+        CPU *cpu;
+
+      public:
+        DVRInstructionFetchPort(CPU *owner) :
+            RequestPort("dvr_icache_port", owner), cpu(owner) {}
+
+      protected:
+        bool recvTimingResp(PacketPtr pkt) override;
+        void recvReqRetry() override;
+    } dvrInstructionPort;
+
     /** The fetch stage. */
     Fetch fetch;
 
@@ -606,6 +620,9 @@ class CPU : public BaseCPU
         return fetch.getInstPort();
     }
 
+    Port &getPort(const std::string &if_name,
+                  PortID idx=InvalidPortID) override;
+
     /** Get the dcache port (used to find block size for translations). */
     Port &
     getDataPort() override
@@ -716,6 +733,9 @@ class CPU : public BaseCPU
         statistics::Scalar dvrHelperInstructionFetchFaults;
         statistics::Scalar dvrHelperInstructionsDecoded;
         statistics::Scalar dvrHelperDecodeFallbacks;
+        statistics::Scalar dvrHelperInstructionTimingRequests;
+        statistics::Scalar dvrHelperInstructionTimingResponses;
+        statistics::Scalar dvrHelperInstructionTimingRetries;
         statistics::Scalar dvrHelperFetchBlockedByMain;
         statistics::Scalar dvrHelperDecodeBlockedByMain;
         statistics::Scalar dvrHelperVIRCapacityStalls;
@@ -769,7 +789,6 @@ class CPU : public BaseCPU
         statistics::Scalar dvrPrefetchesIssued;
         statistics::Scalar dvrPrefetchesCompleted;
         statistics::Scalar dvrPrefetchesDropped;
-        statistics::Scalar dvrPrefetchesCrossingLine;
         statistics::Scalar dvrPrefetchTranslationFaults;
         statistics::Scalar dvrSourcePrefetchTranslationFaults;
         statistics::Scalar dvrDependentPrefetchTranslationFaults;
@@ -831,10 +850,13 @@ class CPU : public BaseCPU
         statistics::Scalar dvrAlternatePathCompleteHits;
         statistics::Scalar dvrAlternatePathLiveInRejects;
         statistics::Scalar dvrAlternatePathIncompleteRejects;
+        statistics::Scalar dvrAlternatePathUnsupportedRejects;
+        statistics::Scalar dvrAlternatePathControlRejects;
+        statistics::Scalar dvrAlternatePathDirectJumps;
+        statistics::Scalar dvrAlternatePathSafeSkips;
         statistics::Scalar dvrAlternatePathUopsReplayed;
         statistics::Scalar dvrAlternatePathDependentTargets;
         statistics::Scalar dvrAlternatePathDemandCovered;
-        statistics::Scalar dvrAlternatePathReconvergenceFallbacks;
         statistics::Scalar dvrReconvergenceResumeSuccesses;
         statistics::Scalar dvrQualityIssuedBytes;
         statistics::Scalar dvrQualityCompletedBytes;
@@ -847,6 +869,10 @@ class CPU : public BaseCPU
         statistics::Scalar dvrHelperLaunchCapacityDrops;
         statistics::Scalar dvrHelperLaunchZeroLanes;
         statistics::Scalar dvrPrefetchesDeduplicated;
+        statistics::Scalar oraclePrefetchesGenerated;
+        statistics::Scalar oraclePrefetchesIssued;
+        statistics::Scalar oraclePrefetchesCompleted;
+        statistics::Scalar oracleDemandCovered;
     } cpuStats;
 
   public:
@@ -997,6 +1023,7 @@ class CPU : public BaseCPU
         static constexpr unsigned MaxRelations = 4;
         bool source;
         bool nested;
+        bool oracle;
         unsigned relationCount;
         std::array<int64_t, MaxRelations> scales;
         std::array<int64_t, MaxRelations> offsets;
@@ -1008,6 +1035,7 @@ class CPU : public BaseCPU
         ThreadID tid;
 
         DVRPrefetchSenderState(bool is_source, bool is_nested,
+            bool is_oracle,
             unsigned relation_count,
             const std::array<int64_t, MaxRelations> &relation_scales,
             const std::array<int64_t, MaxRelations> &relation_offsets,
@@ -1054,6 +1082,13 @@ class CPU : public BaseCPU
     unsigned dvrMaxLanes;
     unsigned dvrHelperMaxUops;
     bool dvrEnableDependentPrefetch;
+    bool oraclePrefetch;
+    std::string oracleTraceFile;
+    unsigned oracleLookahead;
+    std::vector<Addr> oracleLoadTrace;
+    uint64_t oracleLoadIndex = 0;
+    std::unordered_set<Addr> oracleCompletedLines;
+    void oracleOnCommittedLoad(Addr address, ThreadID tid);
     bool dvrVectorChunkModel;
     bool dvrVectorUnlimitedFU;
     unsigned dvrVectorElementBits;
@@ -1078,6 +1113,7 @@ class CPU : public BaseCPU
         Addr pc;
         ThreadID tid;
         bool source;
+        bool oracle = false;
         bool nested = false;
         unsigned relationCount = 0;
         std::array<int64_t, DVRPrefetchSenderState::MaxRelations> scales = {};
@@ -1087,7 +1123,6 @@ class CPU : public BaseCPU
         std::shared_ptr<const DVRReplayTemplate> replay;
         std::shared_ptr<DVRPredicateGeneration> predicate;
         unsigned lane = 0;
-        bool alternatePath = false;
     };
 
     /**
@@ -1499,7 +1534,11 @@ class CPU : public BaseCPU
                         uop.semantic ==
                             DVRInstructionRecorder::Uop::Semantic::LoadByteSigned ||
                         uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::LoadByteUnsigned ||
+                        uop.semantic ==
                             DVRInstructionRecorder::Uop::Semantic::LoadHalfSigned ||
+                        uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::LoadHalfUnsigned ||
                         uop.semantic ==
                             DVRInstructionRecorder::Uop::Semantic::LoadWordSigned ||
                         uop.semantic ==
@@ -1689,6 +1728,8 @@ class CPU : public BaseCPU
     // need one request per cache line.
     std::unordered_set<Addr> dvrQueuedPrefetchAddresses;
     std::unordered_set<Addr> dvrOutstandingPrefetchAddresses;
+    std::unordered_set<Addr> dvrInstructionFetchPending;
+    PacketPtr dvrInstructionRetryPkt = nullptr;
     std::unordered_set<Addr> dvrQueuedDependentLines;
     struct DVRAddressRelation
     {
@@ -1777,6 +1818,10 @@ class CPU : public BaseCPU
     std::shared_ptr<DVRPredicateGeneration> dvrActivePredicateGeneration;
     Addr dvrCurrentTriggerPC = 0;
     Addr dvrCurrentTriggerAddress = 0;
+    // The paper permits one innermost-stride handoff per Discovery
+    // generation. Without this guard, repeated outer loads can restart the
+    // same Discovery and starve completion/replay.
+    bool dvrDiscoverySwitchedInnermost = false;
     uint8_t dvrSelectedRelationSlots = 0;
     RegVal dvrInitiatingLoadValue = 0;
     struct DVRPendingNestedCandidate
@@ -1862,6 +1907,16 @@ class CPU : public BaseCPU
                                    &finish_regs);
     void launchDVRVectorRunahead(ThreadID tid, Addr current_address,
                                  Addr pc, int64_t stride);
+    struct DVRInstructionFetchState : public Packet::SenderState
+    {
+        Addr pc = 0;
+        ThreadID tid = 0;
+        StaticInstPtr captured;
+    };
+    void completeDVRInstructionFetch(PacketPtr pkt);
+    void retryDVRInstructionFetch();
+    bool requestDVRInstructionFetch(ThreadID tid, Addr pc,
+                                    const StaticInstPtr &captured);
     StaticInstPtr fetchDecodeDVRUop(ThreadID tid, Addr pc,
                                     const StaticInstPtr &captured,
                                     bool &fetch_fault, bool &cache_hit);
