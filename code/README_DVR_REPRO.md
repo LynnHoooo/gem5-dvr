@@ -1542,7 +1542,7 @@ late 较高                         = 预取发出过晚，不能及时隐藏 mi
 | `5. Recorder / replay` | `recorded metadata uops`、`programs built`、`unsupported`、`overflows` | recorder 保存的是 replay 所需的指令 metadata。`unsupported=0` 最好；`overflows>0` 表示有 discovery 超过 recorder 可保存的模板，需要单独修复，不能把这一轮称为所有链都被完整记录。 |
 | `6. VRAT` | `programs`、`lane register writes` | VRAT 是 helper 私有的向量寄存器表。每个 replay program 应创建一个 VRAT，source response 应写入 lane register。 |
 | `7. Vectorizer` | `source lanes`、`dependent lanes` 和 CSV 样例 | source lane 是未来规则地址；dependent lane 是读取 source value 后计算出的间接目标。脚本会将 stats 和 CSV 条目逐个计数比较。 |
-| `8. VIR` | `mask failures`、`multi-lane groups`、`maximum group width` | VIR 把 ready 且 PC 相同的 lane 合并。Camel 使用 64-bit element 和 512-bit chunk，所以最大宽度是 8。`multi-lane groups>0` 才证明不是每个 lane 都单独执行。 |
+| `8. VIR` | `mask failures`、`multi-lane groups`、`maximum group width`、control fallback | VIR 把 ready 且 PC 相同的 lane 合并。Camel 使用 64-bit element 和 512-bit chunk，所以最大宽度是 8。`multi-lane groups>0` 才证明不是每个 lane 都单独执行。若 initial VIR audit 有 unsupported semantic，必须同时看到 persistent continuation fallback 为 0，才说明 source response 进入了新的持久化 helper 路径，而不是临时单 lane fallback。 |
 | `9. Helper uop` | `decoded/issued/completed`、fetch/decode | 三个数量相等表示每个 helper uop 都走完生命周期。这里是独立 helper 的轻量 front-end 和 `DVRDynUop`，不是主线程的 DynInst/ROB/commit。 |
 | `10. FU` | `requests/grants/stalls`、ALU/shift/multiply chunks | helper uop 先申请共享 FU，再获得 grant。Camel 的计算主要是 ALU；`vector FU conflict cycles=0` 只表示 Camel 主线程没有 SIMD 指令，不能证明 SIMD 竞争已被测试。 |
 | `11. LSQ / cache` | source/dependent generated、issued、completed | source 和 dependent 是两种请求。总生成量应满足 `source generated + dependent generated = total issued = total completed`；source 必须使用真实返回值，dependent 才能继续 replay。 |
@@ -1566,6 +1566,10 @@ Full Vector speedup            1.034017x
 
 因此可以得出：Camel 已经验证普通 DVR data path 有实际执行和约 `1.034x`
 性能收益；它没有验证 NDM flatten，也没有验证主线程 SIMD 与 helper 的 FU
-竞争。另有 1 次 recorder overflow，应在后续长模板实验中消除。当前结果最准确
-的命名仍是 `DVR-Offload+Discovery` 或 `ISA-adapted execution-driven DVR`，
-不是完整 Sniper/DynInst bit-exact reproduction。
+竞争。当前 Camel 的 initial VIR audit 仍会对部分 captured semantic 产生
+unsupported 计数，并通过显式 source-helper control fallback 继续执行；这部分
+不能宣称为完整 initial VIR 语义覆盖。不过 persistent continuation 的 fallback、
+timeout 和 stack overflow 都应为 0，且本轮满足这一条件。另有 1 次 recorder
+overflow，应在后续长模板实验中消除。当前结果最准确的命名仍是
+`DVR-Offload+Discovery` 或 `ISA-adapted execution-driven DVR`，不是完整
+Sniper/DynInst bit-exact reproduction。

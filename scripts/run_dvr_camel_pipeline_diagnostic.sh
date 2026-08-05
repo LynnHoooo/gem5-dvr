@@ -229,19 +229,42 @@ max_group="$(stat dvrVIRContinuationMaxGroupWidth)"
 chunks="$(stat dvrVectorChunkRequests)"
 multi_lane_groups="$(awk -F, '$2 == "vir_issue_group" && $5 >= 2 {++n} END {print n + 0}' \
     "$TRACE/vectorization.csv")"
+vir_unsupported_cf="$(stat dvrVIRUnsupportedControlFlow)"
+vir_unsupported_sem="$(stat dvrVIRUnsupportedSemanticLanes)"
+control_fallbacks="$(stat dvrControlFallbackSourceLaunches)"
+continuation_contexts="$(stat dvrVIRContinuationContexts)"
+continuation_resumes="$(stat dvrVIRContinuationResumes)"
+continuation_fallbacks="$(stat dvrVIRContinuationFallbacks)"
+helper_timeouts="$(stat dvrHelperTimeouts)"
+stack_overflows="$(stat dvrReconvergenceStackOverflows)"
 line "active-mask checks/failures" "$mask_checks/$mask_failures"
 line "same-PC VIR groups" "$groups"
 line "groups with at least 2 lanes" "$multi_lane_groups"
 line "lanes in VIR groups" "$group_lanes"
 line "maximum group width" "$max_group"
 line "vector chunk requests" "$chunks"
+line "initial VIR unsupported CF/semantic lanes" "$vir_unsupported_cf/$vir_unsupported_sem"
+line "source launch control fallbacks" "$control_fallbacks"
+line "persistent contexts/resumes/fallbacks" \
+    "$continuation_contexts/$continuation_resumes/$continuation_fallbacks"
+line "helper timeouts/stack overflows" "$helper_timeouts/$stack_overflows"
 positive "VIR performed no mask check" "$mask_checks"
 equal "VIR active-mask failures" "$mask_failures" 0
 positive "VIR formed no issue group" "$groups"
 positive "VIR formed no multi-lane group" "$multi_lane_groups"
 equal "VIR trace/stat maximum width" "$trace_max_group" "$max_group"
+equal "persistent continuation fallback" "$continuation_fallbacks" 0
+equal "helper timeout" "$helper_timeouts" 0
+equal "reconvergence stack overflow" "$stack_overflows" 0
+positive "persistent VIR context was never created" "$continuation_contexts"
+positive "persistent VIR never resumed a source response" "$continuation_resumes"
 [[ "$max_group" -ge 2 ]] || fail "Camel did not form a multi-lane VIR group"
 [[ "$max_group" -le 8 ]] || fail "64-bit 512-bit chunk exceeded 8 lanes"
+if [[ "$vir_unsupported_cf" -gt 0 || "$vir_unsupported_sem" -gt 0 ]]; then
+    warn "initial VIR audit rejected some captured semantics; Camel used the explicit source-helper control fallback"
+else
+    pass "initial VIR audit accepted all captured semantics"
+fi
 pass "active masks match grouped lanes and same-PC batching occurred"
 printf '  VIR group samples:\n'
 awk -F, '$2 == "vir_issue_group" {print "    " $0; if (++n == 8) exit}' \
