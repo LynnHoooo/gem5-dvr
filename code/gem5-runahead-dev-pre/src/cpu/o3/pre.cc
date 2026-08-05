@@ -1371,6 +1371,7 @@ DVRVectorInstructionRegister::resumeSourceLane(
         const auto &op = source[op_index];
         if (lanePendingReconvergence[lane][op_index]) {
             ++result.reconvergences;
+            ++result.alternatePathReconvergences;
             lanePendingReconvergence[lane][op_index] = false;
             if (laneStackDepth[lane] != 0)
                 --laneStackDepth[lane];
@@ -1390,6 +1391,16 @@ DVRVectorInstructionRegister::resumeSourceLane(
             const Addr next = taken ? op.branchTargetPC :
                 (op.fallthroughPC != 0 ? op.fallthroughPC :
                  (op_index + 1 < size ? source[op_index + 1].pc : 0));
+            const Addr captured_target = op.branchTaken ?
+                op.branchTargetPC : op.fallthroughPC;
+            if (next != captured_target && op.reconvergencePC != 0) {
+                for (unsigned candidate = 1; candidate < size; ++candidate) {
+                    if (source[candidate].pc == op.reconvergencePC) {
+                        lanePendingReconvergence[lane][candidate] = true;
+                        break;
+                    }
+                }
+            }
             lanePC[lane] = next;
             ++result.helperUops;
             ++result.chunkIssues;
@@ -1585,6 +1596,15 @@ DVRVectorInstructionRegister::resumeSourceLanes(
         const auto &op = source[op_index];
         if (op.alternatePath)
             ++result.alternatePathUops;
+        for (unsigned candidate_lane = 0;
+             candidate_lane < continuationLanes; ++candidate_lane) {
+            if (laneActive[candidate_lane] && laneReady[candidate_lane] &&
+                lanePC[candidate_lane] == group_pc &&
+                lanePendingReconvergence[candidate_lane][op_index]) {
+                ++result.alternatePathReconvergences;
+                lanePendingReconvergence[candidate_lane][op_index] = false;
+            }
+        }
         ++result.pcGroups;
         bool any_active = false;
         unsigned group_lanes = 0;
