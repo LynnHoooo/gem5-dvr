@@ -1505,3 +1505,67 @@ RPT candidate
 独立 `DVRDynUop -> VIR -> IEW::tryIssueDVRHelperFU -> FUPool` 路径；它仍不进入
 主线程 `DynInst -> rename -> IQ -> ROB -> commit`，因此这里的结论是
 “ISA-adapted execution-driven helper”，不是 bit-exact 的 Sniper DVR。
+
+### 18.2 Camel Figure 3 pipeline diagnostic：初学者阅读方法
+
+本节对应脚本
+`scripts/run_dvr_camel_pipeline_diagnostic.sh`。它不检查程序退出/清理结构，
+只检查普通 DVR data path：RPT、Discovery、VTT/FLR、loop bound、recorder、
+VRAT、vectorizer、VIR、helper uop、FU 和 LSQ/cache。运行：
+
+```bash
+cd /home/lynnhoo/dvr-repro/source/gem5-dvr-next
+BENCH=/home/lynnhoo/dvr-repro/results/camel-dvr-trace-c_lw-full/camel.riscv \
+  bash scripts/run_dvr_camel_pipeline_diagnostic.sh
+```
+
+脚本会打印一个新的结果目录。最重要的阅读方法是：
+
+```text
+数量 > 0                         = 该模块确实被执行
+generated == issued == completed  = 请求没有卡在 helper/cache 队列
+issued == completed               = 已发出的请求都收到 response
+mask failures == 0                = active lane mask 没有和实际 lane 不一致
+max group width >= 2              = 至少有一次真正的多 lane 同 PC issue
+useful/covered > 0                = 预取至少帮助了主线程的一部分访问
+late 较高                         = 预取发出过晚，不能及时隐藏 miss
+```
+
+下面按图中的模块解释每一段输出。
+
+| 输出段 | 看什么 | 说明 |
+|---|---|---|
+| `1. RPT / stride detector` | `loads observed`、`stride candidates` | RPT 先观察主线程 load，再判断哪些 load 的地址呈固定步长。candidate 不能为零，否则后面不会启动 DVR。 |
+| `2. Discovery Mode` | `starts`、`completions`、`timeouts` | `starts` 表示触发了 Discovery；`completions` 表示找到了可以结束的 discovery。timeout 不一定是错误，但过多说明探索经常没有在限制内完成。 |
+| `3. VTT / taint / FLR` | `tainted instructions`、`dependent loads`、`discoveries with FLR` | taint 表示“这条指令的输入来自 trigger load”；dependent load 是最终间接地址 load；FLR 是 Discovery 找到的最终 load register。三者都为正，说明依赖链确实被追踪。 |
+| `4. Loop-bound detector` | `bounds`、`matches`、`lane-count samples` | bound 是循环剩余次数，lane count 是要向量化的迭代数量。`matches` 表示两个动态寄存器快照支持这个推断；`fallbacks` 表示推断失败而使用最大 lane 数，应作为准确率风险观察。 |
+| `5. Recorder / replay` | `recorded metadata uops`、`programs built`、`unsupported`、`overflows` | recorder 保存的是 replay 所需的指令 metadata。`unsupported=0` 最好；`overflows>0` 表示有 discovery 超过 recorder 可保存的模板，需要单独修复，不能把这一轮称为所有链都被完整记录。 |
+| `6. VRAT` | `programs`、`lane register writes` | VRAT 是 helper 私有的向量寄存器表。每个 replay program 应创建一个 VRAT，source response 应写入 lane register。 |
+| `7. Vectorizer` | `source lanes`、`dependent lanes` 和 CSV 样例 | source lane 是未来规则地址；dependent lane 是读取 source value 后计算出的间接目标。脚本会将 stats 和 CSV 条目逐个计数比较。 |
+| `8. VIR` | `mask failures`、`multi-lane groups`、`maximum group width` | VIR 把 ready 且 PC 相同的 lane 合并。Camel 使用 64-bit element 和 512-bit chunk，所以最大宽度是 8。`multi-lane groups>0` 才证明不是每个 lane 都单独执行。 |
+| `9. Helper uop` | `decoded/issued/completed`、fetch/decode | 三个数量相等表示每个 helper uop 都走完生命周期。这里是独立 helper 的轻量 front-end 和 `DVRDynUop`，不是主线程的 DynInst/ROB/commit。 |
+| `10. FU` | `requests/grants/stalls`、ALU/shift/multiply chunks | helper uop 先申请共享 FU，再获得 grant。Camel 的计算主要是 ALU；`vector FU conflict cycles=0` 只表示 Camel 主线程没有 SIMD 指令，不能证明 SIMD 竞争已被测试。 |
+| `11. LSQ / cache` | source/dependent generated、issued、completed | source 和 dependent 是两种请求。总生成量应满足 `source generated + dependent generated = total issued = total completed`；source 必须使用真实返回值，dependent 才能继续 replay。 |
+| `11b. Prefetch quality` | accuracy、coverage、timeliness、pollution | 这是“发出请求”之后的效果检查。coverage 表示减少了多少原本会发生的 miss；timeliness 表示是否及时；pollution 表示预取是否挤掉了有用 cache line。 |
+
+当前 Camel 结果的简化读法：
+
+```text
+RPT candidates                 8546
+Discovery starts/completions   2082/2074
+discoveries with FLR           2055
+loop-bound matches             2024
+source/dependent lanes         184120/8475
+VRAT programs/writes           2024/368240
+DynUop decoded/issued/done     205098/205098/205098
+VIR mask checks/failures       205098/0
+multi-lane max group           8
+source/dependent issued/done   184120/184120, 8475/8475
+Full Vector speedup            1.034017x
+```
+
+因此可以得出：Camel 已经验证普通 DVR data path 有实际执行和约 `1.034x`
+性能收益；它没有验证 NDM flatten，也没有验证主线程 SIMD 与 helper 的 FU
+竞争。另有 1 次 recorder overflow，应在后续长模板实验中消除。当前结果最准确
+的命名仍是 `DVR-Offload+Discovery` 或 `ISA-adapted execution-driven DVR`，
+不是完整 Sniper/DynInst bit-exact reproduction。
