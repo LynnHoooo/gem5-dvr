@@ -605,8 +605,12 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
             uop.loadBytes = 8;
             break;
           case 4:
-            uop.semantic = Semantic::LoadWordUnsigned;
-            uop.loadBytes = 4;
+            uop.semantic = Semantic::LoadByteUnsigned;
+            uop.loadBytes = 1;
+            break;
+          case 5:
+            uop.semantic = Semantic::LoadHalfUnsigned;
+            uop.loadBytes = 2;
             break;
           default: uop.semantic = Semantic::Unsupported; return;
         }
@@ -697,7 +701,9 @@ DVRInstructionRecorder::Uop::evaluate(
       case Semantic::AddImmediate:
       case Semantic::LoadAddress:
       case Semantic::LoadByteSigned:
+      case Semantic::LoadByteUnsigned:
       case Semantic::LoadHalfSigned:
+      case Semantic::LoadHalfUnsigned:
       case Semantic::LoadWordSigned:
       case Semantic::LoadWordUnsigned:
       case Semantic::LoadDouble:
@@ -811,10 +817,6 @@ DVRInstructionRecorder::record(const DynInstPtr &inst)
     Uop &uop = uops[count++];
     uop.pc = inst->pcState().instAddr();
     uop.staticInst = inst->staticInst;
-    // DVR currently targets RV64; the fixed-width fall-through is sufficient
-    // for the compact helper program and avoids consulting architectural PC
-    // state during replay.
-    uop.fallthroughPC = uop.pc + 4;
     if (inst->isDirectCtrl())
         uop.branchTargetPC = inst->branchTarget()->instAddr();
     uop.intSources = dvrIntRegisterMask(inst, true);
@@ -827,6 +829,11 @@ DVRInstructionRecorder::record(const DynInstPtr &inst)
     uop.conditional = inst->isCondCtrl();
     uop.branchTaken = inst->pcState().branching();
     dvrDecodeRiscvSemantic(uop, inst);
+    // RISC-V compressed control-flow instructions advance by two bytes.
+    // Using a fixed four-byte fall-through silently sends C.BEQZ/C.BNEZ to
+    // the wrong PC and makes a valid alternate path look external.
+    uop.fallthroughPC = uop.pc +
+        (uop.encodingValid && (uop.encoding & 0x3) != 0x3 ? 2 : 4);
     return true;
 }
 
@@ -1141,6 +1148,28 @@ DVRVectorInstructionRegister::executeLanePC(
                 }
                 has_taken |= lane_taken;
                 has_fallthrough |= !lane_taken;
+                continue;
+            }
+
+            // A direct unconditional jump is control metadata, not an ALU
+            // operation.  Follow its resolved target so an alternate path
+            // can reach the shared reconvergence PC without being classified
+            // as an unsupported semantic.
+            if (op.control && !op.conditional && op.branchTargetPC != 0) {
+                lanePC[lane] = op.branchTargetPC;
+                if (lanePC[lane] == 0)
+                    ++result.earlyExitLanes;
+                else if (lanePC[lane] == program[0].pc)
+                    ++result.normalTerminatedLanes;
+                continue;
+            }
+
+            if (op.semantic == DVRInstructionRecorder::Uop::Semantic::Unsupported &&
+                !op.control && op.intDestinations == 0) {
+                lanePC[lane] = op_index + 1 < program.size() ?
+                    program[op_index + 1].pc : 0;
+                if (lanePC[lane] == 0)
+                    ++result.normalTerminatedLanes;
                 continue;
             }
 
@@ -1525,6 +1554,55 @@ DVRVectorInstructionRegister::resumeSourceLane(
             continue;
         }
 
+        if (op.control && !op.conditional && op.branchTargetPC != 0) {
+            const Addr captured_target = op.branchTaken ?
+                op.branchTargetPC : op.fallthroughPC;
+            if (op.branchTargetPC != captured_target &&
+                op.reconvergencePC != 0) {
+                for (unsigned candidate = 1; candidate < size; ++candidate) {
+                    if (source[candidate].pc == op.reconvergencePC) {
+                        lanePendingReconvergence[lane][candidate] = true;
+                        break;
+                    }
+                }
+            }
+            lanePC[lane] = op.branchTargetPC;
+            ++result.helperUops;
+            ++result.chunkIssues;
+            ++result.chunkExecutions;
+            if (lanePC[lane] == 0) {
+                ++result.earlyExitLanes;
+                laneActive[lane] = false;
+                activeMask[lane / 64] &=
+                    ~(uint64_t(1) << (lane % 64));
+                break;
+            }
+            if (lanePC[lane] == source[0].pc) {
+                ++result.normalTerminatedLanes;
+                laneActive[lane] = false;
+                activeMask[lane / 64] &=
+                    ~(uint64_t(1) << (lane % 64));
+                break;
+            }
+            continue;
+        }
+
+        if (op.semantic == DVRInstructionRecorder::Uop::Semantic::Unsupported &&
+            !op.control && op.intDestinations == 0) {
+            lanePC[lane] = op_index + 1 < size ? source[op_index + 1].pc : 0;
+            ++result.helperUops;
+            ++result.chunkIssues;
+            ++result.chunkExecutions;
+            if (lanePC[lane] == 0) {
+                ++result.normalTerminatedLanes;
+                laneActive[lane] = false;
+                activeMask[lane / 64] &=
+                    ~(uint64_t(1) << (lane % 64));
+                break;
+            }
+            continue;
+        }
+
         RegVal value = 0;
         if (!op.evaluate(lhs, rhs, value)) {
             result.unsupportedControlFlow = true;
@@ -1758,6 +1836,44 @@ DVRVectorInstructionRegister::resumeSourceLanes(
                     activeMask[candidate_lane / 64] &=
                         ~(uint64_t(1) << (candidate_lane % 64));
                 } else if (next == source[0].pc) {
+                    ++result.normalTerminatedLanes;
+                    laneActive[candidate_lane] = false;
+                    laneReady[candidate_lane] = false;
+                    activeMask[candidate_lane / 64] &=
+                        ~(uint64_t(1) << (candidate_lane % 64));
+                }
+                continue;
+            }
+
+            if (op.control && !op.conditional && op.branchTargetPC != 0) {
+                lanePC[candidate_lane] = op.branchTargetPC;
+                ++result.helperUops;
+                ++result.chunkIssues;
+                ++result.chunkExecutions;
+                if (lanePC[candidate_lane] == 0) {
+                    ++result.earlyExitLanes;
+                    laneActive[candidate_lane] = false;
+                    laneReady[candidate_lane] = false;
+                    activeMask[candidate_lane / 64] &=
+                        ~(uint64_t(1) << (candidate_lane % 64));
+                } else if (lanePC[candidate_lane] == source[0].pc) {
+                    ++result.normalTerminatedLanes;
+                    laneActive[candidate_lane] = false;
+                    laneReady[candidate_lane] = false;
+                    activeMask[candidate_lane / 64] &=
+                        ~(uint64_t(1) << (candidate_lane % 64));
+                }
+                continue;
+            }
+
+            if (op.semantic == DVRInstructionRecorder::Uop::Semantic::Unsupported &&
+                !op.control && op.intDestinations == 0) {
+                lanePC[candidate_lane] = op_index + 1 < size ?
+                    source[op_index + 1].pc : 0;
+                ++result.helperUops;
+                ++result.chunkIssues;
+                ++result.chunkExecutions;
+                if (lanePC[candidate_lane] == 0) {
                     ++result.normalTerminatedLanes;
                     laneActive[candidate_lane] = false;
                     laneReady[candidate_lane] = false;

@@ -20,7 +20,10 @@ OUT_ROOT="${OUT_ROOT:-$HOME/dvr-repro/results/dvr-figure8}"
 BENCHES_CSV="${BENCHES_CSV:-bc,bfs,cc,pr,sssp,hpc-db}"
 OPTIONS="${OPTIONS:--g 10 -n 1}"
 
-gem5="$ROOT/build/RISCV/gem5.opt"
+gem5="${GEM5_BIN:-$HOME/build/RISCV/gem5.opt}"
+if [[ ! -x "$gem5" ]]; then
+    gem5="$ROOT/build/RISCV/gem5.opt"
+fi
 config="$ROOT/configs/dvr/table1_se.py"
 test -x "$gem5"
 test -f "$config"
@@ -47,10 +50,14 @@ run_case() {
 
     case "$mode" in
         Baseline) args=() ;;
-        VR)       args=(--dvr --dvr-mode=vr) ;;
-        Offload)  args=(--dvr --dvr-mode=offload) ;;
-        Discovery) args=(--dvr --dvr-mode=full) ;;
-        Multiple) args=(--dvr --dvr-mode=nested) ;;
+        # Figure 8 compares the DVR mechanisms on the same vector-runahead
+        # substrate.  Leaving vector chunks disabled silently turns every
+        # DVR bar into the scalar helper model and prevents source responses
+        # from entering the vector replay path.
+        VR)       args=(--dvr --dvr-mode=vr --dvr-vector-chunks) ;;
+        Offload)  args=(--dvr --dvr-mode=offload --dvr-vector-chunks) ;;
+        Discovery) args=(--dvr --dvr-mode=full --dvr-vector-chunks) ;;
+        Multiple) args=(--dvr --dvr-mode=nested --dvr-vector-chunks) ;;
         *)        echo "unknown mode: $mode" >&2; exit 2 ;;
     esac
 

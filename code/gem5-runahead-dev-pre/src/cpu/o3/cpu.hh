@@ -712,6 +712,10 @@ class CPU : public BaseCPU
         statistics::Scalar dvrHelperDynUopsCompleted;
         statistics::Scalar dvrHelperDecodedCacheHits;
         statistics::Scalar dvrHelperDecodedCacheMisses;
+        statistics::Scalar dvrHelperInstructionFetches;
+        statistics::Scalar dvrHelperInstructionFetchFaults;
+        statistics::Scalar dvrHelperInstructionsDecoded;
+        statistics::Scalar dvrHelperDecodeFallbacks;
         statistics::Scalar dvrHelperFetchBlockedByMain;
         statistics::Scalar dvrHelperDecodeBlockedByMain;
         statistics::Scalar dvrHelperVIRCapacityStalls;
@@ -826,6 +830,10 @@ class CPU : public BaseCPU
         statistics::Scalar dvrAlternatePathCompleteHits;
         statistics::Scalar dvrAlternatePathLiveInRejects;
         statistics::Scalar dvrAlternatePathIncompleteRejects;
+        statistics::Scalar dvrAlternatePathUnsupportedRejects;
+        statistics::Scalar dvrAlternatePathControlRejects;
+        statistics::Scalar dvrAlternatePathDirectJumps;
+        statistics::Scalar dvrAlternatePathSafeSkips;
         statistics::Scalar dvrAlternatePathUopsReplayed;
         statistics::Scalar dvrAlternatePathDependentTargets;
         statistics::Scalar dvrAlternatePathDemandCovered;
@@ -841,6 +849,10 @@ class CPU : public BaseCPU
         statistics::Scalar dvrHelperLaunchCapacityDrops;
         statistics::Scalar dvrHelperLaunchZeroLanes;
         statistics::Scalar dvrPrefetchesDeduplicated;
+        statistics::Scalar oraclePrefetchesGenerated;
+        statistics::Scalar oraclePrefetchesIssued;
+        statistics::Scalar oraclePrefetchesCompleted;
+        statistics::Scalar oracleDemandCovered;
     } cpuStats;
 
   public:
@@ -991,6 +1003,7 @@ class CPU : public BaseCPU
         static constexpr unsigned MaxRelations = 4;
         bool source;
         bool nested;
+        bool oracle;
         unsigned relationCount;
         std::array<int64_t, MaxRelations> scales;
         std::array<int64_t, MaxRelations> offsets;
@@ -1002,6 +1015,7 @@ class CPU : public BaseCPU
         ThreadID tid;
 
         DVRPrefetchSenderState(bool is_source, bool is_nested,
+            bool is_oracle,
             unsigned relation_count,
             const std::array<int64_t, MaxRelations> &relation_scales,
             const std::array<int64_t, MaxRelations> &relation_offsets,
@@ -1048,6 +1062,13 @@ class CPU : public BaseCPU
     unsigned dvrMaxLanes;
     unsigned dvrHelperMaxUops;
     bool dvrEnableDependentPrefetch;
+    bool oraclePrefetch;
+    std::string oracleTraceFile;
+    unsigned oracleLookahead;
+    std::vector<Addr> oracleLoadTrace;
+    uint64_t oracleLoadIndex = 0;
+    std::unordered_set<Addr> oracleCompletedLines;
+    void oracleOnCommittedLoad(Addr address, ThreadID tid);
     bool dvrVectorChunkModel;
     bool dvrVectorUnlimitedFU;
     unsigned dvrVectorElementBits;
@@ -1072,6 +1093,7 @@ class CPU : public BaseCPU
         Addr pc;
         ThreadID tid;
         bool source;
+        bool oracle = false;
         bool nested = false;
         unsigned relationCount = 0;
         std::array<int64_t, DVRPrefetchSenderState::MaxRelations> scales = {};
@@ -1113,6 +1135,11 @@ class CPU : public BaseCPU
         Tick computeReadyTick = 0;
         bool vectorChunkModel = false;
         Addr helperPC = 0;
+        ThreadID frontendTid = 0;
+        unsigned frontendUopIndex = 0;
+        unsigned lastFetched = 0;
+        unsigned lastDecoded = 0;
+        std::shared_ptr<const DVRReplayTemplate> frontendReplay;
 
         enum class ComputeKind { Alu, Add, Shift, Multiply };
         struct DVRDynUop
@@ -1215,6 +1242,11 @@ class CPU : public BaseCPU
             computeReadyTick = 0;
             vectorChunkModel = false;
             helperPC = 0;
+            frontendTid = 0;
+            frontendUopIndex = 0;
+            lastFetched = 0;
+            lastDecoded = 0;
+            frontendReplay.reset();
             issueQueue.clear();
             replayGenerations.clear();
             replayLanes.clear();
@@ -1227,7 +1259,8 @@ class CPU : public BaseCPU
                    unsigned units, unsigned budget,
                    const DVRInstructionRecorder::ResourceCounts &resources,
                    bool vector_model,
-                   std::shared_ptr<const DVRReplayTemplate> replay)
+                   std::shared_ptr<const DVRReplayTemplate> replay,
+                   ThreadID tid = 0)
         {
             id = helper_id;
             triggerPC = pc;
@@ -1235,6 +1268,11 @@ class CPU : public BaseCPU
             maxUops = budget;
             workUnits = units;
             helperPC = pc;
+            frontendTid = tid;
+            frontendUopIndex = 0;
+            lastFetched = 0;
+            lastDecoded = 0;
+            frontendReplay = replay;
             nextLane = 0;
             issuedUops = 0;
             outstanding = 0;
@@ -1264,7 +1302,7 @@ class CPU : public BaseCPU
         {
             if (state == State::Idle) {
                 begin(id, pc, uops, units, maxUops, resources, vector_model,
-                      replay);
+                      replay, frontendTid);
                 return;
             }
 
@@ -1288,6 +1326,8 @@ class CPU : public BaseCPU
 
         unsigned advanceFrontend(unsigned fetch_width, unsigned decode_width)
         {
+            lastFetched = 0;
+            lastDecoded = 0;
             if (state == State::Idle || state == State::Draining)
                 return 0;
 
@@ -1297,10 +1337,12 @@ class CPU : public BaseCPU
                 fetchRemaining -= fetched;
                 decodeRemaining += fetched;
             }
+            lastFetched = fetched;
 
             unsigned decoded = std::min(decode_width, decodeRemaining);
             decodeRemaining -= decoded;
             readyUops += decoded;
+            lastDecoded = decoded;
 
             if (fetchRemaining == 0 && decodeRemaining == 0 &&
                 readyUops == 0 && outstanding == 0) {
@@ -1472,7 +1514,11 @@ class CPU : public BaseCPU
                         uop.semantic ==
                             DVRInstructionRecorder::Uop::Semantic::LoadByteSigned ||
                         uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::LoadByteUnsigned ||
+                        uop.semantic ==
                             DVRInstructionRecorder::Uop::Semantic::LoadHalfSigned ||
+                        uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::LoadHalfUnsigned ||
                         uop.semantic ==
                             DVRInstructionRecorder::Uop::Semantic::LoadWordSigned ||
                         uop.semantic ==
@@ -1763,6 +1809,10 @@ class CPU : public BaseCPU
     std::shared_ptr<DVRPredicateGeneration> dvrActivePredicateGeneration;
     Addr dvrCurrentTriggerPC = 0;
     Addr dvrCurrentTriggerAddress = 0;
+    // The paper permits one innermost-stride handoff per Discovery
+    // generation. Without this guard, repeated outer loads can restart the
+    // same Discovery and starve completion/replay.
+    bool dvrDiscoverySwitchedInnermost = false;
     uint8_t dvrSelectedRelationSlots = 0;
     RegVal dvrInitiatingLoadValue = 0;
     struct DVRPendingNestedCandidate
@@ -1848,6 +1898,9 @@ class CPU : public BaseCPU
                                    &finish_regs);
     void launchDVRVectorRunahead(ThreadID tid, Addr current_address,
                                  Addr pc, int64_t stride);
+    StaticInstPtr fetchDecodeDVRUop(ThreadID tid, Addr pc,
+                                    const StaticInstPtr &captured,
+                                    bool &fetch_fault, bool &cache_hit);
     void completeDVRNestedContext(
         const DynInstPtr &committing_inst,
         const DVRLoopBoundDetector::RegisterSnapshot &finish_regs);
@@ -1872,7 +1925,7 @@ class CPU : public BaseCPU
                         const DVRInstructionRecorder::ResourceCounts
                         &resources = {},
                         std::shared_ptr<const DVRReplayTemplate> replay =
-                            nullptr);
+                            nullptr, ThreadID tid = 0);
     unsigned dvrHelperWorkUnits(unsigned lanes) const
     {
         if (!dvrVectorChunkModel)

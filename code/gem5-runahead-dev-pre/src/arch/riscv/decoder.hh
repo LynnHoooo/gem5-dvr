@@ -80,6 +80,15 @@ class Decoder : public InstDecoder
     void moreBytes(const PCStateBase &pc, Addr fetchPC) override;
 
     StaticInstPtr decode(PCStateBase &nextPC) override;
+
+    /** Decode one instruction word fetched by an independent helper. */
+    StaticInstPtr decodeRaw(uint32_t raw, Addr addr)
+    {
+        ExtMachInst inst = letoh(raw);
+        if (compressed(inst))
+            inst &= 0xffff;
+        return decode(inst, addr);
+    }
 };
 
 } // namespace RiscvISA
