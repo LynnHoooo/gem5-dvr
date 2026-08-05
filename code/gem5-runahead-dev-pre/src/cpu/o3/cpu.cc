@@ -44,6 +44,7 @@
 
 #include <cstdlib>
 #include <cstdio>
+#include <limits>
 
 #include "mem/packet_access.hh"
 
@@ -636,6 +637,14 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Helper-owned DVRDynUops issued to a shared FU"),
       ADD_STAT(dvrHelperDynUopsCompleted, statistics::units::Count::get(),
                "Helper-owned DVRDynUops completed"),
+      ADD_STAT(dvrHelperDecodedCacheHits, statistics::units::Count::get(),
+               "Helper decoded-uop cache hits"),
+      ADD_STAT(dvrHelperDecodedCacheMisses, statistics::units::Count::get(),
+               "Helper decoded-uop cache misses"),
+      ADD_STAT(dvrHelperFetchBlockedByMain, statistics::units::Cycle::get(),
+               "Helper fetch cycles denied by main-thread priority"),
+      ADD_STAT(dvrHelperDecodeBlockedByMain, statistics::units::Cycle::get(),
+               "Helper decode cycles denied by main-thread priority"),
       ADD_STAT(dvrHelperVIRCapacityStalls, statistics::units::Count::get(),
                "Helper uops blocked by the finite VIR capacity"),
       ADD_STAT(dvrHelperVRATPrograms, statistics::units::Count::get(),
@@ -1036,8 +1045,23 @@ CPU::tick()
     // fetch/decode/issue resources, while its own ready queue is visible to
     // the residual issue arbitration below.
     const unsigned ready_uops_before = dvrHelperThread.readyUops;
+    // The O3 stages have already run.  Their issue count is used as the
+    // conservative demand proxy for the shared front-end budget: main-thread
+    // work gets first claim, and only the residual fetch/decode width is
+    // offered to the independent helper.
+    const unsigned main_fetch_claim = std::min(
+        dvrFetchWidth, dvrMainIssuesThisCycle);
+    const unsigned main_decode_claim = std::min(
+        dvrDecodeWidth, dvrMainIssuesThisCycle);
+    const unsigned helper_fetch_width = dvrFetchWidth - main_fetch_claim;
+    const unsigned helper_decode_width = dvrDecodeWidth - main_decode_claim;
+    if (dvrHelperThread.fetchRemaining != 0 && helper_fetch_width == 0)
+        ++cpuStats.dvrHelperFetchBlockedByMain;
+    if (dvrHelperThread.decodeRemaining != 0 && helper_decode_width == 0)
+        ++cpuStats.dvrHelperDecodeBlockedByMain;
     const unsigned helper_frontend_work =
-        dvrHelperThread.advanceFrontend(dvrFetchWidth, dvrDecodeWidth);
+        dvrHelperThread.advanceFrontend(helper_fetch_width,
+                                        helper_decode_width);
     const unsigned ready_uops_after = dvrHelperThread.readyUops;
     if (helper_frontend_work != 0) {
         if (dvrHelperThread.fetchRemaining != 0 ||
@@ -3041,12 +3065,36 @@ CPU::issueDVRReplayLanes(unsigned slots)
         return 0;
 
     using Lane = CPU::DVRHelperThread::ReplayLaneContext;
+    const auto findPC = [](const std::shared_ptr<const DVRReplayTemplate> &program,
+                           Addr pc) {
+        if (!program || pc == 0)
+            return std::numeric_limits<unsigned>::max();
+        for (unsigned index = 1; index < program->count; ++index) {
+            if (program->uops[index].pc == pc)
+                return index;
+        }
+        return std::numeric_limits<unsigned>::max();
+    };
     const Lane *seed = nullptr;
     std::vector<Lane *> group;
     for (auto &lane : dvrHelperThread.replayLanes) {
         if (!lane.active || !lane.program ||
-            lane.uopIndex >= lane.program->count)
+            lane.uopIndex >= lane.program->count ||
+            lane.helperUops >= dvrHelperMaxUops)
             continue;
+        while (lane.reconvergenceDepth != 0 &&
+               lane.lanePC == lane.reconvergenceStack[
+                   lane.reconvergenceDepth - 1].pc) {
+            --lane.reconvergenceDepth;
+            ++cpuStats.dvrReconvergences;
+        }
+        const unsigned pc_index = findPC(lane.program, lane.lanePC);
+        if (pc_index == std::numeric_limits<unsigned>::max()) {
+            lane.active = false;
+            ++cpuStats.dvrVIRExternalPathLanes;
+            continue;
+        }
+        lane.uopIndex = pc_index;
         const auto &uop = lane.program->uops[lane.uopIndex];
         const unsigned lane_id = lane.lane;
         const auto &helper_regs = lane.program->helperRegs;
@@ -3112,7 +3160,13 @@ CPU::issueDVRReplayLanes(unsigned slots)
         static_cast<uint64_t>(latency) * clockPeriod();
     DVRHelperThread::DVRDynUop dyn_uop;
     dyn_uop.program = seed->program;
-    dyn_uop.staticInst = uop.staticInst;
+    bool decoded_cache_hit = false;
+    dyn_uop.staticInst = dvrHelperThread.decodeUop(
+        uop.pc, uop.staticInst, decoded_cache_hit);
+    if (decoded_cache_hit)
+        ++cpuStats.dvrHelperDecodedCacheHits;
+    else
+        ++cpuStats.dvrHelperDecodedCacheMisses;
     dyn_uop.uopIndex = seed->uopIndex;
     dyn_uop.opClass = op_class;
     dyn_uop.source0 = uop.source0;
@@ -3163,9 +3217,56 @@ CPU::issueDVRReplayLanes(unsigned slots)
         if (lane_uop.conditional) {
             bool taken = false;
             valid = lane_uop.evaluateBranch(source0, source1, taken);
-        } else {
-            valid = lane_uop.evaluate(source0, source1, result);
+            if (!valid) {
+                lane->active = false;
+                ++cpuStats.dvrVIRSourceValueSemanticFailures;
+                continue;
+            }
+
+            const Addr next_pc = taken ? lane_uop.branchTargetPC :
+                lane_uop.fallthroughPC;
+            const Addr captured_pc = lane_uop.branchTaken ?
+                lane_uop.branchTargetPC : lane_uop.fallthroughPC;
+            if (next_pc == 0 || next_pc == lane->triggerPC) {
+                lane->active = false;
+                ++cpuStats.dvrVIRNormalTerminatedLanes;
+                ++lane->helperUops;
+                continue;
+            }
+            const unsigned next_index = findPC(lane->program, next_pc);
+            if (next_index == std::numeric_limits<unsigned>::max()) {
+                lane->active = false;
+                ++cpuStats.dvrVIRExternalPathLanes;
+                ++lane->helperUops;
+                continue;
+            }
+            if (lane_uop.reconvergencePC != 0 &&
+                next_pc != lane_uop.reconvergencePC) {
+                if (lane->reconvergenceDepth >= Lane::ReconvergenceEntries) {
+                    lane->active = false;
+                    ++cpuStats.dvrVIRUnsupportedControlFlow;
+                    ++lane->helperUops;
+                    continue;
+                }
+                auto &frame = lane->reconvergenceStack[
+                    lane->reconvergenceDepth++];
+                frame.pc = lane_uop.reconvergencePC;
+                frame.deferredPC = captured_pc == next_pc ?
+                    (taken ? lane_uop.fallthroughPC :
+                             lane_uop.branchTargetPC) : captured_pc;
+                frame.alternatePath = next_pc != captured_pc;
+                ++cpuStats.dvrDivergentBranches;
+                if (frame.alternatePath)
+                    ++cpuStats.dvrAlternatePathUopsReplayed;
+            }
+            lane->lanePC = next_pc;
+            lane->uopIndex = next_index;
+            ++lane->helperUops;
+            if (lane->helperUops >= dvrHelperMaxUops)
+                lane->active = false;
+            continue;
         }
+        valid = lane_uop.evaluate(source0, source1, result);
         if (!valid) {
             lane->active = false;
             ++cpuStats.dvrVIRSourceValueSemanticFailures;
@@ -3252,9 +3353,13 @@ CPU::issueDVRReplayLanes(unsigned slots)
             ++cpuStats.dvrHelperVRATWrites;
         }
         lane->regs[0] = 0;
-        ++lane->uopIndex;
-        if (lane->uopIndex >= lane->program->count)
+        ++lane->helperUops;
+        lane->lanePC = lane->uopIndex + 1 < lane->program->count ?
+            lane->program->uops[lane->uopIndex + 1].pc : 0;
+        if (lane->lanePC == 0 || lane->helperUops >= dvrHelperMaxUops)
             lane->active = false;
+        else
+            lane->uopIndex = findPC(lane->program, lane->lanePC);
     }
     issued_dyn_uop.completeCycle = ready_tick;
     issued_dyn_uop.state = DVRHelperThread::DVRDynUop::State::Completed;

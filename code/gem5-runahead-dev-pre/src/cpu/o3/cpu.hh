@@ -709,6 +709,10 @@ class CPU : public BaseCPU
         statistics::Scalar dvrHelperDynUopsDecoded;
         statistics::Scalar dvrHelperDynUopsIssued;
         statistics::Scalar dvrHelperDynUopsCompleted;
+        statistics::Scalar dvrHelperDecodedCacheHits;
+        statistics::Scalar dvrHelperDecodedCacheMisses;
+        statistics::Scalar dvrHelperFetchBlockedByMain;
+        statistics::Scalar dvrHelperDecodeBlockedByMain;
         statistics::Scalar dvrHelperVIRCapacityStalls;
         statistics::Scalar dvrHelperVRATPrograms;
         statistics::Scalar dvrHelperVRATWrites;
@@ -1134,6 +1138,13 @@ class CPU : public BaseCPU
         };
         struct ReplayLaneContext
         {
+            struct ReconvergenceFrame
+            {
+                Addr pc = 0;
+                Addr deferredPC = 0;
+                bool alternatePath = false;
+            };
+            static constexpr unsigned ReconvergenceEntries = 8;
             std::shared_ptr<const DVRReplayTemplate> program;
             std::array<RegVal, DVRLoopBoundDetector::MaxArchitecturalIntRegs>
                 regs = {};
@@ -1149,6 +1160,11 @@ class CPU : public BaseCPU
             ThreadID tid = 0;
             Addr triggerPC = 0;
             unsigned uopIndex = 1;
+            Addr lanePC = 0;
+            std::array<ReconvergenceFrame, ReconvergenceEntries>
+                reconvergenceStack = {};
+            unsigned reconvergenceDepth = 0;
+            unsigned helperUops = 0;
             bool nested = false;
             bool active = true;
         };
@@ -1168,6 +1184,9 @@ class CPU : public BaseCPU
         std::deque<ReplayGeneration> replayGenerations;
         std::deque<ReplayLaneContext> replayLanes;
         std::deque<DVRDynUop> virBuffer;
+        // Decoded instructions belong to the helper context and never enter
+        // the main O3 fetch queue.
+        std::unordered_map<Addr, StaticInstPtr> decodedUopCache;
         std::array<Tick, ScoreboardRegisters> readyCycle = {};
 
         void reset()
@@ -1194,6 +1213,7 @@ class CPU : public BaseCPU
             replayGenerations.clear();
             replayLanes.clear();
             virBuffer.clear();
+            decodedUopCache.clear();
             readyCycle.fill(0);
         }
 
@@ -1226,6 +1246,7 @@ class CPU : public BaseCPU
             replayGenerations.clear();
             replayLanes.clear();
             virBuffer.clear();
+            decodedUopCache.clear();
             readyCycle.fill(0);
             state = fetchRemaining == 0 ? State::Idle : State::Fetch;
         }
@@ -1335,6 +1356,8 @@ class CPU : public BaseCPU
             lane_context.lane = sender.lane;
             lane_context.tid = sender.tid;
             lane_context.triggerPC = sender.replay->triggerPC;
+            lane_context.lanePC = sender.replay->count > 1 ?
+                sender.replay->uops[1].pc : 0;
             lane_context.nested = sender.nested;
             sender.replay->helperRegs->write(
                 sender.replay->triggerDestination, sender.lane,
@@ -1569,6 +1592,20 @@ class CPU : public BaseCPU
         }
 
         bool active() const { return state != State::Idle; }
+
+        StaticInstPtr decodeUop(Addr pc, const StaticInstPtr &decoded,
+                                bool &cache_hit)
+        {
+            auto found = decodedUopCache.find(pc);
+            if (found != decodedUopCache.end()) {
+                cache_hit = true;
+                return found->second;
+            }
+            cache_hit = false;
+            if (decoded)
+                decodedUopCache.emplace(pc, decoded);
+            return decoded;
+        }
     } dvrHelperThread;
     // Main O3 stages run first every cycle.  Helpers may consume at most one
     // residual issue/LSU slot after IEW has completed.

@@ -572,7 +572,7 @@ DVR_REGRESSION_PASSED quick=0
 summary=/home/lynnhoo/dvr-repro/results/dvr-regression-logs/20260730T134006Z.summary
 ```
 
-#### 9.3.2 当前 Nested Controller 不等于论文的 Nested Discovery Mode
+#### 9.3.2 Nested Discovery Mode 数据面状态
 
 论文 NDM 的完整语义包括：
 
@@ -586,31 +586,56 @@ summary=/home/lynnhoo/dvr-repro/results/dvr-regression-logs/20260730T134006Z.sum
 8. 展平为最多 128 个 inner lanes；
 9. 再从 inner stride 启动普通 DVR。
 
-当前实现主要是：root discovery 中发现另一个 candidate，candidate commit 后建立
-独立 child context，child recurrence 后按 child stride 生成 helper。它证明了两层
-独立 discovery/replay context 能发送真实内存请求，但尚缺 `<64 lane` 门槛、
-branch inversion、IR/ILR、outer invocation vectorization 和 inner-lane flatten。
+当前 next helper 分支已经把这些控制和数据面接通：完成的短 inner-loop discovery
+在 `<64` lanes 时进入 NDM，保存 IR/ILR/LCR，反转 inner backward branch，接受
+真实 committed outer stride，并把多个独立 outer invocation 的 inner bound 和
+起始地址展平为最多 128 个 scalar-equivalent lanes。NDM 的请求仍经过同一 helper
+生命周期和真实 LSQ/cache 路径。
 
-因此，当前 Stage 13 应描述为“两层独立上下文和真实 helper 验证”，不能描述为
-论文 4.3 节 NDM 的完整复现。
+验收不应只看 NDM 控制计数，还必须检查以下守恒关系：
 
-#### 9.3.3 helper 尚未完整共享论文中的执行资源
+```text
+nested_batches > 0
+outer_instances >= 2 * nested_batches
+flattened_lanes == expected_flattened_lanes
+flatten_invariant_failures == 0
+nested_helpers_generated >= flattened_lanes
+```
+
+`scripts/run_remote_dvr_helper_regression.sh` 会在
+`dvr_divergent.riscv`、`dvr_nested.riscv` 和
+`dvr_nested_variable.riscv` 上执行这组检查。当前 next binary 的两个 Nested
+结果为：普通 nested `6292` batches、`12584` outer instances、`765240`
+flattened lanes；variable nested `1518` batches、`3036` outer instances、
+`55734` flattened lanes 和 `1210` 个 variable-lane batches。两组的 flatten
+invariant failures 都为 0。
+
+这证明了论文 4.3 节的 NDM branch-inversion 到 outer-times-inner flatten
+数据面，而不是只证明控制器状态机。它仍然不是 Sniper/x86 的 bit-exact
+复现，helper-owned DynInst 也仍不进入主线程 ROB/IQ/commit。
+
+#### 9.3.3 helper 执行资源与前端边界
 
 论文要求 helper 与主线程共享执行单元，并且只有在相同端口没有 main-thread
-ready instruction 时才能发射。当前实现已经具有主线程优先的 cache/data-port
-节流，但地址计算主要由 CPU 侧 C++ evaluator 完成，VIR 尚未作为真实 gem5 FU
-pipeline 的有序发射后端。
+ready instruction 时才能发射。当前 next helper 已按以下边界建模：
 
-目前未完整建模：
+- helper 自有 decoded-uop cache，Discovery 保存的 `StaticInstPtr` 只在 helper
+  context 内按 PC 缓存，不进入主线程 fetch queue；
+- 主线程阶段先运行，helper fetch/decode 只获得剩余的前端宽度，并统计
+  `dvrHelperFetchBlockedByMain` 和 `dvrHelperDecodeBlockedByMain`；
+- 同 PC ready lanes 合并为 512-bit chunk，分别请求 `SimdAlu`、`SimdShift` 或
+  `SimdMult`，再由 `IEW::tryIssueDVRHelperFU()` 使用原生 FU pool 的 latency
+  和占用；
+- dependent load 等待前序 helper 地址 uop 完成，然后进入真实 LSQ、DTLB、cache
+  和 MSHR；
+- 每 lane 持有 PC、8-entry reconvergence stack、helper-uop timeout 和私有 VRAT
+  状态；
+- helper 仍不产生主线程 DynInst，也不进入主线程 rename/IQ/ROB/commit，这是
+  论文独立 in-order subthread 的边界，而不是第二个 SMT O3 线程。
 
-- IntALU、shift、multiply、vector FU 的占用；
-- helper uop latency；
-- per-port main-thread priority；
-- source load → dependent ALU → next load 的调度时间；
-- helper front-end buffer 对 fetch/decode 带宽的影响。
-
-这会影响最终 performance、MLP 和 timeliness，必须在正式 workload 实验前补齐
-至少一个可审计的资源 token/port contention 模型。
+因此它现在是 paper-faithful execution-driven helper timing model，而不是
+完整 Sniper 内部实现。性能实验仍需分别报告 constrained vector FU 和
+unlimited vector FU，避免把资源模型变化误认为算法收益。
 
 #### 9.3.4 逐 lane evaluator 的 opcode 覆盖过窄
 
@@ -1356,7 +1381,7 @@ source response
 - `CPU::issueDVRReplayLanes()`：按相同 PC/uop 和 ready lane 形成最多 512-bit chunk，
   预约原生 FU，并在完成地址计算后提交 dependent request。
 
-Camel 验收结果：
+Camel 验收结果（vector-chunk helper build）：
 
 ```text
 dvrHelperDynUopsDecoded       2,212,641
@@ -1369,8 +1394,10 @@ dvrDependentDemandCovered        65,495
 dvrDependentDemandLate                 1
 ```
 
-该路径仍需继续完成 M5 的显式 helper/main fetch-decode 仲裁、完整 branch
-divergence/reconvergence 和 NDM，不能描述为 Sniper 论文实现的 bit-exact reproduction。
+该路径已经包含显式 helper/main fetch-decode residual arbitration、同 PC
+multi-lane batching 和 helper-owned branch PC/reconvergence 状态；分支和 NDM
+回归见 9.3.2。仍不能描述为 Sniper 论文实现的 bit-exact reproduction，原因是
+gem5 RISC-V 与 Sniper x86 的前端、TLB、缓存填充和带宽细节并不相同。
 
 ## 18. DVR 第一阶段原配置锚定与 NDM 端到端验收
 
