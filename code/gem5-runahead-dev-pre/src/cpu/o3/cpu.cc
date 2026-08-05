@@ -65,6 +65,8 @@
 #include "sim/cur_tick.hh"
 #include "sim/full_system.hh"
 #include "sim/process.hh"
+#include "arch/riscv/decoder.hh"
+#include "mem/se_translating_port_proxy.hh"
 #include "sim/stat_control.hh"
 #include "sim/system.hh"
 
@@ -644,6 +646,15 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Helper decoded-uop cache hits"),
       ADD_STAT(dvrHelperDecodedCacheMisses, statistics::units::Count::get(),
                "Helper decoded-uop cache misses"),
+      ADD_STAT(dvrHelperInstructionFetches, statistics::units::Count::get(),
+               "Helper instruction bytes fetched from the live address space"),
+      ADD_STAT(dvrHelperInstructionFetchFaults,
+               statistics::units::Count::get(),
+               "Helper instruction fetches that could not be translated"),
+      ADD_STAT(dvrHelperInstructionsDecoded, statistics::units::Count::get(),
+               "Helper instructions decoded from fetched bytes"),
+      ADD_STAT(dvrHelperDecodeFallbacks, statistics::units::Count::get(),
+               "Helper decode fallbacks to captured metadata"),
       ADD_STAT(dvrHelperFetchBlockedByMain, statistics::units::Cycle::get(),
                "Helper fetch cycles denied by main-thread priority"),
       ADD_STAT(dvrHelperDecodeBlockedByMain, statistics::units::Cycle::get(),
@@ -1083,6 +1094,24 @@ CPU::tick()
     const unsigned helper_frontend_work =
         dvrHelperThread.advanceFrontend(helper_fetch_width,
                                         helper_decode_width);
+    for (unsigned fetched = 0;
+         fetched < dvrHelperThread.lastFetched &&
+         dvrHelperThread.frontendReplay &&
+         dvrHelperThread.frontendReplay->count != 0; ++fetched) {
+        auto &program = dvrHelperThread.frontendReplay;
+        if (dvrHelperThread.frontendUopIndex >= program->count)
+            dvrHelperThread.frontendUopIndex = 0;
+        const auto &frontend_uop =
+            program->uops[dvrHelperThread.frontendUopIndex++];
+        bool fetch_fault = false;
+        bool cache_hit = false;
+        const auto decoded = fetchDecodeDVRUop(
+            dvrHelperThread.frontendTid, frontend_uop.pc,
+            frontend_uop.staticInst, fetch_fault, cache_hit);
+        dvrHelperThread.helperPC = frontend_uop.pc;
+        if (!decoded)
+            ++cpuStats.dvrHelperDecodeFallbacks;
+    }
     const unsigned ready_uops_after = dvrHelperThread.readyUops;
     if (helper_frontend_work != 0) {
         if (dvrHelperThread.fetchRemaining != 0 ||
@@ -2654,7 +2683,7 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
     // not contain a replayable load uop.  Keep the helper alive for source
     // lanes; replay->count only controls dependent replay semantics.
     startDVRHelper(pc, std::max(1u, replay->count), lanes,
-                   dvrInstructionRecorder.resourceCounts(), replay);
+                   dvrInstructionRecorder.resourceCounts(), replay, tid);
     for (unsigned lane = 1; lane <= lanes; ++lane) {
         const Addr address = current_address + stride * lane;
         // A source response carries the value at this exact byte address;
@@ -2699,7 +2728,7 @@ CPU::launchDVRVectorRunahead(ThreadID tid, Addr current_address,
     dvrQueuedDependentLines.clear();
     DVRInstructionRecorder::ResourceCounts vector_resources;
     vector_resources.lsu = 1;
-    startDVRHelper(pc, 1, lanes, vector_resources);
+    startDVRHelper(pc, 1, lanes, vector_resources, nullptr, tid);
     for (unsigned lane = 1; lane <= lanes; ++lane) {
         DVRPrefetchAddress prefetch;
         prefetch.address = current_address + stride * lane;
@@ -2984,7 +3013,7 @@ CPU::launchDVRNestedPrefetches(
     }
     startDVRHelper(dvrNestedContext.triggerPC, replay->count,
                    flattened, dvrNestedContext.recorder.resourceCounts(),
-                   replay);
+                   replay, dvrNestedContext.tid);
     unsigned flat_lane = 0;
     for (unsigned invocation = 0; invocation < invocations; ++invocation) {
       const Addr base = use_ndm_plan ? ndm_invocations[invocation].innerStart :
@@ -3277,12 +3306,10 @@ CPU::issueDVRReplayLanes(unsigned slots)
     DVRHelperThread::DVRDynUop dyn_uop;
     dyn_uop.program = seed->program;
     bool decoded_cache_hit = false;
-    dyn_uop.staticInst = dvrHelperThread.decodeUop(
-        uop.pc, uop.staticInst, decoded_cache_hit);
-    if (decoded_cache_hit)
-        ++cpuStats.dvrHelperDecodedCacheHits;
-    else
-        ++cpuStats.dvrHelperDecodedCacheMisses;
+    bool instruction_fetch_fault = false;
+    dyn_uop.staticInst = fetchDecodeDVRUop(
+        seed->tid, uop.pc, uop.staticInst, instruction_fetch_fault,
+        decoded_cache_hit);
     dyn_uop.uopIndex = seed->uopIndex;
     dyn_uop.opClass = op_class;
     dyn_uop.source0 = uop.source0;
@@ -4063,7 +4090,8 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
         // bounded memory-only continuation instead of leaving them stranded
         // behind an Idle helper state.
         DVRInstructionRecorder::ResourceCounts memory_only;
-        startDVRHelper(pkt->req->getPC(), 1, 1, memory_only, nullptr);
+        startDVRHelper(pkt->req->getPC(), 1, 1, memory_only, nullptr,
+                       state->tid);
     }
     delete state;
     pkt->senderState = nullptr;
@@ -4074,7 +4102,7 @@ void
 CPU::startDVRHelper(
     Addr trigger_pc, unsigned program_uops, unsigned lanes,
     const DVRInstructionRecorder::ResourceCounts &resources,
-    std::shared_ptr<const DVRReplayTemplate> replay)
+    std::shared_ptr<const DVRReplayTemplate> replay, ThreadID tid)
 {
     if (program_uops == 0 || lanes == 0)
         return;
@@ -4091,7 +4119,7 @@ CPU::startDVRHelper(
     } else {
         dvrHelperThread.begin(dvrNextHelperId++, trigger_pc, program_uops,
                               work_units, dvrHelperMaxUops, helper_resources,
-                              dvrVectorChunkModel, replay);
+                              dvrVectorChunkModel, replay, tid);
     }
     if (dvrVectorChunkModel)
         cpuStats.dvrVectorActiveLanes += lanes;
@@ -4103,6 +4131,61 @@ CPU::startDVRHelper(
             "DVR helper start id=%llu trigger=%#x uops=%u lanes=%u budget=%u\n",
             static_cast<unsigned long long>(dvrHelperThread.id), trigger_pc,
             program_uops, lanes, dvrHelperMaxUops);
+}
+
+StaticInstPtr
+CPU::fetchDecodeDVRUop(ThreadID tid, Addr pc,
+                       const StaticInstPtr &captured,
+                       bool &fetch_fault, bool &cache_hit)
+{
+    fetch_fault = false;
+    cache_hit = false;
+    auto cached = dvrHelperThread.decodedUopCache.find(pc);
+    if (cached != dvrHelperThread.decodedUopCache.end()) {
+        cache_hit = true;
+        ++cpuStats.dvrHelperDecodedCacheHits;
+        return cached->second;
+    }
+
+    ++cpuStats.dvrHelperDecodedCacheMisses;
+    ++cpuStats.dvrHelperInstructionFetches;
+    if (tid >= threadContexts.size() || !threadContexts[tid]) {
+        fetch_fault = true;
+        ++cpuStats.dvrHelperInstructionFetchFaults;
+        ++cpuStats.dvrHelperDecodeFallbacks;
+        return captured;
+    }
+
+    SETranslatingPortProxy proxy(threadContexts[tid]);
+    uint16_t half = 0;
+    if (!proxy.tryReadBlob(pc, &half, sizeof(half))) {
+        fetch_fault = true;
+        ++cpuStats.dvrHelperInstructionFetchFaults;
+        ++cpuStats.dvrHelperDecodeFallbacks;
+        return captured;
+    }
+
+    uint32_t raw = half;
+    if ((half & 0x3) == 0x3 &&
+        !proxy.tryReadBlob(pc, &raw, sizeof(raw))) {
+        fetch_fault = true;
+        ++cpuStats.dvrHelperInstructionFetchFaults;
+        ++cpuStats.dvrHelperDecodeFallbacks;
+        return captured;
+    }
+
+    StaticInstPtr decoded;
+    auto *decoder = dynamic_cast<RiscvISA::Decoder *>(
+        threadContexts[tid]->getDecoderPtr());
+    if (decoder)
+        decoded = decoder->decodeRaw(raw, pc);
+    if (!decoded) {
+        ++cpuStats.dvrHelperDecodeFallbacks;
+        return captured;
+    }
+    dvrHelperThread.decodedUopCache.emplace(pc, decoded);
+    ++cpuStats.dvrHelperInstructionsDecoded;
+    return decoded;
 }
 
 bool
