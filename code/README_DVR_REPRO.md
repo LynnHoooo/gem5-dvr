@@ -1347,6 +1347,9 @@ source response
 - `DVRHelperVectorRegisterFile`：每个 replay program 私有的架构寄存器到
   helper vector physical register 映射、lane value、valid/ready 状态；不使用主线程
   的物理寄存器文件，也不产生 commit 状态；
+- `DVRInstructionRecorder::Uop::staticInst` 和 `DVRDynUop::staticInst`：Discovery
+  保存 gem5 ISA 解码对象，helper 使用该对象作为 decoded-uop metadata，而不是重新
+  构造一个主线程 `DynInst`；
 - `DVRHelperThread::DVRDynUop`：保存 PC、operand、active lane mask、chunk 数量、
   issue/complete tick 和生命周期状态；
 - `DVRHelperThread::virBuffer`：有限 8-entry 的 in-order VIR buffer；

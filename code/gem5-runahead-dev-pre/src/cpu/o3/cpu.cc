@@ -3112,6 +3112,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
         static_cast<uint64_t>(latency) * clockPeriod();
     DVRHelperThread::DVRDynUop dyn_uop;
     dyn_uop.program = seed->program;
+    dyn_uop.staticInst = uop.staticInst;
     dyn_uop.uopIndex = seed->uopIndex;
     dyn_uop.opClass = op_class;
     dyn_uop.source0 = uop.source0;

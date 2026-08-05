@@ -1110,6 +1110,7 @@ class CPU : public BaseCPU
             enum class State { Decoded, Ready, Issued, WaitingMemory,
                                Completed };
             std::shared_ptr<const DVRReplayTemplate> program;
+            StaticInstPtr staticInst;
             unsigned uopIndex = 0;
             OpClass opClass = SimdAluOp;
             int8_t source0 = -1;

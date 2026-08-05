@@ -12,6 +12,7 @@
 #include "cpu/inst_seq.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/reg_class.hh"
+#include "cpu/static_inst_fwd.hh"
 
 namespace gem5
 {
@@ -203,6 +204,9 @@ class DVRInstructionRecorder
         };
 
         Addr pc = 0;
+        // Decoded instruction object retained by the helper program.  It is
+        // metadata only: the helper does not enqueue a DynInst into O3 ROB/IQ.
+        StaticInstPtr staticInst;
         Addr branchTargetPC = 0;
         Addr fallthroughPC = 0;
         Addr reconvergencePC = 0;

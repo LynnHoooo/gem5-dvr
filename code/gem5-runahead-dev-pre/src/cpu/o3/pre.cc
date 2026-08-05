@@ -715,6 +715,7 @@ DVRInstructionRecorder::record(const DynInstPtr &inst)
 
     Uop &uop = uops[count++];
     uop.pc = inst->pcState().instAddr();
+    uop.staticInst = inst->staticInst;
     // DVR currently targets RV64; the fixed-width fall-through is sufficient
     // for the compact helper program and avoids consulting architectural PC
     // state during replay.
