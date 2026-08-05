@@ -1663,19 +1663,6 @@ class CPU : public BaseCPU
 
         bool active() const { return state != State::Idle; }
 
-        StaticInstPtr decodeUop(Addr pc, const StaticInstPtr &decoded,
-                                bool &cache_hit)
-        {
-            auto found = decodedUopCache.find(pc);
-            if (found != decodedUopCache.end()) {
-                cache_hit = true;
-                return found->second;
-            }
-            cache_hit = false;
-            if (decoded)
-                decodedUopCache.emplace(pc, decoded);
-            return decoded;
-        }
     } dvrHelperThread;
     // Main O3 stages run first every cycle.  Helpers may consume at most one
     // residual issue/LSU slot after IEW has completed.
