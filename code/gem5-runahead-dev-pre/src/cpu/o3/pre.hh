@@ -219,6 +219,7 @@ class DVRInstructionRecorder
         bool control = false;
         bool conditional = false;
         bool branchTaken = false;
+        bool alternatePath = false;
 
         /**
          * 计算支持的标量地址生成操作。
@@ -240,6 +241,8 @@ class DVRInstructionRecorder
     bool record(const DynInstPtr &inst);
     /** Import a committed helper template for response-driven replay. */
     void import(const std::array<Uop, MaxUops> &source, unsigned size);
+    /** Insert a validated alternate-path suffix immediately before reconvergence. */
+    bool insertBeforePC(Addr reconvergence_pc, const std::vector<Uop> &path);
     /** Bind every conditional path to the DVR termination PC (the FLR). */
     void setReconvergencePC(Addr pc);
     void reset();
@@ -284,6 +287,7 @@ class DVRVectorInstructionRegister
         std::array<uint64_t, 2> deferredMask = {};
         Addr deferredPC = 0;
         Addr pc = 0;
+        bool alternatePath = false;
     };
 
     std::array<uint64_t, 2> activeMask = {};
@@ -329,6 +333,8 @@ class DVRVectorInstructionRegister
         unsigned earlyExitLanes = 0;
         unsigned externalPathLanes = 0;
         unsigned unsupportedSemanticLanes = 0;
+        unsigned alternatePathUops = 0;
+        unsigned alternatePathReconvergences = 0;
         unsigned pcGroups = 0;
         unsigned maxPCGroupLanes = 0;
         bool timedOut = false;

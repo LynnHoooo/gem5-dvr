@@ -346,6 +346,50 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
         const uint32_t quadrant = compressed & 0x3;
         const uint32_t funct3 = (compressed >> 13) & 0x7;
 
+        // C.LI rd, imm -- a zero-source immediate is represented as x0.
+        if (quadrant == 1 && funct3 == 2 &&
+            ((compressed >> 7) & 0x1f) != 0) {
+            uop.semantic = Semantic::AddImmediate;
+            uop.source0 = 0;
+            uop.immediate = dvrSignExtend(
+                (((compressed >> 12) & 0x1) << 5) |
+                ((compressed >> 2) & 0x1f), 6);
+            return;
+        }
+
+        // C.ADDI rd, imm -- the normal source/destination metadata is
+        // retained, only the compressed immediate needs decoding.
+        if (quadrant == 1 && funct3 == 0 &&
+            ((compressed >> 7) & 0x1f) != 0) {
+            uop.semantic = Semantic::AddImmediate;
+            uop.immediate = dvrSignExtend(
+                (((compressed >> 12) & 0x1) << 5) |
+                ((compressed >> 2) & 0x1f), 6);
+            return;
+        }
+
+        // C.ADDIW rd, imm -- RV64 sign-extended word add.
+        if (quadrant == 1 && funct3 == 1 &&
+            ((compressed >> 7) & 0x1f) != 0) {
+            uop.semantic = Semantic::AddWordImmediate;
+            uop.immediate = dvrSignExtend(
+                (((compressed >> 12) & 0x1) << 5) |
+                ((compressed >> 2) & 0x1f), 6);
+            return;
+        }
+
+        // C.LUI rd, imm -- model the upper immediate as x0 + imm.
+        if (quadrant == 1 && funct3 == 3 &&
+            ((compressed >> 7) & 0x1f) != 0 &&
+            ((compressed >> 7) & 0x1f) != 2) {
+            uop.semantic = Semantic::AddImmediate;
+            uop.source0 = 0;
+            uop.immediate = dvrSignExtend(
+                (((compressed >> 12) & 0x1) << 5) |
+                ((compressed >> 2) & 0x1f), 6) << 12;
+            return;
+        }
+
         // C.LD rd', uimm(rs1') -- RV64C quadrant 0, funct3 011.
         if (quadrant == 0 && funct3 == 3) {
             uop.semantic = Semantic::LoadAddress;
@@ -700,6 +744,32 @@ DVRInstructionRecorder::import(const std::array<Uop, MaxUops> &source,
         uops[index] = source[index];
 }
 
+bool
+DVRInstructionRecorder::insertBeforePC(
+    Addr reconvergence_pc, const std::vector<Uop> &path)
+{
+    if (reconvergence_pc == 0 || path.empty() || count >= MaxUops ||
+        path.size() > MaxUops - count)
+        return false;
+
+    unsigned insert = count;
+    for (unsigned index = 0; index < count; ++index) {
+        if (uops[index].pc == reconvergence_pc) {
+            insert = index;
+            break;
+        }
+    }
+    if (insert == count)
+        return false;
+
+    for (unsigned index = count; index > insert; --index)
+        uops[index + path.size() - 1] = uops[index - 1];
+    for (unsigned index = 0; index < path.size(); ++index)
+        uops[insert + index] = path[index];
+    count += path.size();
+    return true;
+}
+
 void
 DVRInstructionRecorder::setReconvergencePC(Addr pc)
 {
@@ -852,6 +922,14 @@ DVRVectorInstructionRegister::executeLanePC(
             if (at_reconvergence || !selected_path_alive) {
                 const auto deferred = top.deferredMask;
                 const Addr deferred_pc = top.deferredPC;
+                bool deferred_alternate = false;
+                for (unsigned candidate = 0; candidate < program.size();
+                     ++candidate) {
+                    if (program[candidate].pc == deferred_pc) {
+                        deferred_alternate = program[candidate].alternatePath;
+                        break;
+                    }
+                }
                 for (unsigned lane = 0; lane < lanes; ++lane) {
                     if (deferred[lane / 64] &
                         (uint64_t(1) << (lane % 64))) {
@@ -862,6 +940,9 @@ DVRVectorInstructionRegister::executeLanePC(
                 --stackDepth;
                 if (at_reconvergence)
                     ++result.reconvergences;
+                if (at_reconvergence &&
+                    (deferred_alternate || top.alternatePath))
+                    ++result.alternatePathReconvergences;
                 resumed_path = true;
             }
         }
@@ -920,6 +1001,8 @@ DVRVectorInstructionRegister::executeLanePC(
             break;
 
         const auto &op = program[op_index];
+        if (op.alternatePath)
+            ++result.alternatePathUops;
 
         std::array<bool, 128> executing = {};
         std::array<bool, 128> taken_lanes = {};
@@ -990,6 +1073,7 @@ DVRVectorInstructionRegister::executeLanePC(
                 op.reconvergencePC : op.fallthroughPC;
             std::array<uint64_t, 2> deferred = {};
             Addr deferred_pc = 0;
+            bool alternate_path = false;
             for (unsigned lane = 0; lane < lanes; ++lane) {
                 if (!executing[lane])
                     continue;
@@ -999,10 +1083,19 @@ DVRVectorInstructionRegister::executeLanePC(
                     deferred_pc = lanePC[lane];
                     laneBlocked[lane] = true;
                 }
+                for (unsigned candidate = 0; candidate < program.size();
+                     ++candidate) {
+                    if (program[candidate].pc == lanePC[lane] &&
+                        program[candidate].alternatePath) {
+                        alternate_path = true;
+                        break;
+                    }
+                }
             }
             stack[stackDepth].deferredMask = deferred;
             stack[stackDepth].deferredPC = deferred_pc;
             stack[stackDepth].pc = reconvergence;
+            stack[stackDepth].alternatePath = alternate_path;
             ++stackDepth;
         }
 
@@ -1402,6 +1495,13 @@ DVRVectorInstructionRegister::resumeSourceLanes(
             if (at_reconvergence || !selected_path_alive) {
                 const auto deferred = top.deferredMask;
                 const Addr deferred_pc = top.deferredPC;
+                bool deferred_alternate = false;
+                for (unsigned candidate = 0; candidate < size; ++candidate) {
+                    if (source[candidate].pc == deferred_pc) {
+                        deferred_alternate = source[candidate].alternatePath;
+                        break;
+                    }
+                }
                 for (unsigned candidate_lane = 0;
                      candidate_lane < continuationLanes; ++candidate_lane) {
                     if (deferred[candidate_lane / 64] &
@@ -1413,6 +1513,9 @@ DVRVectorInstructionRegister::resumeSourceLanes(
                 --stackDepth;
                 if (at_reconvergence)
                     ++result.reconvergences;
+                if (at_reconvergence &&
+                    (deferred_alternate || top.alternatePath))
+                    ++result.alternatePathReconvergences;
                 resumed_path = true;
             }
         }
@@ -1480,6 +1583,8 @@ DVRVectorInstructionRegister::resumeSourceLanes(
         }
 
         const auto &op = source[op_index];
+        if (op.alternatePath)
+            ++result.alternatePathUops;
         ++result.pcGroups;
         bool any_active = false;
         unsigned group_lanes = 0;
@@ -1579,6 +1684,7 @@ DVRVectorInstructionRegister::resumeSourceLanes(
                 op.reconvergencePC : op.fallthroughPC;
             std::array<uint64_t, 2> deferred = {};
             Addr deferred_pc = 0;
+            bool alternate_path = false;
             for (unsigned candidate_lane = 0;
                  candidate_lane < continuationLanes; ++candidate_lane) {
                 if (!any_active || !laneActive[candidate_lane] ||
@@ -1591,10 +1697,18 @@ DVRVectorInstructionRegister::resumeSourceLanes(
                     deferred_pc = lanePC[candidate_lane];
                     laneBlocked[candidate_lane] = true;
                 }
+                for (unsigned candidate = 0; candidate < size; ++candidate) {
+                    if (source[candidate].pc == lanePC[candidate_lane] &&
+                        source[candidate].alternatePath) {
+                        alternate_path = true;
+                        break;
+                    }
+                }
             }
             stack[stackDepth].deferredMask = deferred;
             stack[stackDepth].deferredPC = deferred_pc;
             stack[stackDepth].pc = reconvergence;
+            stack[stackDepth].alternatePath = alternate_path;
             ++stackDepth;
         }
         ++result.helperUops;

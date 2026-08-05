@@ -802,6 +802,15 @@ class CPU : public BaseCPU
         statistics::Scalar dvrReplayAttempts;
         statistics::Scalar dvrReplayTargetsGenerated;
         statistics::Scalar dvrReplayFallbacks;
+        statistics::Scalar dvrAlternatePathLookups;
+        statistics::Scalar dvrAlternatePathHits;
+        statistics::Scalar dvrAlternatePathCompleteHits;
+        statistics::Scalar dvrAlternatePathLiveInRejects;
+        statistics::Scalar dvrAlternatePathIncompleteRejects;
+        statistics::Scalar dvrAlternatePathUopsReplayed;
+        statistics::Scalar dvrAlternatePathDependentTargets;
+        statistics::Scalar dvrAlternatePathDemandCovered;
+        statistics::Scalar dvrReconvergenceResumeSuccesses;
         statistics::Scalar dvrQualityIssuedBytes;
         statistics::Scalar dvrQualityCompletedBytes;
         statistics::Scalar dvrQualityDemandAddressesObserved;
@@ -1258,6 +1267,44 @@ class CPU : public BaseCPU
     std::unordered_set<Addr> dvrDependentLoadPCs;
     std::unordered_map<Addr, unsigned> dvrDependentOutstandingLines;
     std::unordered_set<Addr> dvrDependentCompletedLines;
+    std::unordered_set<Addr> dvrAlternateDependentLines;
+    struct DVRAlternatePathKey
+    {
+        Addr branchPC = 0;
+        Addr targetPC = 0;
+        Addr reconvergencePC = 0;
+        ContextID addressSpaceID = 0;
+
+        bool operator==(const DVRAlternatePathKey &other) const
+        {
+            return branchPC == other.branchPC && targetPC == other.targetPC &&
+                reconvergencePC == other.reconvergencePC &&
+                addressSpaceID == other.addressSpaceID;
+        }
+    };
+    struct DVRAlternatePathKeyHash
+    {
+        size_t operator()(const DVRAlternatePathKey &key) const
+        {
+            size_t hash = std::hash<Addr>{}(key.branchPC);
+            hash ^= std::hash<Addr>{}(key.targetPC) +
+                size_t(0x9e3779b9) + (hash << 6) + (hash >> 2);
+            hash ^= std::hash<Addr>{}(key.reconvergencePC) +
+                size_t(0x9e3779b9) + (hash << 6) + (hash >> 2);
+            hash ^= std::hash<ContextID>{}(key.addressSpaceID) +
+                size_t(0x9e3779b9) + (hash << 6) + (hash >> 2);
+            return hash;
+        }
+    };
+    struct DVRAlternatePath
+    {
+        std::vector<DVRInstructionRecorder::Uop> uops;
+        uint32_t liveInRegisters = 0;
+        uint64_t codeVersion = 0;
+        bool complete = false;
+    };
+    std::unordered_map<DVRAlternatePathKey, DVRAlternatePath,
+                       DVRAlternatePathKeyHash> dvrAlternatePathCache;
     uint64_t dvrPrefetchQueuePeak = 0;
     uint64_t dvrNextPredicateGeneration = 1;
     uint64_t dvrNextHelperId = 1;
@@ -1392,6 +1439,12 @@ class CPU : public BaseCPU
     void trainDVRAddressRelation(Addr trigger_pc, Addr flr_pc,
                                  RegVal source_value,
                                  Addr dependent_address);
+    void recordDVRAlternatePaths(const DVRInstructionRecorder &recorder,
+                                 ContextID address_space_id);
+    void augmentDVRAlternatePaths(DVRInstructionRecorder &recorder,
+                                  ContextID address_space_id,
+                                  const DVRLoopBoundDetector::RegisterSnapshot
+                                      &initial_regs);
 
     /** Checkpoints of the rename map when entering PRE. */
     std::vector<PhysRegIdPtr> checkpointRenameMap[CCRegClass + 1];
