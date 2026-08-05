@@ -438,6 +438,20 @@ class CPU : public BaseCPU
     bool removeInstsThisCycle;
 
   protected:
+    class DVRInstructionFetchPort : public RequestPort
+    {
+      private:
+        CPU *cpu;
+
+      public:
+        DVRInstructionFetchPort(CPU *owner) :
+            RequestPort("dvr_icache_port", owner), cpu(owner) {}
+
+      protected:
+        bool recvTimingResp(PacketPtr pkt) override;
+        void recvReqRetry() override;
+    } dvrInstructionPort;
+
     /** The fetch stage. */
     Fetch fetch;
 
@@ -606,6 +620,9 @@ class CPU : public BaseCPU
         return fetch.getInstPort();
     }
 
+    Port &getPort(const std::string &if_name,
+                  PortID idx=InvalidPortID) override;
+
     /** Get the dcache port (used to find block size for translations). */
     Port &
     getDataPort() override
@@ -716,6 +733,9 @@ class CPU : public BaseCPU
         statistics::Scalar dvrHelperInstructionFetchFaults;
         statistics::Scalar dvrHelperInstructionsDecoded;
         statistics::Scalar dvrHelperDecodeFallbacks;
+        statistics::Scalar dvrHelperInstructionTimingRequests;
+        statistics::Scalar dvrHelperInstructionTimingResponses;
+        statistics::Scalar dvrHelperInstructionTimingRetries;
         statistics::Scalar dvrHelperFetchBlockedByMain;
         statistics::Scalar dvrHelperDecodeBlockedByMain;
         statistics::Scalar dvrHelperVIRCapacityStalls;
@@ -1708,6 +1728,8 @@ class CPU : public BaseCPU
     // need one request per cache line.
     std::unordered_set<Addr> dvrQueuedPrefetchAddresses;
     std::unordered_set<Addr> dvrOutstandingPrefetchAddresses;
+    std::unordered_set<Addr> dvrInstructionFetchPending;
+    PacketPtr dvrInstructionRetryPkt = nullptr;
     std::unordered_set<Addr> dvrQueuedDependentLines;
     struct DVRAddressRelation
     {
@@ -1885,6 +1907,16 @@ class CPU : public BaseCPU
                                    &finish_regs);
     void launchDVRVectorRunahead(ThreadID tid, Addr current_address,
                                  Addr pc, int64_t stride);
+    struct DVRInstructionFetchState : public Packet::SenderState
+    {
+        Addr pc = 0;
+        ThreadID tid = 0;
+        StaticInstPtr captured;
+    };
+    void completeDVRInstructionFetch(PacketPtr pkt);
+    void retryDVRInstructionFetch();
+    bool requestDVRInstructionFetch(ThreadID tid, Addr pc,
+                                    const StaticInstPtr &captured);
     StaticInstPtr fetchDecodeDVRUop(ThreadID tid, Addr pc,
                                     const StaticInstPtr &captured,
                                     bool &fetch_fault, bool &cache_hit);

@@ -44,6 +44,7 @@
 
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <fstream>
 #include <string>
@@ -123,6 +124,7 @@ CPU::CPU(const BaseO3CPUParams &params)
       instcount(0),
 #endif
       removeInstsThisCycle(false),
+      dvrInstructionPort(this),
       fetch(this, params),
       decode(this, params),
       rename(this, params),
@@ -446,6 +448,115 @@ CPU::regProbePoints()
     commit.regProbePoints();
 }
 
+bool
+CPU::DVRInstructionFetchPort::recvTimingResp(PacketPtr pkt)
+{
+    cpu->completeDVRInstructionFetch(pkt);
+    return true;
+}
+
+void
+CPU::DVRInstructionFetchPort::recvReqRetry()
+{
+    cpu->retryDVRInstructionFetch();
+}
+
+Port &
+CPU::getPort(const std::string &if_name, PortID idx)
+{
+    if (if_name == "dvr_icache_port")
+        return dvrInstructionPort;
+    return BaseCPU::getPort(if_name, idx);
+}
+
+bool
+CPU::requestDVRInstructionFetch(ThreadID tid, Addr pc,
+                                const StaticInstPtr &captured)
+{
+    if (!dvrInstructionPort.isConnected())
+        return false;
+
+    // A helper lane may revisit the same PC while its cache request is in
+    // flight.  Keep one request per PC and let the lane retry after fill.
+    if (dvrInstructionFetchPending.count(pc) != 0)
+        return true;
+    if (dvrInstructionRetryPkt != nullptr)
+        return true;
+    if (tid >= threadContexts.size() || !threadContexts[tid])
+        return false;
+
+    RequestPtr req = std::make_shared<Request>(
+        pc, 4, Request::INST_FETCH, instRequestorId(), pc,
+        thread[tid]->contextId());
+    req->taskId(taskId());
+    const Fault fault = mmu->translateFunctional(
+        req, thread[tid]->getTC(), BaseMMU::Execute);
+    if (fault != NoFault) {
+        ++cpuStats.dvrHelperInstructionFetchFaults;
+        ++cpuStats.dvrHelperDecodeFallbacks;
+        dvrHelperThread.decodedUopCache[pc] = captured;
+        return false;
+    }
+
+    PacketPtr pkt = new Packet(req, MemCmd::ReadReq);
+    pkt->dataDynamic(new uint8_t[4]);
+    auto *state = new DVRInstructionFetchState;
+    state->pc = pc;
+    state->tid = tid;
+    state->captured = captured;
+    pkt->senderState = state;
+    dvrInstructionFetchPending.insert(pc);
+    ++cpuStats.dvrHelperInstructionTimingRequests;
+    if (!dvrInstructionPort.sendTimingReq(pkt)) {
+        dvrInstructionRetryPkt = pkt;
+    }
+    return true;
+}
+
+void
+CPU::completeDVRInstructionFetch(PacketPtr pkt)
+{
+    auto *state = dynamic_cast<DVRInstructionFetchState *>(
+        pkt->senderState);
+    if (!state) {
+        delete pkt;
+        return;
+    }
+
+    StaticInstPtr decoded;
+    if (pkt->hasData() && pkt->getSize() >= 4 &&
+        state->tid < threadContexts.size() && threadContexts[state->tid]) {
+        uint32_t raw = 0;
+        std::memcpy(&raw, pkt->getConstPtr<uint8_t>(), sizeof(raw));
+        auto *decoder = dynamic_cast<RiscvISA::Decoder *>(
+            threadContexts[state->tid]->getDecoderPtr());
+        if (decoder)
+            decoded = decoder->decodeRaw(raw, state->pc);
+    }
+    if (decoded) {
+        dvrHelperThread.decodedUopCache[state->pc] = decoded;
+        ++cpuStats.dvrHelperInstructionsDecoded;
+    } else {
+        dvrHelperThread.decodedUopCache[state->pc] = state->captured;
+        ++cpuStats.dvrHelperDecodeFallbacks;
+    }
+    ++cpuStats.dvrHelperInstructionTimingResponses;
+    dvrInstructionFetchPending.erase(state->pc);
+    pkt->senderState = nullptr;
+    delete state;
+    delete pkt;
+}
+
+void
+CPU::retryDVRInstructionFetch()
+{
+    if (!dvrInstructionRetryPkt)
+        return;
+    ++cpuStats.dvrHelperInstructionTimingRetries;
+    if (dvrInstructionPort.sendTimingReq(dvrInstructionRetryPkt))
+        dvrInstructionRetryPkt = nullptr;
+}
+
 CPU::~CPU()
 {
     if (dvrTrace.workload) std::fclose(dvrTrace.workload);
@@ -710,7 +821,7 @@ CPU::CPUStats::CPUStats(CPU *cpu)
       ADD_STAT(dvrHelperDecodedCacheMisses, statistics::units::Count::get(),
                "Helper decoded-uop cache misses"),
       ADD_STAT(dvrHelperInstructionFetches, statistics::units::Count::get(),
-               "Helper instruction bytes fetched from the live address space"),
+               "Helper instruction fetch attempts from the live address space"),
       ADD_STAT(dvrHelperInstructionFetchFaults,
                statistics::units::Count::get(),
                "Helper instruction fetches that could not be translated"),
@@ -718,6 +829,15 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Helper instructions decoded from fetched bytes"),
       ADD_STAT(dvrHelperDecodeFallbacks, statistics::units::Count::get(),
                "Helper decode fallbacks to captured metadata"),
+      ADD_STAT(dvrHelperInstructionTimingRequests,
+               statistics::units::Count::get(),
+               "Helper instruction-cache timing requests"),
+      ADD_STAT(dvrHelperInstructionTimingResponses,
+               statistics::units::Count::get(),
+               "Helper instruction-cache timing responses"),
+      ADD_STAT(dvrHelperInstructionTimingRetries,
+               statistics::units::Count::get(),
+               "Helper instruction-cache request retries"),
       ADD_STAT(dvrHelperFetchBlockedByMain, statistics::units::Cycle::get(),
                "Helper fetch cycles denied by main-thread priority"),
       ADD_STAT(dvrHelperDecodeBlockedByMain, statistics::units::Cycle::get(),
@@ -1186,12 +1306,13 @@ CPU::tick()
             program->uops[dvrHelperThread.frontendUopIndex++];
         bool fetch_fault = false;
         bool cache_hit = false;
-        const auto decoded = fetchDecodeDVRUop(
+        fetchDecodeDVRUop(
             dvrHelperThread.frontendTid, frontend_uop.pc,
             frontend_uop.staticInst, fetch_fault, cache_hit);
         dvrHelperThread.helperPC = frontend_uop.pc;
-        if (!decoded)
-            ++cpuStats.dvrHelperDecodeFallbacks;
+        // Timing misses are accounted by request/response handlers.  A
+        // nullptr here means the helper front-end is waiting on its cache
+        // request, not that semantic metadata was used as a fallback.
     }
     const unsigned ready_uops_after = dvrHelperThread.readyUops;
     if (helper_frontend_work != 0) {
@@ -3358,6 +3479,20 @@ CPU::issueDVRReplayLanes(unsigned slots)
         return 0;
 
     const auto &uop = seed->program->uops[seed->uopIndex];
+    bool decoded_cache_hit = false;
+    bool instruction_fetch_fault = false;
+    const StaticInstPtr decoded_inst = fetchDecodeDVRUop(
+        seed->tid, uop.pc, uop.staticInst, instruction_fetch_fault,
+        decoded_cache_hit);
+    if (!decoded_inst) {
+        // The independent instruction-cache request is still outstanding.
+        // Do not consume a FU slot or remove the lanes; they will become
+        // eligible after completeDVRInstructionFetch fills the decode cache.
+        return 0;
+    }
+    if (instruction_fetch_fault)
+        DPRINTF(O3CPU, "DVR helper fetch fault at pc=%#x; using captured "
+                "semantic metadata\n", uop.pc);
     using Semantic = DVRInstructionRecorder::Uop::Semantic;
     const bool is_shift =
         uop.semantic == Semantic::ShiftLeft ||
@@ -3411,14 +3546,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
         static_cast<uint64_t>(latency) * clockPeriod();
     DVRHelperThread::DVRDynUop dyn_uop;
     dyn_uop.program = seed->program;
-    bool decoded_cache_hit = false;
-    bool instruction_fetch_fault = false;
-    dyn_uop.staticInst = fetchDecodeDVRUop(
-        seed->tid, uop.pc, uop.staticInst, instruction_fetch_fault,
-        decoded_cache_hit);
-    if (instruction_fetch_fault)
-        DPRINTF(O3CPU, "DVR helper fetch fault at pc=%#x; using captured "
-                "semantic metadata\n", uop.pc);
+    dyn_uop.staticInst = decoded_inst;
     dyn_uop.uopIndex = seed->uopIndex;
     dyn_uop.opClass = op_class;
     dyn_uop.source0 = uop.source0;
@@ -4395,11 +4523,23 @@ CPU::fetchDecodeDVRUop(ThreadID tid, Addr pc,
     }
 
     ++cpuStats.dvrHelperDecodedCacheMisses;
-    ++cpuStats.dvrHelperInstructionFetches;
     if (tid >= threadContexts.size() || !threadContexts[tid]) {
         fetch_fault = true;
         ++cpuStats.dvrHelperInstructionFetchFaults;
         ++cpuStats.dvrHelperDecodeFallbacks;
+        return captured;
+    }
+
+    ++cpuStats.dvrHelperInstructionFetches;
+    if (dvrInstructionPort.isConnected()) {
+        // A timing miss is intentionally represented by nullptr.  The
+        // caller keeps the replay lane active and retries this PC after the
+        // response populates decodedUopCache.
+        if (requestDVRInstructionFetch(tid, pc, captured))
+            return nullptr;
+        auto fallback = dvrHelperThread.decodedUopCache.find(pc);
+        if (fallback != dvrHelperThread.decodedUopCache.end())
+            return fallback->second;
         return captured;
     }
 

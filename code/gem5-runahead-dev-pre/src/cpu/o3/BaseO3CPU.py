@@ -55,6 +55,7 @@ class CommitPolicy(ScopedEnum):
     vals = [ 'RoundRobin', 'OldestReady' ]
 
 class BaseO3CPU(BaseCPU):
+    dvr_icache_port = RequestPort("DVR helper instruction-cache port")
     type = 'BaseO3CPU'
     cxx_class = 'gem5::o3::CPU'
     cxx_header = 'cpu/o3/dyn_inst.hh'

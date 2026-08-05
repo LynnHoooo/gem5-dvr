@@ -279,6 +279,9 @@ def main():
     system.cpu.connectAllPorts(system.l2bus.cpu_side_ports,
                                system.membus.cpu_side_ports,
                                system.membus.mem_side_ports)
+    # DVR helper instruction fetches use a separate timing port so they do not
+    # mutate the main O3 Fetch stage's outstanding-request state.
+    system.cpu.dvr_icache_port = system.l2bus.cpu_side_ports
     system.l2.cpu_side = system.l2bus.mem_side_ports
     system.l2.mem_side = system.l3bus.cpu_side_ports
     system.l3.cpu_side = system.l3bus.mem_side_ports
