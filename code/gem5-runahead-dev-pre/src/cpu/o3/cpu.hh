@@ -1009,6 +1009,26 @@ class CPU : public BaseCPU
             unsigned unit = 0;
             unsigned uop = 0;
         };
+        struct ReplayLaneContext
+        {
+            std::shared_ptr<const DVRReplayTemplate> program;
+            std::array<RegVal, DVRLoopBoundDetector::MaxArchitecturalIntRegs>
+                regs = {};
+            std::array<Tick, DVRLoopBoundDetector::MaxArchitecturalIntRegs>
+                readyCycle = {};
+            std::shared_ptr<DVRPredicateGeneration> predicate;
+            std::array<int64_t, DVRPrefetchSenderState::MaxRelations> scales = {};
+            std::array<int64_t, DVRPrefetchSenderState::MaxRelations> offsets = {};
+            std::array<RegVal, DVRPrefetchSenderState::MaxRelations> masks = {};
+            std::array<RegVal, DVRPrefetchSenderState::MaxRelations> patterns = {};
+            unsigned relationCount = 0;
+            unsigned lane = 0;
+            ThreadID tid = 0;
+            Addr triggerPC = 0;
+            unsigned uopIndex = 1;
+            bool nested = false;
+            bool active = true;
+        };
         struct IssueEntry
         {
             ComputeKind kind = ComputeKind::Alu;
@@ -1023,6 +1043,7 @@ class CPU : public BaseCPU
         static constexpr unsigned ScoreboardRegisters = 32;
         std::deque<IssueEntry> issueQueue;
         std::deque<ReplayGeneration> replayGenerations;
+        std::deque<ReplayLaneContext> replayLanes;
         std::array<Tick, ScoreboardRegisters> readyCycle = {};
 
         void reset()
@@ -1047,6 +1068,7 @@ class CPU : public BaseCPU
             helperPC = 0;
             issueQueue.clear();
             replayGenerations.clear();
+            replayLanes.clear();
             readyCycle.fill(0);
         }
 
@@ -1077,8 +1099,7 @@ class CPU : public BaseCPU
             vectorChunkModel = vector_model;
             issueQueue.clear();
             replayGenerations.clear();
-            if (replay && vector_model)
-                replayGenerations.push_back({replay, units, 0, 0});
+            replayLanes.clear();
             readyCycle.fill(0);
             state = fetchRemaining == 0 ? State::Idle : State::Fetch;
         }
@@ -1102,9 +1123,7 @@ class CPU : public BaseCPU
                 std::min<uint64_t>(uint64_t(uops) * units, maxUops);
             fetchRemaining += generation_uops;
             maxUops += generation_uops;
-            if (replay && vector_model) {
-                replayGenerations.push_back({replay, units, 0, 0});
-            } else {
+            if (!(replay && vector_model)) {
                 aluRemaining += resources.alu;
                 shiftRemaining += resources.shift;
                 multiplyRemaining += resources.multiply;
@@ -1162,7 +1181,41 @@ class CPU : public BaseCPU
         {
             return aluRemaining != 0 || shiftRemaining != 0 ||
                    multiplyRemaining != 0 || !issueQueue.empty() ||
-                   !replayGenerations.empty();
+                   !replayGenerations.empty() || !replayLanes.empty();
+        }
+
+        bool enqueueReplayLane(const DVRPrefetchSenderState &sender,
+                               RegVal source_value,
+                               unsigned &became_ready)
+        {
+            became_ready = 0;
+            if (!sender.replay || sender.replay->count <= 1 ||
+                sender.replay->triggerDestination < 0 ||
+                sender.replay->triggerDestination >=
+                    DVRLoopBoundDetector::MaxArchitecturalIntRegs)
+                return false;
+            ReplayLaneContext lane_context;
+            lane_context.program = sender.replay;
+            lane_context.regs = sender.replay->initialRegs;
+            lane_context.regs[0] = 0;
+            lane_context.regs[sender.replay->triggerDestination] = source_value;
+            lane_context.predicate = sender.predicate;
+            lane_context.scales = sender.scales;
+            lane_context.offsets = sender.offsets;
+            lane_context.masks = sender.masks;
+            lane_context.patterns = sender.patterns;
+            lane_context.relationCount = sender.relationCount;
+            lane_context.lane = sender.lane;
+            lane_context.tid = sender.tid;
+            lane_context.triggerPC = sender.replay->triggerPC;
+            lane_context.nested = sender.nested;
+            replayLanes.push_back(std::move(lane_context));
+            became_ready = readyUops == 0 ? 1 : 0;
+            if (became_ready != 0) {
+                readyUops = 1;
+                state = State::Running;
+            }
+            return true;
         }
 
         void refillIssueQueue()
@@ -1279,10 +1332,11 @@ class CPU : public BaseCPU
                     readyCycle[entry.source1] > now);
         }
 
-        bool canIssue() const
+        bool canIssue(bool source_request = false) const
         {
             return state == State::Running && readyUops != 0 &&
-                   issuedUops < maxUops && !computePending();
+                   issuedUops < maxUops &&
+                   (source_request || !computePending());
         }
 
         unsigned wakeForMemoryRequest()
@@ -1322,6 +1376,19 @@ class CPU : public BaseCPU
             if (issuedUops >= maxUops && readyUops == 0 &&
                 fetchRemaining == 0 && decodeRemaining == 0 &&
                 outstanding == 0 && !computePending())
+                state = State::Draining;
+        }
+
+        void issueReplayChunk(Tick ready_tick)
+        {
+            assert(vectorChunkModel);
+            assert(readyUops != 0);
+            ++issuedUops;
+            --readyUops;
+            computeReadyTick = std::max(computeReadyTick, ready_tick);
+            if (issuedUops >= maxUops && readyUops == 0 &&
+                fetchRemaining == 0 && decodeRemaining == 0 &&
+                outstanding == 0 && replayLanes.empty())
                 state = State::Draining;
         }
 
@@ -1373,6 +1440,7 @@ class CPU : public BaseCPU
     unsigned dvrFetchWidth = 1;
     unsigned dvrDecodeWidth = 1;
     unsigned dvrLSUWidth = 1;
+    unsigned dvrReplayMaxGroupWidth = 0;
     static constexpr unsigned DvrHelperIssueWidth = 4;
     static constexpr unsigned DvrVectorBits = 512;
     // Keep a small number of generations in flight.  Without this bound,
@@ -1547,11 +1615,15 @@ class CPU : public BaseCPU
     {
         if (!dvrVectorChunkModel)
             return lanes;
-        const unsigned elements_per_chunk =
-            DvrVectorBits / dvrVectorElementBits;
+        const unsigned elements_per_chunk = dvrElementsPerChunk();
         return (lanes + elements_per_chunk - 1) / elements_per_chunk;
     }
+    unsigned dvrElementsPerChunk() const
+    {
+        return DvrVectorBits / dvrVectorElementBits;
+    }
     unsigned issueDVRHelperCompute();
+    unsigned issueDVRReplayLanes(unsigned slots);
     Addr dvrPrefetchLine(Addr address) const;
     void accountDVRDemand(Addr address);
     void updateDVRPrefetchQueuePeak();
