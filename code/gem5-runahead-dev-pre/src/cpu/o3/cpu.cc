@@ -2028,6 +2028,21 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 captureDVRRegisterSnapshot(tid, inst, finish_regs);
                 const auto inference = dvrLoopBoundDetector.infer(
                     dvrDiscoveryStartRegs, finish_regs, dvrMaxLanes);
+                // DVR follows the paper's reconvergence policy: all
+                // divergent paths are deferred until the final indirect
+                // load (FLR), which is the vector-runahead termination PC.
+                // The recorder's first-observed successor is only a fallback
+                // for incomplete control metadata and must not be used when
+                // a real FLR is known.
+                dvrInstructionRecorder.setReconvergencePC(
+                    dvrTaintTracker.flr());
+                for (unsigned index = 0;
+                     index < dvrInstructionRecorder.size(); ++index) {
+                    const auto &uop = dvrInstructionRecorder[index];
+                    if (uop.conditional)
+                        dvrTraceVector("reconvergence_branch", curTick(),
+                            uop.pc, uop.branchTargetPC, inference.lanes);
+                }
                 // Every completed root discovery is a dynamic inner-loop
                 // invocation with its own start address and bound.  Once NDM
                 // has found the outer stride, pair that exact data with the
@@ -3089,6 +3104,12 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
                     state->replay->triggerDestination, value,
                     dvrHelperMaxUops, state->replay->initialRegs);
             ++cpuStats.dvrVIRSourceValueExecutions;
+            // Source-response continuation is the normal path for a
+            // dependent chain.  Its SIMT branch results must contribute to
+            // the same global divergence/reconvergence counters as the
+            // initial VIR pass.
+            cpuStats.dvrDivergentBranches += response.divergentBranches;
+            cpuStats.dvrReconvergences += response.reconvergences;
             cpuStats.dvrVIRSourceValueBranches += response.divergentBranches;
             cpuStats.dvrVIRSourceValueExternalLanes +=
                 response.externalPathLanes;

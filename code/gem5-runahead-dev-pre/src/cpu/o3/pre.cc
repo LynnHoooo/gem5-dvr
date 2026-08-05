@@ -701,6 +701,17 @@ DVRInstructionRecorder::import(const std::array<Uop, MaxUops> &source,
 }
 
 void
+DVRInstructionRecorder::setReconvergencePC(Addr pc)
+{
+    if (pc == 0)
+        return;
+    for (unsigned index = 0; index < count; ++index) {
+        if (uops[index].conditional)
+            uops[index].reconvergencePC = pc;
+    }
+}
+
+void
 DVRInstructionRecorder::reset()
 {
     uops = {};
@@ -801,8 +812,6 @@ DVRVectorInstructionRegister::executeLanePC(
         return result;
 
     std::array<bool, 128> lane_active = {};
-    std::array<bool, DVRInstructionRecorder::MaxUops> pending_reconvergence =
-        {};
     std::array<unsigned, 128> lane_window_start = {};
     std::array<unsigned, 128> lane_window_end = {};
     const Addr entry = program[start_index].pc;
@@ -825,10 +834,54 @@ DVRVectorInstructionRegister::executeLanePC(
 
     const unsigned chunks = (lanes + 15) / 16;
     for (unsigned step = 0; step < max_helper_uops; ++step) {
+        // The stack is a SIMT scheduler, not just a counter.  A deferred
+        // path is held out of issue until the selected path reaches the
+        // common DVR termination point.  At that point restore its mask and
+        // continue at the saved target PC, as in the paper's Figure 6.
+        bool resumed_path = false;
+        if (stackDepth != 0) {
+            const auto &top = stack[stackDepth - 1];
+            bool at_reconvergence = false;
+            bool selected_path_alive = false;
+            for (unsigned lane = 0; lane < lanes; ++lane) {
+                if (!lane_active[lane] || laneBlocked[lane])
+                    continue;
+                selected_path_alive = true;
+                at_reconvergence |= lanePC[lane] == top.pc;
+            }
+            if (at_reconvergence || !selected_path_alive) {
+                const auto deferred = top.deferredMask;
+                const Addr deferred_pc = top.deferredPC;
+                for (unsigned lane = 0; lane < lanes; ++lane) {
+                    if (deferred[lane / 64] &
+                        (uint64_t(1) << (lane % 64))) {
+                        laneBlocked[lane] = false;
+                        lanePC[lane] = deferred_pc;
+                    }
+                }
+                --stackDepth;
+                if (at_reconvergence)
+                    ++result.reconvergences;
+                resumed_path = true;
+            }
+        }
         int op_index = -1;
         Addr group_pc = 0;
+        if (resumed_path && stackDepth < ReconvergenceEntries) {
+            // Prefer the path just restored so it reaches the common PC
+            // before the already-finished path executes past it.
+            for (unsigned lane = 0; lane < lanes; ++lane) {
+                if (lane_active[lane] && !laneBlocked[lane] &&
+                    lanePC[lane] != 0) {
+                    group_pc = lanePC[lane];
+                    break;
+                }
+            }
+        }
         for (unsigned lane = 0; lane < lanes; ++lane) {
-            if (!lane_active[lane])
+            if (!lane_active[lane] || laneBlocked[lane])
+                continue;
+            if (resumed_path && group_pc != 0 && lanePC[lane] != group_pc)
                 continue;
             for (unsigned candidate = lane_window_start[lane];
                  candidate < lane_window_end[lane]; ++candidate) {
@@ -867,16 +920,13 @@ DVRVectorInstructionRegister::executeLanePC(
             break;
 
         const auto &op = program[op_index];
-        if (pending_reconvergence[op_index]) {
-            ++result.reconvergences;
-            pending_reconvergence[op_index] = false;
-            if (stackDepth != 0)
-                --stackDepth;
-        }
 
         std::array<bool, 128> executing = {};
+        std::array<bool, 128> taken_lanes = {};
         bool has_taken = false;
         bool has_fallthrough = false;
+        bool first_path_taken = false;
+        bool first_path_set = false;
         for (unsigned lane = 0; lane < lanes; ++lane) {
             if (!lane_active[lane] || lanePC[lane] != group_pc)
                 continue;
@@ -904,6 +954,11 @@ DVRVectorInstructionRegister::executeLanePC(
                 lanePC[lane] = next;
                 if (next == 0)
                     ++result.earlyExitLanes;
+                taken_lanes[lane] = lane_taken;
+                if (!first_path_set) {
+                    first_path_taken = lane_taken;
+                    first_path_set = true;
+                }
                 has_taken |= lane_taken;
                 has_fallthrough |= !lane_taken;
                 continue;
@@ -933,13 +988,21 @@ DVRVectorInstructionRegister::executeLanePC(
             }
             const Addr reconvergence = op.reconvergencePC != 0 ?
                 op.reconvergencePC : op.fallthroughPC;
-            for (unsigned candidate = 0; candidate < program.size();
-                 ++candidate) {
-                if (program[candidate].pc == reconvergence) {
-                    pending_reconvergence[candidate] = true;
-                    break;
+            std::array<uint64_t, 2> deferred = {};
+            Addr deferred_pc = 0;
+            for (unsigned lane = 0; lane < lanes; ++lane) {
+                if (!executing[lane])
+                    continue;
+                const bool defer = taken_lanes[lane] != first_path_taken;
+                if (defer) {
+                    deferred[lane / 64] |= uint64_t(1) << (lane % 64);
+                    deferred_pc = lanePC[lane];
+                    laneBlocked[lane] = true;
                 }
             }
+            stack[stackDepth].deferredMask = deferred;
+            stack[stackDepth].deferredPC = deferred_pc;
+            stack[stackDepth].pc = reconvergence;
             ++stackDepth;
         }
 
@@ -961,8 +1024,12 @@ DVRVectorInstructionRegister::executeLanePC(
         bool any_active = false;
         for (unsigned lane = 0; lane < lanes; ++lane)
             any_active |= lane_active[lane] && lanePC[lane] != 0;
+        // A selected path can terminate before the reconvergence point.  The
+        // next iteration will pop the deferred path even though no selected
+        // lane remains issueable.
         if (!any_active)
-            break;
+            if (stackDepth == 0)
+                break;
     }
 
     if (result.helperUops >= max_helper_uops) {
@@ -1139,6 +1206,7 @@ DVRVectorInstructionRegister::initializeSourceContinuation(
     for (unsigned lane = 0; lane < continuationLanes; ++lane) {
         laneActive[lane] = true;
         laneReady[lane] = false;
+        laneBlocked[lane] = false;
         lanePC[lane] = entry;
         laneWindowStart[lane] = 1;
         laneWindowEnd[lane] = std::min(
@@ -1318,11 +1386,56 @@ DVRVectorInstructionRegister::resumeSourceLanes(
         return result;
 
     for (unsigned step = 0; step < max_helper_uops; ++step) {
+        bool resumed_path = false;
+        if (stackDepth != 0) {
+            const auto &top = stack[stackDepth - 1];
+            bool at_reconvergence = false;
+            bool selected_path_alive = false;
+            for (unsigned candidate_lane = 0;
+                 candidate_lane < continuationLanes; ++candidate_lane) {
+                if (!laneActive[candidate_lane] ||
+                    !laneReady[candidate_lane] || laneBlocked[candidate_lane])
+                    continue;
+                selected_path_alive = true;
+                at_reconvergence |= lanePC[candidate_lane] == top.pc;
+            }
+            if (at_reconvergence || !selected_path_alive) {
+                const auto deferred = top.deferredMask;
+                const Addr deferred_pc = top.deferredPC;
+                for (unsigned candidate_lane = 0;
+                     candidate_lane < continuationLanes; ++candidate_lane) {
+                    if (deferred[candidate_lane / 64] &
+                        (uint64_t(1) << (candidate_lane % 64))) {
+                        laneBlocked[candidate_lane] = false;
+                        lanePC[candidate_lane] = deferred_pc;
+                    }
+                }
+                --stackDepth;
+                if (at_reconvergence)
+                    ++result.reconvergences;
+                resumed_path = true;
+            }
+        }
         Addr group_pc = 0;
         int op_index = -1;
+        if (resumed_path) {
+            for (unsigned candidate_lane = 0;
+                 candidate_lane < continuationLanes; ++candidate_lane) {
+                if (laneActive[candidate_lane] &&
+                    laneReady[candidate_lane] &&
+                    !laneBlocked[candidate_lane]) {
+                    group_pc = lanePC[candidate_lane];
+                    break;
+                }
+            }
+        }
         for (unsigned candidate_lane = 0;
              candidate_lane < continuationLanes; ++candidate_lane) {
-            if (!laneActive[candidate_lane] || !laneReady[candidate_lane])
+            if (!laneActive[candidate_lane] || !laneReady[candidate_lane] ||
+                laneBlocked[candidate_lane])
+                continue;
+            if (resumed_path && group_pc != 0 &&
+                lanePC[candidate_lane] != group_pc)
                 continue;
             group_pc = lanePC[candidate_lane];
             for (unsigned candidate = laneWindowStart[candidate_lane];
@@ -1350,7 +1463,7 @@ DVRVectorInstructionRegister::resumeSourceLanes(
             for (unsigned candidate_lane = 0;
                  candidate_lane < continuationLanes; ++candidate_lane) {
                 if (!laneActive[candidate_lane] ||
-                    !laneReady[candidate_lane])
+                    !laneReady[candidate_lane] || laneBlocked[candidate_lane])
                     continue;
                 laneActive[candidate_lane] = false;
                 laneReady[candidate_lane] = false;
@@ -1370,8 +1483,11 @@ DVRVectorInstructionRegister::resumeSourceLanes(
         ++result.pcGroups;
         bool any_active = false;
         unsigned group_lanes = 0;
+        std::array<bool, 128> taken_lanes = {};
         bool has_taken = false;
         bool has_fallthrough = false;
+        bool first_path_taken = false;
+        bool first_path_set = false;
         for (unsigned candidate_lane = 0;
              candidate_lane < continuationLanes; ++candidate_lane) {
             if (!laneActive[candidate_lane] || !laneReady[candidate_lane] ||
@@ -1394,6 +1510,11 @@ DVRVectorInstructionRegister::resumeSourceLanes(
                     (op.fallthroughPC != 0 ? op.fallthroughPC :
                      (op_index + 1 < size ? source[op_index + 1].pc : 0));
                 lanePC[candidate_lane] = next;
+                taken_lanes[candidate_lane] = taken;
+                if (!first_path_set) {
+                    first_path_taken = taken;
+                    first_path_set = true;
+                }
                 has_taken |= taken;
                 has_fallthrough |= !taken;
                 if (next == 0) {
@@ -1450,15 +1571,31 @@ DVRVectorInstructionRegister::resumeSourceLanes(
                                           group_lanes);
         if (has_taken && has_fallthrough) {
             ++result.divergentBranches;
-            // Each lane retains its own PC and active state.  The per-lane
-            // stack metadata is reserved for the reconvergence PC; lanes
-            // that leave the captured recorder are terminated above.
+            if (stackDepth >= ReconvergenceEntries) {
+                result.stackOverflow = true;
+                return result;
+            }
+            const Addr reconvergence = op.reconvergencePC != 0 ?
+                op.reconvergencePC : op.fallthroughPC;
+            std::array<uint64_t, 2> deferred = {};
+            Addr deferred_pc = 0;
             for (unsigned candidate_lane = 0;
                  candidate_lane < continuationLanes; ++candidate_lane) {
-                if (laneActive[candidate_lane] &&
-                    laneReady[candidate_lane])
-                    ++laneStackDepth[candidate_lane];
+                if (!any_active || !laneActive[candidate_lane] ||
+                    !laneReady[candidate_lane] ||
+                    lanePC[candidate_lane] == 0)
+                    continue;
+                if (taken_lanes[candidate_lane] != first_path_taken) {
+                    deferred[candidate_lane / 64] |=
+                        uint64_t(1) << (candidate_lane % 64);
+                    deferred_pc = lanePC[candidate_lane];
+                    laneBlocked[candidate_lane] = true;
+                }
             }
+            stack[stackDepth].deferredMask = deferred;
+            stack[stackDepth].deferredPC = deferred_pc;
+            stack[stackDepth].pc = reconvergence;
+            ++stackDepth;
         }
         ++result.helperUops;
         ++result.chunkIssues;
@@ -1468,7 +1605,8 @@ DVRVectorInstructionRegister::resumeSourceLanes(
     if (result.helperUops >= max_helper_uops) {
         for (unsigned candidate_lane = 0;
              candidate_lane < continuationLanes; ++candidate_lane) {
-            if (laneActive[candidate_lane] && laneReady[candidate_lane]) {
+            if (laneActive[candidate_lane] && laneReady[candidate_lane] &&
+                !laneBlocked[candidate_lane]) {
                 result.timedOut = true;
                 break;
             }
@@ -1494,6 +1632,7 @@ DVRVectorInstructionRegister::reset()
     lanePC = {};
     laneActive = {};
     laneReady = {};
+    laneBlocked = {};
     lanePendingReconvergence = {};
     laneWindowStart = {};
     laneWindowEnd = {};

@@ -240,6 +240,8 @@ class DVRInstructionRecorder
     bool record(const DynInstPtr &inst);
     /** Import a committed helper template for response-driven replay. */
     void import(const std::array<Uop, MaxUops> &source, unsigned size);
+    /** Bind every conditional path to the DVR termination PC (the FLR). */
+    void setReconvergencePC(Addr pc);
     void reset();
     unsigned size() const { return count; }
     bool overflow() const { return overflowed; }
@@ -280,6 +282,7 @@ class DVRVectorInstructionRegister
     struct ReconvergenceEntry
     {
         std::array<uint64_t, 2> deferredMask = {};
+        Addr deferredPC = 0;
         Addr pc = 0;
     };
 
@@ -292,6 +295,9 @@ class DVRVectorInstructionRegister
     std::array<Addr, 128> lanePC = {};
     std::array<bool, 128> laneActive = {};
     std::array<bool, 128> laneReady = {};
+    // A deferred SIMT path remains live, but is not eligible for issue until
+    // the currently selected path reaches the stack's reconvergence PC.
+    std::array<bool, 128> laneBlocked = {};
     std::array<std::array<bool, DVRInstructionRecorder::MaxUops>, 128>
         lanePendingReconvergence = {};
     // Each lane has its own decoded-uop window.  A divergent target can move
