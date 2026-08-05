@@ -72,17 +72,38 @@ DVRStrideDetector::observe(Addr pc, Addr address)
 }
 
 std::optional<DVRStrideDetector::Candidate>
-DVRStrideDetector::observeDispatch(Addr pc) const
+DVRStrideDetector::observeDispatch(Addr pc, bool discovery_active,
+                                   Addr trigger_pc)
 {
-    for (const auto &entry : entries) {
+    for (auto &entry : entries) {
         if (entry.valid && entry.pc == pc && entry.stride != 0 &&
             entry.confidence >= 2) {
+            const bool repeated = discovery_active && entry.discoverySeen;
+            if (discovery_active)
+                entry.discoverySeen = true;
             return Candidate{pc, static_cast<Addr>(
                 static_cast<int64_t>(entry.lastAddress) + entry.stride),
-                entry.stride};
+                entry.stride, repeated && pc != trigger_pc};
         }
     }
     return std::nullopt;
+}
+
+void
+DVRStrideDetector::beginDiscovery(Addr trigger_pc)
+{
+    // This models the paper's one-bit register: every RPT entry starts clear
+    // for a new Discovery generation, then the trigger entry is marked as
+    // soon as Discovery opens.  A second observation of another striding PC
+    // therefore identifies a more-inner candidate.
+    for (auto &entry : entries)
+        entry.discoverySeen = false;
+    for (auto &entry : entries) {
+        if (entry.valid && entry.pc == trigger_pc) {
+            entry.discoverySeen = true;
+            break;
+        }
+    }
 }
 
 void
@@ -114,6 +135,14 @@ DVRDiscoveryController::arm(
     triggerSequence = sequence;
     stopSequence = 0;
     instructions = 0;
+}
+
+void
+DVRDiscoveryController::restart(
+    const DVRStrideDetector::Candidate &candidate, InstSeqNum sequence)
+{
+    finish();
+    arm(candidate, sequence);
 }
 
 bool
@@ -392,7 +421,8 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
 
         // C.LD rd', uimm(rs1') -- RV64C quadrant 0, funct3 011.
         if (quadrant == 0 && funct3 == 3) {
-            uop.semantic = Semantic::LoadAddress;
+            uop.semantic = Semantic::LoadDouble;
+            uop.loadBytes = 8;
             uop.immediate =
                 ((compressed >> 10) & 0x7) << 3 |
                 ((compressed >> 5) & 0x3) << 6;
@@ -403,11 +433,54 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
         // The helper only needs the effective address; the loaded word is
         // supplied by the source-response path just like other loads.
         if (quadrant == 0 && funct3 == 2) {
-            uop.semantic = Semantic::LoadAddress;
+            uop.semantic = Semantic::LoadWordSigned;
+            uop.loadBytes = 4;
             uop.immediate =
                 ((compressed >> 10) & 0x7) << 3 |
                 ((compressed >> 6) & 0x1) << 2;
             return;
+        }
+
+        // RV64C quadrant 1, funct3 100: compressed shifts, ANDI, and
+        // register logical operations.  These are common in compiler
+        // generated address/control paths and must not become a semantic
+        // fallback merely because they use a 16-bit encoding.
+        if (quadrant == 1 && funct3 == 4) {
+            const bool wide_register_op = ((compressed >> 12) & 0x1) != 0;
+            const unsigned op_select = (compressed >> 10) & 0x3;
+            if (op_select == 0) {
+                uop.semantic = Semantic::ShiftRightLogicalImmediate;
+                uop.immediate = ((compressed >> 12) & 0x1) << 5 |
+                    ((compressed >> 2) & 0x1f);
+                return;
+            }
+            if (op_select == 1) {
+                uop.semantic = Semantic::ShiftRightArithmeticImmediate;
+                uop.immediate = ((compressed >> 12) & 0x1) << 5 |
+                    ((compressed >> 2) & 0x1f);
+                return;
+            }
+            if (op_select == 2) {
+                uop.semantic = Semantic::AndImmediate;
+                uop.immediate = dvrSignExtend(
+                    (((compressed >> 12) & 0x1) << 5) |
+                    ((compressed >> 2) & 0x1f), 6);
+                return;
+            }
+            if (!wide_register_op && op_select == 3) {
+                switch ((compressed >> 5) & 0x3) {
+                  case 0: uop.semantic = Semantic::Sub; return;
+                  case 1: uop.semantic = Semantic::Xor; return;
+                  case 2: uop.semantic = Semantic::Or; return;
+                  case 3: uop.semantic = Semantic::And; return;
+                }
+            }
+            if (wide_register_op && op_select == 3) {
+                switch ((compressed >> 5) & 0x3) {
+                  case 0: uop.semantic = Semantic::SubWord; return;
+                  case 1: uop.semantic = Semantic::AddWord; return;
+                }
+            }
         }
 
         // C.SLLI rd, shamt -- quadrant 2, funct3 000.
@@ -465,6 +538,8 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
             uop.semantic = Semantic::AddWord;
         else if (funct3 == 0 && funct7 == 0x20)
             uop.semantic = Semantic::SubWord;
+        else if (funct3 == 0 && funct7 == 1)
+            uop.semantic = Semantic::MultiplyWord;
         return;
     }
 
@@ -513,11 +588,26 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
 
     if (opcode == 0x03) {
         switch (funct3) {
-          case 0: uop.semantic = Semantic::LoadByteSigned; break;
-          case 1: uop.semantic = Semantic::LoadHalfSigned; break;
-          case 2: uop.semantic = Semantic::LoadWordSigned; break;
-          case 3: uop.semantic = Semantic::LoadDouble; break;
-          case 4: uop.semantic = Semantic::LoadWordUnsigned; break;
+          case 0:
+            uop.semantic = Semantic::LoadByteSigned;
+            uop.loadBytes = 1;
+            break;
+          case 1:
+            uop.semantic = Semantic::LoadHalfSigned;
+            uop.loadBytes = 2;
+            break;
+          case 2:
+            uop.semantic = Semantic::LoadWordSigned;
+            uop.loadBytes = 4;
+            break;
+          case 3:
+            uop.semantic = Semantic::LoadDouble;
+            uop.loadBytes = 8;
+            break;
+          case 4:
+            uop.semantic = Semantic::LoadWordUnsigned;
+            uop.loadBytes = 4;
+            break;
           default: uop.semantic = Semantic::Unsupported; return;
         }
         uop.immediate = dvrSignExtend(uop.encoding >> 20, 12);
@@ -588,6 +678,11 @@ DVRInstructionRecorder::Uop::evaluate(
         return true;
       case Semantic::Multiply:
         result = source0_value * source1_value;
+        return true;
+      case Semantic::MultiplyWord:
+        result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
+            static_cast<uint32_t>(source0_value) *
+            static_cast<uint32_t>(source1_value))));
         return true;
       case Semantic::AddWord:
         result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
@@ -715,6 +810,7 @@ DVRInstructionRecorder::record(const DynInstPtr &inst)
 
     Uop &uop = uops[count++];
     uop.pc = inst->pcState().instAddr();
+    uop.staticInst = inst->staticInst;
     // DVR currently targets RV64; the fixed-width fall-through is sufficient
     // for the compact helper program and avoids consulting architectural PC
     // state during replay.
@@ -799,7 +895,8 @@ DVRInstructionRecorder::resourceCounts() const
             ++resources.lsu;
             continue;
         }
-        if (uop.semantic == Uop::Semantic::Multiply) {
+        if (uop.semantic == Uop::Semantic::Multiply ||
+            uop.semantic == Uop::Semantic::MultiplyWord) {
             ++resources.multiply;
             continue;
         }
@@ -1051,6 +1148,12 @@ DVRVectorInstructionRegister::executeLanePC(
             if (!op.evaluate(lhs, rhs, value)) {
                 result.unsupportedControlFlow = true;
                 ++result.unsupportedSemanticLanes;
+                if (result.unsupportedSemanticPC == 0) {
+                    result.unsupportedSemanticPC = op.pc;
+                    result.unsupportedSemanticEncoding = op.encoding;
+                    result.unsupportedSemantic =
+                        static_cast<uint8_t>(op.semantic);
+                }
                 lane_active[lane] = false;
                 activeMask[lane / 64] &= ~(uint64_t(1) << (lane % 64));
                 continue;
@@ -1426,6 +1529,12 @@ DVRVectorInstructionRegister::resumeSourceLane(
         if (!op.evaluate(lhs, rhs, value)) {
             result.unsupportedControlFlow = true;
             ++result.unsupportedSemanticLanes;
+            if (result.unsupportedSemanticPC == 0) {
+                result.unsupportedSemanticPC = op.pc;
+                result.unsupportedSemanticEncoding = op.encoding;
+                result.unsupportedSemantic =
+                    static_cast<uint8_t>(op.semantic);
+            }
             laneActive[lane] = false;
             activeMask[lane / 64] &= ~(uint64_t(1) << (lane % 64));
             break;
@@ -1662,6 +1771,12 @@ DVRVectorInstructionRegister::resumeSourceLanes(
             if (!op.evaluate(lhs, rhs, value)) {
                 result.unsupportedControlFlow = true;
                 ++result.unsupportedSemanticLanes;
+                if (result.unsupportedSemanticPC == 0) {
+                    result.unsupportedSemanticPC = op.pc;
+                    result.unsupportedSemanticEncoding = op.encoding;
+                    result.unsupportedSemantic =
+                        static_cast<uint8_t>(op.semantic);
+                }
                 laneActive[candidate_lane] = false;
                 laneReady[candidate_lane] = false;
                 activeMask[candidate_lane / 64] &=

@@ -175,7 +175,7 @@ discovery complete
   → DTLB translateAtomic
   → SoftPFReq timing packet
   → L1D/下层 cache
-  → source response 返回 8-byte value
+  → source response 按 LB/LH/LW/LWU/LD 的宽度返回并完成 sign/zero extension
   → 选择学习到的 FLR relation
   → 生成 dependent SoftPFReq
 ```
@@ -190,7 +190,7 @@ discovery complete
 | 模块 | 主要代码位置 | 关键运行时入口 | 验证入口 |
 |---|---|---|---|
 | 参数与配置 | `src/cpu/o3/BaseO3CPU.py`；`configs/dvr/table1_se.py` | `enableDVR`、`dvrEnableDependentPrefetch`、`--dvr-mode` | Stage 2；Figure 8 |
-| RPT / Stride Detector | `src/cpu/o3/pre.hh/.cc` | `DVRStrideDetector::observe()`（真实 load 地址）；`observeDispatch()`（dispatch 侧 candidate） | Stage 1、3 |
+| RPT / Stride Detector | `src/cpu/o3/pre.hh/.cc` | `DVRStrideDetector::observe()`（真实 load 地址）；`observeDispatch()`、`beginDiscovery()`（dispatch 侧 candidate 与 per-entry discovery bit） | Stage 1、3 |
 | O3 dispatch 接入 | `src/cpu/o3/iew.cc`；`src/cpu/o3/cpu.cc` | `IEW::dispatchInsts()` → `CPU::observeDVRDispatch()` | Stage 1、3、4 |
 | Discovery | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `arm()`、`observeDispatch()`、`observeCommit()`；`CPU::instDone()` | Stage 3 |
 | VTT / FLR | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `DVRVectorTaintTracker::observe()`、`classify()`；dispatch 侧 taint/dependent 记录 | Stage 4 |
@@ -346,18 +346,14 @@ accuracy、coverage、timeliness 和 pollution 需要 L1 tag lookup/fill/victim
 
 按重要程度排列：
 
-1. 将已验证的逐 lane evaluator 扩展到更多 RV64/RVC 整数、比较、load-value 和地址生成 opcode；
-   仿射逻辑仅保留为 unsupported 链的显式 fallback。
-2. 将当前按 source response 重建的单 lane VIR continuation，提升为持久化的
-   多 lane helper context：为每个未完成 lane 保存 PC、寄存器、active/deferred
-   mask 和 reconvergence stack，并让 source response 直接恢复对应 lane，而不是
-   重新建立一个单 lane evaluator。
-3. 将已验证的实际 value-predicate 路径选择进一步扩展到任意 branch opcode，
+1. 将已验证的逐 lane evaluator 继续扩展到 `LBU/LHU`、更多 RV64/RVC 整数和地址生成
+   opcode；仿射逻辑仅保留为 unsupported 链的显式 fallback。
+2. 将已验证的实际 value-predicate 路径选择进一步扩展到任意 branch opcode，
    并让 VIR 使用独立 lane PC 执行 branch target/fall-through，而不仅是
    recorder 内的有限路径。
-4. 将当前已加入 fetch/decode/issue 状态的 helper 继续扩展为执行端口级资源
+3. 将当前已加入 fetch/decode/issue 状态的 helper 继续扩展为执行端口级资源
    竞争模型。
-5. 将已接通的严格质量 tracker 扩展到更多 workload，并统一论文的 accuracy、
+4. 将已接通的严格质量 tracker 扩展到更多 workload，并统一论文的 accuracy、
    coverage、timeliness 和 pollution 报告口径。
 6. 缩小版 GAP workload。
 7. Baseline、PRE、Offload/Discovery、Nested DVR 消融。
@@ -572,7 +568,7 @@ DVR_REGRESSION_PASSED quick=0
 summary=/home/lynnhoo/dvr-repro/results/dvr-regression-logs/20260730T134006Z.summary
 ```
 
-#### 9.3.2 当前 Nested Controller 不等于论文的 Nested Discovery Mode
+#### 9.3.2 Nested Discovery Mode 数据面状态
 
 论文 NDM 的完整语义包括：
 
@@ -586,36 +582,63 @@ summary=/home/lynnhoo/dvr-repro/results/dvr-regression-logs/20260730T134006Z.sum
 8. 展平为最多 128 个 inner lanes；
 9. 再从 inner stride 启动普通 DVR。
 
-当前实现主要是：root discovery 中发现另一个 candidate，candidate commit 后建立
-独立 child context，child recurrence 后按 child stride 生成 helper。它证明了两层
-独立 discovery/replay context 能发送真实内存请求，但尚缺 `<64 lane` 门槛、
-branch inversion、IR/ILR、outer invocation vectorization 和 inner-lane flatten。
+当前 next helper 分支已经把这些控制和数据面接通：完成的短 inner-loop discovery
+在 `<64` lanes 时进入 NDM，保存 IR/ILR/LCR，反转 inner backward branch，接受
+真实 committed outer stride，并把多个独立 outer invocation 的 inner bound 和
+起始地址展平为最多 128 个 scalar-equivalent lanes。NDM 的请求仍经过同一 helper
+生命周期和真实 LSQ/cache 路径。
 
-因此，当前 Stage 13 应描述为“两层独立上下文和真实 helper 验证”，不能描述为
-论文 4.3 节 NDM 的完整复现。
+验收不应只看 NDM 控制计数，还必须检查以下守恒关系：
 
-#### 9.3.3 helper 尚未完整共享论文中的执行资源
+```text
+nested_batches > 0
+outer_instances >= 2 * nested_batches
+flattened_lanes == expected_flattened_lanes
+flatten_invariant_failures == 0
+nested_helpers_generated >= flattened_lanes
+```
+
+`scripts/run_remote_dvr_helper_regression.sh` 会在
+`dvr_divergent.riscv`、`dvr_nested.riscv` 和
+`dvr_nested_variable.riscv` 上执行这组检查。当前 next binary 的两个 Nested
+结果为：普通 nested `6292` batches、`12584` outer instances、`765240`
+flattened lanes；variable nested `1518` batches、`3036` outer instances、
+`55734` flattened lanes 和 `1210` 个 variable-lane batches。两组的 flatten
+invariant failures 都为 0。
+
+这证明了论文 4.3 节的 NDM branch-inversion 到 outer-times-inner flatten
+数据面，而不是只证明控制器状态机。它仍然不是 Sniper/x86 的 bit-exact
+复现，helper-owned DynInst 也仍不进入主线程 ROB/IQ/commit。
+
+#### 9.3.3 helper 执行资源与前端边界
 
 论文要求 helper 与主线程共享执行单元，并且只有在相同端口没有 main-thread
-ready instruction 时才能发射。当前实现已经具有主线程优先的 cache/data-port
-节流，但地址计算主要由 CPU 侧 C++ evaluator 完成，VIR 尚未作为真实 gem5 FU
-pipeline 的有序发射后端。
+ready instruction 时才能发射。当前 next helper 已按以下边界建模：
 
-目前未完整建模：
+- helper 自有 decoded-uop cache，Discovery 保存的 `StaticInstPtr` 只在 helper
+  context 内按 PC 缓存，不进入主线程 fetch queue；
+- 主线程阶段先运行，helper fetch/decode 只获得剩余的前端宽度，并统计
+  `dvrHelperFetchBlockedByMain` 和 `dvrHelperDecodeBlockedByMain`；
+- 同 PC ready lanes 合并为 512-bit chunk，按语义分别请求 `SimdAdd`、`SimdAlu`、`SimdShift` 或
+  `SimdMult`，再由 `IEW::tryIssueDVRHelperFU()` 使用原生 FU pool 的 latency
+  和占用；
+- dependent load 等待前序 helper 地址 uop 完成，然后进入真实 LSQ、DTLB、cache
+  和 MSHR；
+- 每 lane 持有 PC、8-entry reconvergence stack、helper-uop timeout 和私有 VRAT
+  状态；
+- helper 仍不产生主线程 DynInst，也不进入主线程 rename/IQ/ROB/commit，这是
+  论文独立 in-order subthread 的边界，而不是第二个 SMT O3 线程。
 
-- IntALU、shift、multiply、vector FU 的占用；
-- helper uop latency；
-- per-port main-thread priority；
-- source load → dependent ALU → next load 的调度时间；
-- helper front-end buffer 对 fetch/decode 带宽的影响。
-
-这会影响最终 performance、MLP 和 timeliness，必须在正式 workload 实验前补齐
-至少一个可审计的资源 token/port contention 模型。
+因此它现在是 paper-faithful execution-driven helper timing model，而不是
+完整 Sniper 内部实现。性能实验仍需分别报告 constrained vector FU 和
+unlimited vector FU，避免把资源模型变化误认为算法收益。
 
 #### 9.3.4 逐 lane evaluator 的 opcode 覆盖过窄
 
-当前主要支持 `ADD/ADDI/SLLI/ANDI/load-address` 和测试使用的
-`C.ADD/C.SLLI/C.LD`。不支持的 uop 会使 replay invalid，并回退到 learned
+当前已支持 `ADD/SUB/ADDW/SUBW`、`MUL/MULW`、立即数和逻辑/shift 子集，以及
+`LB/LH/LW/LWU/LD` 的宽度和扩展语义；RVC 测试覆盖
+`C.ADD/C.SUB/C.XOR/C.OR/C.AND/C.SLLI/C.SRLI/C.SRAI/C.ANDI/C.LW/C.LD`。
+不支持的 uop 会使 replay invalid，并回退到 learned
 仿射地址 relation。
 
 真实图算法中还常见：
@@ -623,9 +646,8 @@ pipeline 的有序发射后端。
 - `SUB/SUBW`、`ADDW/ADDIW`；
 - `AND/OR/XOR`；
 - `SLL/SRL/SRA` 及 immediate/word variants；
-- `LB/LBU/LH/LHU/LW/LWU/LD`；
-- sign/zero extension；
-- `MUL`；
+- 尚未覆盖 `LBU/LHU` 以及更多 load/value 组合；
+- 更多 `MUL/MULW` 组合；
 - 更多 RVC 地址生成形式。
 
 如果真实 workload 大量回退，实验主要验证的是 relation predictor，而不是 DVR
@@ -731,9 +753,11 @@ Table-1 风格配置。
 #### 9.4.3 innermost stride selection
 
 论文在 Discovery 中维护每个 RPT entry 的 seen bit；若另一 stride 在当前 trigger
-重现前出现两次，应切换到更内层 stride，并重置 VTT/FLR。当前单 active discovery
-和 nested-candidate 逻辑尚不能替代这一通用算法，应增加 outer/inner stride 专项
-微基准和 trigger-switch 统计。
+重现前出现两次，应切换到更内层 stride，并重置 VTT/FLR。当前实现已在
+`DVRStrideDetector::beginDiscovery()`、`observeDispatch()` 和
+`CPU::beginDVRDiscoveryAtDispatch()` 中接通这条路径；Camel 诊断最近一次记录
+`dvrDiscoveryInnermostSwitches=78`。仍需用显式 outer/inner stride 微基准验证切换
+后的边界和性能收益。
 
 #### 9.4.4 loop-bound fallback 语义
 
@@ -1265,8 +1289,8 @@ flattened lanes）。
 
 服务器最新提交上已扩展 `DVRInstructionRecorder::Semantic` 和逐 lane evaluator，
 新增 RV64 常见整数数据流：`SUB`、寄存器 `AND/OR/XOR`、寄存器移位
-`SLL/SRL/SRA`、`MUL`，以及 `ORI/XORI/SRLI/SRAI`。二元语义现在显式读取第二个
-source register；未覆盖指令仍返回 `Unsupported`，不会静默近似。
+`SLL/SRL/SRA`、`MUL/MULW`，以及 `ORI/XORI/SRLI/SRAI`。二元语义现在显式读取
+第二个 source register；未覆盖指令仍返回 `Unsupported`，不会静默近似。
 
 固定 Python 3.11/Nix 环境重新编译成功，Stage15 资源验证通过：
 
@@ -1277,9 +1301,10 @@ main_issue=2003631 main_thread_suppressed=242974 dvr_issued=94199
 ```
 
 这完成了 P0 evaluator 的第一批可审计扩展。当前源码已经包含
-`ADDW/SUBW`、word shift、`LB/LH/LW/LWU/LD` 的 evaluator/replay 分支；但真实
-memory request 的 load width、sign/zero extension、RVC 变体、完整 branch path
-evaluator 和严格的论文 NDM branch inversion 仍然需要独立验收。当前 P0 状态应记录为：
+`ADDW/SUBW`、`MULW`、word shift、`LB/LH/LW/LWU/LD` 以及一组 RV64C 逻辑/移位
+指令的 evaluator/replay 分支；但 `LBU/LHU`、更完整的 load/value 组合、完整
+branch path evaluator 和严格的论文 NDM branch inversion 仍然需要独立验收。当前
+P0 状态应记录为：
 
 - Stage13 一键回归：已完成；
 - GAP 五 workload 六模式实验：已完成；
@@ -1347,13 +1372,16 @@ source response
 - `DVRHelperVectorRegisterFile`：每个 replay program 私有的架构寄存器到
   helper vector physical register 映射、lane value、valid/ready 状态；不使用主线程
   的物理寄存器文件，也不产生 commit 状态；
+- `DVRInstructionRecorder::Uop::staticInst` 和 `DVRDynUop::staticInst`：Discovery
+  保存 gem5 ISA 解码对象，helper 使用该对象作为 decoded-uop metadata，而不是重新
+  构造一个主线程 `DynInst`；
 - `DVRHelperThread::DVRDynUop`：保存 PC、operand、active lane mask、chunk 数量、
   issue/complete tick 和生命周期状态；
 - `DVRHelperThread::virBuffer`：有限 8-entry 的 in-order VIR buffer；
 - `CPU::issueDVRReplayLanes()`：按相同 PC/uop 和 ready lane 形成最多 512-bit chunk，
   预约原生 FU，并在完成地址计算后提交 dependent request。
 
-Camel 验收结果：
+Camel 验收结果（vector-chunk helper build）：
 
 ```text
 dvrHelperDynUopsDecoded       2,212,641
@@ -1366,8 +1394,10 @@ dvrDependentDemandCovered        65,495
 dvrDependentDemandLate                 1
 ```
 
-该路径仍需继续完成 M5 的显式 helper/main fetch-decode 仲裁、完整 branch
-divergence/reconvergence 和 NDM，不能描述为 Sniper 论文实现的 bit-exact reproduction。
+该路径已经包含显式 helper/main fetch-decode residual arbitration、同 PC
+multi-lane batching 和 helper-owned branch PC/reconvergence 状态；分支和 NDM
+回归见 9.3.2。仍不能描述为 Sniper 论文实现的 bit-exact reproduction，原因是
+gem5 RISC-V 与 Sniper x86 的前端、TLB、缓存填充和带宽细节并不相同。
 
 ## 18. DVR 第一阶段原配置锚定与 NDM 端到端验收
 
@@ -1415,3 +1445,131 @@ flattened_lanes=14478、replay_targets=3531、helper completed=9649，守恒失�
 而不是直接把所有 Full/Nested 结果标为完整论文 DVR。只有简单间接 workload
 出现稳定、可解释的正收益，并且 outstanding misses、coverage、timeliness 和
 资源竞争都与收益一致后，才升级命名和论文结论。
+
+### 18.1 Camel Figure 3 架构验收（2026-08-05）
+
+使用当前 `gem5-dvr-next` 构建和
+`camel-dvr-trace-c_lw-full/camel.riscv`，验收脚本为：
+
+```bash
+BENCH=/home/lynnhoo/dvr-repro/results/camel-dvr-trace-c_lw-full/camel.riscv \
+  bash scripts/run_remote_dvr_camel_arch_check.sh
+```
+
+脚本不只比较最终结果，还检查 `Result`、`committedInsts`、VRAT/VIR/UOP
+守恒和 `DVR_TRACE_DIR` 生成的地址链。最近一次结果：
+
+```text
+Result                              33888308
+baseline simTicks                  208039500
+Full Vector simTicks               201195500
+Full Vector speedup                    1.034017x
+vectorizer source lanes               184120
+vectorizer dependent lanes              8475
+helper DynUops decoded/issued/completed 205098/205098/205098
+private VRAT programs/writes          2024/368240
+VIR active-mask checks/failures       205098/0
+maximum same-PC VIR group width             8
+dependent requests issued/completed    8475/8475
+possibly-useful / late prefetches    11416/175
+dependent demand covered / late       8149/3
+peak outstanding DVR lines               19
+```
+
+这组结果证明 Camel 中确实走过以下普通 DVR 数据路径：
+
+```text
+RPT candidate
+  -> Discovery + loop bound
+  -> source vector lanes
+  -> real source ReadReq through LSQ/cache
+  -> source value written to private VRAT lane
+  -> same-PC ready lanes grouped by VIR
+  -> helper DynUop uses native SimdAlu FU reservation
+  -> dependent replay target
+  -> real dependent SoftPFReq through LSQ/cache
+```
+
+`vectorization.csv` 与 `dependency_chain.csv` 还会检查：每个 VIR trace group
+不超过 8 个 64-bit elements；每个 dependent target 都有同一 trigger/lane
+更早到达的真实 `source_value`；source lane 的 lane 编号和 Camel 8-byte 地址
+对齐有效。所有消融模式的程序结果和 committed instructions 保持一致。
+
+该 Camel 程序没有短 inner-loop 的 outer invocation 结构，因此
+`nested_flatten_batches=0` 是预期结果，不能用它验收 NDM；NDM 仍由
+`run_remote_dvr_helper_regression.sh` 的 Nested microbenchmark 验收。
+
+同时，Camel 主线程没有使用 SIMD 指令，所以 `dvrVectorFUConflictCycles=0`，
+且 constrained/unlimited vector-FU 两次结果相同。这不表示资源模型已经验证了
+主线程 SIMD 竞争，只表示该 workload 没有提供这条证据。helper uop 使用的是
+独立 `DVRDynUop -> VIR -> IEW::tryIssueDVRHelperFU -> FUPool` 路径；它仍不进入
+主线程 `DynInst -> rename -> IQ -> ROB -> commit`，因此这里的结论是
+“ISA-adapted execution-driven helper”，不是 bit-exact 的 Sniper DVR。
+
+### 18.2 Camel Figure 3 pipeline diagnostic：初学者阅读方法
+
+本节对应脚本
+`scripts/run_dvr_camel_pipeline_diagnostic.sh`。它不检查程序退出/清理结构，
+只检查普通 DVR data path：RPT、Discovery、VTT/FLR、loop bound、recorder、
+VRAT、vectorizer、VIR、helper uop、FU 和 LSQ/cache。运行：
+
+```bash
+cd /home/lynnhoo/dvr-repro/source/gem5-dvr-next
+BENCH=/home/lynnhoo/dvr-repro/results/camel-dvr-trace-c_lw-full/camel.riscv \
+  bash scripts/run_dvr_camel_pipeline_diagnostic.sh
+```
+
+脚本会打印一个新的结果目录。最重要的阅读方法是：
+
+```text
+数量 > 0                         = 该模块确实被执行
+generated == issued == completed  = 请求没有卡在 helper/cache 队列
+issued == completed               = 已发出的请求都收到 response
+mask failures == 0                = active lane mask 没有和实际 lane 不一致
+max group width >= 2              = 至少有一次真正的多 lane 同 PC issue
+useful/covered > 0                = 预取至少帮助了主线程的一部分访问
+late 较高                         = 预取发出过晚，不能及时隐藏 miss
+```
+
+下面按图中的模块解释每一段输出。
+
+| 输出段 | 看什么 | 说明 |
+|---|---|---|
+| `1. RPT / stride detector` | `loads observed`、`stride candidates` | RPT 先观察主线程 load，再判断哪些 load 的地址呈固定步长。candidate 不能为零，否则后面不会启动 DVR。 |
+| `2. Discovery Mode` | `starts`、`completions`、`timeouts` | `starts` 表示触发了 Discovery；`completions` 表示找到了可以结束的 discovery。timeout 不一定是错误，但过多说明探索经常没有在限制内完成。 |
+| `3. VTT / taint / FLR` | `tainted instructions`、`dependent loads`、`discoveries with FLR` | taint 表示“这条指令的输入来自 trigger load”；dependent load 是最终间接地址 load；FLR 是 Discovery 找到的最终 load register。三者都为正，说明依赖链确实被追踪。 |
+| `4. Loop-bound detector` | `bounds`、`matches`、`lane-count samples` | bound 是循环剩余次数，lane count 是要向量化的迭代数量。`matches` 表示两个动态寄存器快照支持这个推断；`fallbacks` 表示推断失败而使用最大 lane 数，应作为准确率风险观察。 |
+| `5. Recorder / replay` | `recorded metadata uops`、`programs built`、`unsupported`、`overflows` | recorder 保存的是 replay 所需的指令 metadata。`unsupported=0` 最好；`overflows>0` 表示有 discovery 超过 recorder 可保存的模板，需要单独修复，不能把这一轮称为所有链都被完整记录。 |
+| `6. VRAT` | `programs`、`lane register writes` | VRAT 是 helper 私有的向量寄存器表。每个 replay program 应创建一个 VRAT，source response 应写入 lane register。 |
+| `7. Vectorizer` | `source lanes`、`dependent lanes` 和 CSV 样例 | source lane 是未来规则地址；dependent lane 是读取 source value 后计算出的间接目标。脚本会将 stats 和 CSV 条目逐个计数比较。 |
+| `8. VIR` | `mask failures`、`multi-lane groups`、`maximum group width`、control fallback | VIR 把 ready 且 PC 相同的 lane 合并。Camel 使用 64-bit element 和 512-bit chunk，所以最大宽度是 8。`multi-lane groups>0` 才证明不是每个 lane 都单独执行。若 initial VIR audit 有 unsupported semantic，必须同时看到 persistent continuation fallback 为 0，才说明 source response 进入了新的持久化 helper 路径，而不是临时单 lane fallback。 |
+| `9. Helper uop` | `decoded/issued/completed`、fetch/decode | 三个数量相等表示每个 helper uop 都走完生命周期。这里是独立 helper 的轻量 front-end 和 `DVRDynUop`，不是主线程的 DynInst/ROB/commit。 |
+| `10. FU` | `requests/grants/stalls`、ALU/shift/multiply chunks | helper uop 先申请共享 FU，再获得 grant。Camel 的计算主要是 ALU；`vector FU conflict cycles=0` 只表示 Camel 主线程没有 SIMD 指令，不能证明 SIMD 竞争已被测试。 |
+| `11. LSQ / cache` | source/dependent generated、issued、completed | source 和 dependent 是两种请求。总生成量应满足 `source generated + dependent generated = total issued = total completed`；source 必须使用真实返回值，dependent 才能继续 replay。 |
+| `11b. Prefetch quality` | accuracy、coverage、timeliness、pollution | 这是“发出请求”之后的效果检查。coverage 表示减少了多少原本会发生的 miss；timeliness 表示是否及时；pollution 表示预取是否挤掉了有用 cache line。 |
+
+当前 Camel 结果的简化读法：
+
+```text
+RPT candidates                 8546
+Discovery starts/completions   2148/2065
+discoveries with FLR           2031
+loop-bound matches             2024
+source/dependent lanes         184120/8475
+VRAT programs/writes           2024/368240
+DynUop decoded/issued/done     205098/205098/205098
+VIR mask checks/failures       205098/0
+initial VIR unsupported        0/0 (control/semantic)
+multi-lane max group           8
+source/dependent issued/done   184120/184120, 8475/8475
+Full Vector speedup            1.034017x
+```
+
+因此可以得出：Camel 已经验证普通 DVR data path 有实际执行和约 `1.034x`
+性能收益；本轮 initial VIR audit 的 control/semantic failure 都是 0，且
+source-helper control fallback、persistent continuation fallback、timeout 和
+stack overflow 都是 0。它没有验证 NDM flatten，也没有验证主线程 SIMD 与
+helper 的 FU 竞争。另有 1 次 recorder overflow，应在后续长模板实验中消除。
+当前结果最准确的命名仍是
+`DVR-Offload+Discovery` 或 `ISA-adapted execution-driven DVR`，不是完整
+Sniper/DynInst bit-exact reproduction。
