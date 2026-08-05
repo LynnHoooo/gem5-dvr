@@ -38,6 +38,10 @@ class DVRStrideDetector
         Addr pc;
         Addr address;
         int64_t stride;
+        // True when this PC was observed again while another Discovery
+        // generation was still active.  The caller can then switch the
+        // discovery target to this more-inner striding load.
+        bool repeatedDuringDiscovery = false;
     };
 
   private:
@@ -49,6 +53,7 @@ class DVRStrideDetector
         int64_t stride = 0;
         uint8_t confidence = 0;
         uint64_t age = 0;
+        bool discoverySeen = false;
     };
 
     std::vector<Entry> entries;
@@ -57,7 +62,11 @@ class DVRStrideDetector
   public:
     explicit DVRStrideDetector(unsigned num_entries);
     std::optional<Candidate> observe(Addr pc, Addr address);
-    std::optional<Candidate> observeDispatch(Addr pc) const;
+    std::optional<Candidate> observeDispatch(Addr pc,
+                                             bool discovery_active = false,
+                                             Addr trigger_pc = 0);
+    /** Initialize the one-bit-per-RPT-entry discovery register. */
+    void beginDiscovery(Addr trigger_pc);
     void reset();
 };
 
@@ -104,6 +113,9 @@ class DVRDiscoveryController
     explicit DVRDiscoveryController(unsigned max_instructions);
     void arm(const DVRStrideDetector::Candidate &candidate,
              InstSeqNum sequence);
+    /** Restart Discovery on a more-inner striding load. */
+    void restart(const DVRStrideDetector::Candidate &candidate,
+                 InstSeqNum sequence);
     bool observeDispatch(Addr pc, InstSeqNum sequence);
     Result observeCommit(Addr pc, InstSeqNum sequence);
     bool rollback(InstSeqNum squash_sequence);
@@ -218,6 +230,10 @@ class DVRInstructionRecorder
         int8_t source1 = -1;
         int8_t destination = -1;
         Semantic semantic = Semantic::Unsupported;
+        // Width of the architectural load represented by this uop.  Address
+        // generation still uses a full register value; the source response
+        // applies the ISA-specific sign/zero extension using this metadata.
+        uint8_t loadBytes = 0;
         bool encodingValid = false;
         bool load = false;
         bool control = false;

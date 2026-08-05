@@ -659,6 +659,7 @@ class CPU : public BaseCPU
         statistics::Scalar dvrLoadsObserved;
         statistics::Scalar dvrStrideCandidates;
         statistics::Scalar dvrDiscoveryStarts;
+        statistics::Scalar dvrDiscoveryInnermostSwitches;
         statistics::Scalar dvrDiscoveryCompletions;
         statistics::Scalar dvrDiscoveryTimeouts;
         statistics::Scalar dvrDiscoveryAbandons;
@@ -727,6 +728,7 @@ class CPU : public BaseCPU
         statistics::Scalar dvrHelperIssueQueueStalls;
         statistics::Scalar dvrHelperScoreboardWaitCycles;
         statistics::Scalar dvrVectorALUChunkIssues;
+        statistics::Scalar dvrVectorAddChunkIssues;
         statistics::Scalar dvrVectorShiftChunkIssues;
         statistics::Scalar dvrVectorMultiplyChunkIssues;
         statistics::Scalar dvrVectorChunkRequests;
@@ -1112,7 +1114,7 @@ class CPU : public BaseCPU
         bool vectorChunkModel = false;
         Addr helperPC = 0;
 
-        enum class ComputeKind { Alu, Shift, Multiply };
+        enum class ComputeKind { Alu, Add, Shift, Multiply };
         struct DVRDynUop
         {
             enum class State { Decoded, Ready, Issued, WaitingMemory,
@@ -1449,6 +1451,35 @@ class CPU : public BaseCPU
                     } else if (uop.semantic ==
                                    DVRInstructionRecorder::Uop::Semantic::Multiply) {
                         entry.kind = ComputeKind::Multiply;
+                    } else if (
+                        uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::Add ||
+                        uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::Sub ||
+                        uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::AddWord ||
+                        uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::SubWord ||
+                        uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::AddImmediate ||
+                        uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::AddWordImmediate ||
+                        uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::LoadAddress ||
+                        uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::LoadByteSigned ||
+                        uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::LoadHalfSigned ||
+                        uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::LoadWordSigned ||
+                        uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::LoadWordUnsigned ||
+                        uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::LoadDouble) {
+                        // Address generation and integer add/sub use the
+                        // dedicated vector-add class, not the generic SIMD
+                        // ALU class.
+                        entry.kind = ComputeKind::Add;
                     } else {
                         entry.kind = ComputeKind::Alu;
                     }
@@ -1805,6 +1836,9 @@ class CPU : public BaseCPU
     void captureDVRRegisterSnapshot(
         ThreadID tid, const DynInstPtr &committing_inst,
         DVRLoopBoundDetector::RegisterSnapshot &snapshot);
+    void beginDVRDiscoveryAtDispatch(
+        const DynInstPtr &inst, const DVRStrideDetector::Candidate &candidate,
+        bool restart);
     void launchDVRStridePrefetches(ThreadID tid, Addr current_address,
                                    Addr pc, int64_t stride, unsigned lanes,
                                    const DVRLoopBoundDetector::RegisterSnapshot
@@ -1852,6 +1886,7 @@ class CPU : public BaseCPU
     Addr dvrPrefetchLine(Addr address) const;
     void accountDVRDemand(Addr address);
     void updateDVRPrefetchQueuePeak();
+    unsigned dvrPrefetchBytes(const DVRPrefetchAddress &prefetch) const;
     void retireDVRPredicateLane(
         const std::shared_ptr<DVRPredicateGeneration> &generation,
         unsigned lane, bool has_value, RegVal value = 0);

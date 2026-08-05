@@ -175,7 +175,7 @@ discovery complete
   → DTLB translateAtomic
   → SoftPFReq timing packet
   → L1D/下层 cache
-  → source response 返回 8-byte value
+  → source response 按 LB/LH/LW/LWU/LD 的宽度返回并完成 sign/zero extension
   → 选择学习到的 FLR relation
   → 生成 dependent SoftPFReq
 ```
@@ -190,7 +190,7 @@ discovery complete
 | 模块 | 主要代码位置 | 关键运行时入口 | 验证入口 |
 |---|---|---|---|
 | 参数与配置 | `src/cpu/o3/BaseO3CPU.py`；`configs/dvr/table1_se.py` | `enableDVR`、`dvrEnableDependentPrefetch`、`--dvr-mode` | Stage 2；Figure 8 |
-| RPT / Stride Detector | `src/cpu/o3/pre.hh/.cc` | `DVRStrideDetector::observe()`（真实 load 地址）；`observeDispatch()`（dispatch 侧 candidate） | Stage 1、3 |
+| RPT / Stride Detector | `src/cpu/o3/pre.hh/.cc` | `DVRStrideDetector::observe()`（真实 load 地址）；`observeDispatch()`、`beginDiscovery()`（dispatch 侧 candidate 与 per-entry discovery bit） | Stage 1、3 |
 | O3 dispatch 接入 | `src/cpu/o3/iew.cc`；`src/cpu/o3/cpu.cc` | `IEW::dispatchInsts()` → `CPU::observeDVRDispatch()` | Stage 1、3、4 |
 | Discovery | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `arm()`、`observeDispatch()`、`observeCommit()`；`CPU::instDone()` | Stage 3 |
 | VTT / FLR | `src/cpu/o3/pre.hh/.cc`；`cpu.cc` | `DVRVectorTaintTracker::observe()`、`classify()`；dispatch 侧 taint/dependent 记录 | Stage 4 |
@@ -346,18 +346,14 @@ accuracy、coverage、timeliness 和 pollution 需要 L1 tag lookup/fill/victim
 
 按重要程度排列：
 
-1. 将已验证的逐 lane evaluator 扩展到更多 RV64/RVC 整数、比较、load-value 和地址生成 opcode；
-   仿射逻辑仅保留为 unsupported 链的显式 fallback。
-2. 将当前按 source response 重建的单 lane VIR continuation，提升为持久化的
-   多 lane helper context：为每个未完成 lane 保存 PC、寄存器、active/deferred
-   mask 和 reconvergence stack，并让 source response 直接恢复对应 lane，而不是
-   重新建立一个单 lane evaluator。
-3. 将已验证的实际 value-predicate 路径选择进一步扩展到任意 branch opcode，
+1. 将已验证的逐 lane evaluator 继续扩展到 `LBU/LHU`、更多 RV64/RVC 整数和地址生成
+   opcode；仿射逻辑仅保留为 unsupported 链的显式 fallback。
+2. 将已验证的实际 value-predicate 路径选择进一步扩展到任意 branch opcode，
    并让 VIR 使用独立 lane PC 执行 branch target/fall-through，而不仅是
    recorder 内的有限路径。
-4. 将当前已加入 fetch/decode/issue 状态的 helper 继续扩展为执行端口级资源
+3. 将当前已加入 fetch/decode/issue 状态的 helper 继续扩展为执行端口级资源
    竞争模型。
-5. 将已接通的严格质量 tracker 扩展到更多 workload，并统一论文的 accuracy、
+4. 将已接通的严格质量 tracker 扩展到更多 workload，并统一论文的 accuracy、
    coverage、timeliness 和 pollution 报告口径。
 6. 缩小版 GAP workload。
 7. Baseline、PRE、Offload/Discovery、Nested DVR 消融。
@@ -623,7 +619,7 @@ ready instruction 时才能发射。当前 next helper 已按以下边界建模�
   context 内按 PC 缓存，不进入主线程 fetch queue；
 - 主线程阶段先运行，helper fetch/decode 只获得剩余的前端宽度，并统计
   `dvrHelperFetchBlockedByMain` 和 `dvrHelperDecodeBlockedByMain`；
-- 同 PC ready lanes 合并为 512-bit chunk，分别请求 `SimdAlu`、`SimdShift` 或
+- 同 PC ready lanes 合并为 512-bit chunk，按语义分别请求 `SimdAdd`、`SimdAlu`、`SimdShift` 或
   `SimdMult`，再由 `IEW::tryIssueDVRHelperFU()` 使用原生 FU pool 的 latency
   和占用；
 - dependent load 等待前序 helper 地址 uop 完成，然后进入真实 LSQ、DTLB、cache
@@ -639,8 +635,9 @@ unlimited vector FU，避免把资源模型变化误认为算法收益。
 
 #### 9.3.4 逐 lane evaluator 的 opcode 覆盖过窄
 
-当前主要支持 `ADD/ADDI/SLLI/ANDI/load-address` 和测试使用的
-`C.ADD/C.SLLI/C.LD`。不支持的 uop 会使 replay invalid，并回退到 learned
+当前已支持 `ADD/SUB/ADDW/SUBW`、立即数和逻辑/shift/MUL 子集，以及
+`LB/LH/LW/LWU/LD` 的宽度和扩展语义；RVC 测试覆盖 `C.ADD/C.SLLI/C.LW/C.LD`。
+不支持的 uop 会使 replay invalid，并回退到 learned
 仿射地址 relation。
 
 真实图算法中还常见：
@@ -648,8 +645,7 @@ unlimited vector FU，避免把资源模型变化误认为算法收益。
 - `SUB/SUBW`、`ADDW/ADDIW`；
 - `AND/OR/XOR`；
 - `SLL/SRL/SRA` 及 immediate/word variants；
-- `LB/LBU/LH/LHU/LW/LWU/LD`；
-- sign/zero extension；
+- 尚未覆盖 `LBU/LHU` 以及更多 load/value 组合；
 - `MUL`；
 - 更多 RVC 地址生成形式。
 
@@ -756,9 +752,11 @@ Table-1 风格配置。
 #### 9.4.3 innermost stride selection
 
 论文在 Discovery 中维护每个 RPT entry 的 seen bit；若另一 stride 在当前 trigger
-重现前出现两次，应切换到更内层 stride，并重置 VTT/FLR。当前单 active discovery
-和 nested-candidate 逻辑尚不能替代这一通用算法，应增加 outer/inner stride 专项
-微基准和 trigger-switch 统计。
+重现前出现两次，应切换到更内层 stride，并重置 VTT/FLR。当前实现已在
+`DVRStrideDetector::beginDiscovery()`、`observeDispatch()` 和
+`CPU::beginDVRDiscoveryAtDispatch()` 中接通这条路径；Camel 诊断最近一次记录
+`dvrDiscoveryInnermostSwitches=78`。仍需用显式 outer/inner stride 微基准验证切换
+后的边界和性能收益。
 
 #### 9.4.4 loop-bound fallback 语义
 

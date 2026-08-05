@@ -72,17 +72,38 @@ DVRStrideDetector::observe(Addr pc, Addr address)
 }
 
 std::optional<DVRStrideDetector::Candidate>
-DVRStrideDetector::observeDispatch(Addr pc) const
+DVRStrideDetector::observeDispatch(Addr pc, bool discovery_active,
+                                   Addr trigger_pc)
 {
-    for (const auto &entry : entries) {
+    for (auto &entry : entries) {
         if (entry.valid && entry.pc == pc && entry.stride != 0 &&
             entry.confidence >= 2) {
+            const bool repeated = discovery_active && entry.discoverySeen;
+            if (discovery_active)
+                entry.discoverySeen = true;
             return Candidate{pc, static_cast<Addr>(
                 static_cast<int64_t>(entry.lastAddress) + entry.stride),
-                entry.stride};
+                entry.stride, repeated && pc != trigger_pc};
         }
     }
     return std::nullopt;
+}
+
+void
+DVRStrideDetector::beginDiscovery(Addr trigger_pc)
+{
+    // This models the paper's one-bit register: every RPT entry starts clear
+    // for a new Discovery generation, then the trigger entry is marked as
+    // soon as Discovery opens.  A second observation of another striding PC
+    // therefore identifies a more-inner candidate.
+    for (auto &entry : entries)
+        entry.discoverySeen = false;
+    for (auto &entry : entries) {
+        if (entry.valid && entry.pc == trigger_pc) {
+            entry.discoverySeen = true;
+            break;
+        }
+    }
 }
 
 void
@@ -114,6 +135,14 @@ DVRDiscoveryController::arm(
     triggerSequence = sequence;
     stopSequence = 0;
     instructions = 0;
+}
+
+void
+DVRDiscoveryController::restart(
+    const DVRStrideDetector::Candidate &candidate, InstSeqNum sequence)
+{
+    finish();
+    arm(candidate, sequence);
 }
 
 bool
@@ -392,7 +421,8 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
 
         // C.LD rd', uimm(rs1') -- RV64C quadrant 0, funct3 011.
         if (quadrant == 0 && funct3 == 3) {
-            uop.semantic = Semantic::LoadAddress;
+            uop.semantic = Semantic::LoadDouble;
+            uop.loadBytes = 8;
             uop.immediate =
                 ((compressed >> 10) & 0x7) << 3 |
                 ((compressed >> 5) & 0x3) << 6;
@@ -403,7 +433,8 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
         // The helper only needs the effective address; the loaded word is
         // supplied by the source-response path just like other loads.
         if (quadrant == 0 && funct3 == 2) {
-            uop.semantic = Semantic::LoadAddress;
+            uop.semantic = Semantic::LoadWordSigned;
+            uop.loadBytes = 4;
             uop.immediate =
                 ((compressed >> 10) & 0x7) << 3 |
                 ((compressed >> 6) & 0x1) << 2;
@@ -513,11 +544,26 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
 
     if (opcode == 0x03) {
         switch (funct3) {
-          case 0: uop.semantic = Semantic::LoadByteSigned; break;
-          case 1: uop.semantic = Semantic::LoadHalfSigned; break;
-          case 2: uop.semantic = Semantic::LoadWordSigned; break;
-          case 3: uop.semantic = Semantic::LoadDouble; break;
-          case 4: uop.semantic = Semantic::LoadWordUnsigned; break;
+          case 0:
+            uop.semantic = Semantic::LoadByteSigned;
+            uop.loadBytes = 1;
+            break;
+          case 1:
+            uop.semantic = Semantic::LoadHalfSigned;
+            uop.loadBytes = 2;
+            break;
+          case 2:
+            uop.semantic = Semantic::LoadWordSigned;
+            uop.loadBytes = 4;
+            break;
+          case 3:
+            uop.semantic = Semantic::LoadDouble;
+            uop.loadBytes = 8;
+            break;
+          case 4:
+            uop.semantic = Semantic::LoadWordUnsigned;
+            uop.loadBytes = 4;
+            break;
           default: uop.semantic = Semantic::Unsupported; return;
         }
         uop.immediate = dvrSignExtend(uop.encoding >> 20, 12);
