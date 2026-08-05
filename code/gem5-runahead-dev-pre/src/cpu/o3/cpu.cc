@@ -2523,7 +2523,7 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
     // not contain a replayable load uop.  Keep the helper alive for source
     // lanes; replay->count only controls dependent replay semantics.
     startDVRHelper(pc, std::max(1u, replay->count), lanes,
-                   dvrInstructionRecorder.resourceCounts());
+                   dvrInstructionRecorder.resourceCounts(), replay);
     for (unsigned lane = 1; lane <= lanes; ++lane) {
         const Addr address = current_address + stride * lane;
         // A source response carries the value at this exact byte address;
@@ -2824,7 +2824,8 @@ CPU::launchDVRNestedPrefetches(
         ++cpuStats.dvrVIRContinuationContexts;
     }
     startDVRHelper(dvrNestedContext.triggerPC, replay->count,
-                   flattened, dvrNestedContext.recorder.resourceCounts());
+                   flattened, dvrNestedContext.recorder.resourceCounts(),
+                   replay);
     unsigned flat_lane = 0;
     for (unsigned invocation = 0; invocation < invocations; ++invocation) {
       const Addr base = use_ndm_plan ? ndm_invocations[invocation].innerStart :
@@ -2971,8 +2972,7 @@ CPU::issueDVRHelperCompute()
         if (dvrHelperThread.readyUops == 0 ||
             !dvrHelperThread.issueQueueReady(curTick())) {
             ++cpuStats.dvrHelperIssueQueueStalls;
-            if (!dvrHelperThread.issueQueue.empty() &&
-                dvrHelperThread.readyCycle[0] > curTick()) {
+            if (dvrHelperThread.issueQueueScoreboardBlocked(curTick())) {
                 ++cpuStats.dvrHelperScoreboardWaitCycles;
             }
             return 0;
@@ -3327,7 +3327,7 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
         // bounded memory-only continuation instead of leaving them stranded
         // behind an Idle helper state.
         DVRInstructionRecorder::ResourceCounts memory_only;
-        startDVRHelper(pkt->req->getPC(), 1, 1, memory_only);
+        startDVRHelper(pkt->req->getPC(), 1, 1, memory_only, nullptr);
     }
     delete state;
     pkt->senderState = nullptr;
@@ -3337,7 +3337,8 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
 void
 CPU::startDVRHelper(
     Addr trigger_pc, unsigned program_uops, unsigned lanes,
-    const DVRInstructionRecorder::ResourceCounts &resources)
+    const DVRInstructionRecorder::ResourceCounts &resources,
+    std::shared_ptr<const DVRReplayTemplate> replay)
 {
     if (program_uops == 0 || lanes == 0)
         return;
@@ -3350,11 +3351,11 @@ CPU::startDVRHelper(
     helper_resources.lsu *= work_units;
     if (dvrHelperThread.active()) {
         dvrHelperThread.extend(trigger_pc, program_uops, work_units,
-                               helper_resources, dvrVectorChunkModel);
+                               helper_resources, dvrVectorChunkModel, replay);
     } else {
         dvrHelperThread.begin(dvrNextHelperId++, trigger_pc, program_uops,
                               work_units, dvrHelperMaxUops, helper_resources,
-                              dvrVectorChunkModel);
+                              dvrVectorChunkModel, replay);
     }
     if (dvrVectorChunkModel)
         cpuStats.dvrVectorActiveLanes += lanes;

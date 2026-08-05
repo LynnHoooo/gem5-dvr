@@ -971,12 +971,13 @@ class CPU : public BaseCPU
     };
 
     /**
-     * Event-driven model of the decoupled DVR helper thread.
+     * Independent in-order DVR helper subthread.
      *
-     * The helper has its own program/lane progress and is stepped once per
-     * CPU cycle after the main thread has used the LSQ data port.  It does
-     * not modify the architectural register state; only its memory requests
-     * are allowed to enter the shared cache hierarchy.
+     * The helper owns a PC, replay-uop stream, frontend window, scoreboard,
+     * and issue queue.  It is stepped once per CPU cycle after the main
+     * thread has used the LSQ data port.  It does not modify the architectural
+     * register state; only its memory requests are allowed to enter the
+     * shared cache hierarchy.
      */
     struct DVRHelperThread
     {
@@ -998,18 +999,30 @@ class CPU : public BaseCPU
         unsigned multiplyRemaining = 0;
         Tick computeReadyTick = 0;
         bool vectorChunkModel = false;
+        Addr helperPC = 0;
 
         enum class ComputeKind { Alu, Shift, Multiply };
+        struct ReplayGeneration
+        {
+            std::shared_ptr<const DVRReplayTemplate> program;
+            unsigned workUnits = 0;
+            unsigned unit = 0;
+            unsigned uop = 0;
+        };
         struct IssueEntry
         {
             ComputeKind kind = ComputeKind::Alu;
-            unsigned sourceReg = 0;
-            unsigned destinationReg = 0;
+            int8_t source0 = -1;
+            int8_t source1 = -1;
+            int8_t destination = -1;
+            Addr pc = 0;
+            Addr nextPC = 0;
             Tick readyTick = 0;
         };
         static constexpr unsigned IssueQueueCapacity = 8;
-        static constexpr unsigned ScoreboardRegisters = 4;
+        static constexpr unsigned ScoreboardRegisters = 32;
         std::deque<IssueEntry> issueQueue;
+        std::deque<ReplayGeneration> replayGenerations;
         std::array<Tick, ScoreboardRegisters> readyCycle = {};
 
         void reset()
@@ -1031,20 +1044,24 @@ class CPU : public BaseCPU
             multiplyRemaining = 0;
             computeReadyTick = 0;
             vectorChunkModel = false;
+            helperPC = 0;
             issueQueue.clear();
+            replayGenerations.clear();
             readyCycle.fill(0);
         }
 
         void begin(uint64_t helper_id, Addr pc, unsigned uops,
                    unsigned units, unsigned budget,
                    const DVRInstructionRecorder::ResourceCounts &resources,
-                   bool vector_model)
+                   bool vector_model,
+                   std::shared_ptr<const DVRReplayTemplate> replay)
         {
             id = helper_id;
             triggerPC = pc;
             programUops = uops;
             maxUops = budget;
             workUnits = units;
+            helperPC = pc;
             nextLane = 0;
             issuedUops = 0;
             outstanding = 0;
@@ -1054,21 +1071,26 @@ class CPU : public BaseCPU
             fetchRemaining = std::min<uint64_t>(total_uops, maxUops);
             decodeRemaining = 0;
             readyUops = 0;
-            aluRemaining = resources.alu;
-            shiftRemaining = resources.shift;
-            multiplyRemaining = resources.multiply;
+            aluRemaining = replay && vector_model ? 0 : resources.alu;
+            shiftRemaining = replay && vector_model ? 0 : resources.shift;
+            multiplyRemaining = replay && vector_model ? 0 : resources.multiply;
             vectorChunkModel = vector_model;
             issueQueue.clear();
+            replayGenerations.clear();
+            if (replay && vector_model)
+                replayGenerations.push_back({replay, units, 0, 0});
             readyCycle.fill(0);
             state = fetchRemaining == 0 ? State::Idle : State::Fetch;
         }
 
         void extend(Addr pc, unsigned uops, unsigned units,
                     const DVRInstructionRecorder::ResourceCounts &resources,
-                    bool vector_model)
+                    bool vector_model,
+                    std::shared_ptr<const DVRReplayTemplate> replay)
         {
             if (state == State::Idle) {
-                begin(id, pc, uops, units, maxUops, resources, vector_model);
+                begin(id, pc, uops, units, maxUops, resources, vector_model,
+                      replay);
                 return;
             }
 
@@ -1080,9 +1102,13 @@ class CPU : public BaseCPU
                 std::min<uint64_t>(uint64_t(uops) * units, maxUops);
             fetchRemaining += generation_uops;
             maxUops += generation_uops;
-            aluRemaining += resources.alu;
-            shiftRemaining += resources.shift;
-            multiplyRemaining += resources.multiply;
+            if (replay && vector_model) {
+                replayGenerations.push_back({replay, units, 0, 0});
+            } else {
+                aluRemaining += resources.alu;
+                shiftRemaining += resources.shift;
+                multiplyRemaining += resources.multiply;
+            }
             vectorChunkModel = vector_model;
             if (state == State::Draining || state == State::Decode)
                 state = State::Fetch;
@@ -1135,23 +1161,83 @@ class CPU : public BaseCPU
         bool computePending() const
         {
             return aluRemaining != 0 || shiftRemaining != 0 ||
-                   multiplyRemaining != 0 || !issueQueue.empty();
+                   multiplyRemaining != 0 || !issueQueue.empty() ||
+                   !replayGenerations.empty();
         }
 
         void refillIssueQueue()
         {
             if (!vectorChunkModel)
                 return;
-            while (issueQueue.size() < IssueQueueCapacity &&
-                   (aluRemaining != 0 || shiftRemaining != 0 ||
-                    multiplyRemaining != 0)) {
+            while (issueQueue.size() < IssueQueueCapacity) {
+                if (!replayGenerations.empty()) {
+                    auto &generation = replayGenerations.front();
+                    if (!generation.program || generation.workUnits == 0) {
+                        replayGenerations.pop_front();
+                        continue;
+                    }
+                    if (generation.uop >= generation.program->count) {
+                        generation.uop = 0;
+                        if (++generation.unit >= generation.workUnits)
+                            replayGenerations.pop_front();
+                        continue;
+                    }
+                    const auto &uop = generation.program->uops[
+                        generation.uop++];
+                    helperPC = uop.pc;
+                    // Load uops are represented by the real source/dependent
+                    // request queue.  Their compute-side address uops remain
+                    // in this stream, while the request itself uses LSQ.
+                    const bool address_uop =
+                        uop.semantic ==
+                        DVRInstructionRecorder::Uop::Semantic::LoadAddress;
+                    if (uop.load && !address_uop)
+                        continue;
+                    IssueEntry entry;
+                    entry.source0 = uop.source0;
+                    entry.source1 = uop.source1;
+                    entry.destination = uop.destination;
+                    entry.pc = uop.pc;
+                    entry.nextPC = uop.control ?
+                        (uop.branchTaken ? uop.branchTargetPC :
+                         uop.fallthroughPC) : uop.pc + 4;
+                    if (uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::ShiftLeft ||
+                        uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::ShiftRightLogical ||
+                        uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::ShiftRightArithmetic ||
+                        uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::ShiftLeftImmediate ||
+                        uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::ShiftLeftWordImmediate ||
+                        uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::ShiftRightLogicalImmediate ||
+                        uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::ShiftRightArithmeticImmediate ||
+                        uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::ShiftRightLogicalWordImmediate ||
+                        uop.semantic ==
+                            DVRInstructionRecorder::Uop::Semantic::ShiftRightArithmeticWordImmediate) {
+                        entry.kind = ComputeKind::Shift;
+                    } else if (uop.semantic ==
+                                   DVRInstructionRecorder::Uop::Semantic::Multiply) {
+                        entry.kind = ComputeKind::Multiply;
+                    } else {
+                        entry.kind = ComputeKind::Alu;
+                    }
+                    issueQueue.push_back(entry);
+                    continue;
+                }
+
+                if (aluRemaining == 0 && shiftRemaining == 0 &&
+                    multiplyRemaining == 0)
+                    break;
                 IssueEntry entry;
-                // The evaluator does not expose per-uop register operands to
-                // this timing shell.  Use one virtual address-generation
-                // token so a dependent chain observes FU latency without
-                // fabricating a main-thread DynInst.
-                entry.sourceReg = 0;
-                entry.destinationReg = 0;
+                entry.source0 = 0;
+                entry.destination = 0;
+                entry.pc = helperPC;
+                entry.nextPC = helperPC + 4;
                 if (aluRemaining != 0) {
                     entry.kind = ComputeKind::Alu;
                     --aluRemaining;
@@ -1171,8 +1257,26 @@ class CPU : public BaseCPU
             if (!vectorChunkModel || issueQueue.empty())
                 return false;
             const auto &entry = issueQueue.front();
-            return entry.readyTick <= now &&
-                   readyCycle[entry.sourceReg] <= now;
+            const bool source0_ready = entry.source0 < 0 ||
+                entry.source0 >= ScoreboardRegisters ||
+                readyCycle[entry.source0] <= now;
+            const bool source1_ready = entry.source1 < 0 ||
+                entry.source1 >= ScoreboardRegisters ||
+                readyCycle[entry.source1] <= now;
+            return entry.readyTick <= now && source0_ready && source1_ready;
+        }
+
+        bool issueQueueScoreboardBlocked(Tick now) const
+        {
+            if (issueQueue.empty())
+                return false;
+            const auto &entry = issueQueue.front();
+            return (entry.source0 >= 0 &&
+                    entry.source0 < ScoreboardRegisters &&
+                    readyCycle[entry.source0] > now) ||
+                   (entry.source1 >= 0 &&
+                    entry.source1 < ScoreboardRegisters &&
+                    readyCycle[entry.source1] > now);
         }
 
         bool canIssue() const
@@ -1210,7 +1314,10 @@ class CPU : public BaseCPU
             issueQueue.pop_front();
             ++issuedUops;
             --readyUops;
-            readyCycle[entry.destinationReg] = ready_tick;
+            if (entry.destination >= 0 &&
+                entry.destination < ScoreboardRegisters)
+                readyCycle[entry.destination] = ready_tick;
+            helperPC = entry.nextPC;
             computeReadyTick = std::max(computeReadyTick, ready_tick);
             if (issuedUops >= maxUops && readyUops == 0 &&
                 fetchRemaining == 0 && decodeRemaining == 0 &&
@@ -1433,7 +1540,9 @@ class CPU : public BaseCPU
     void startDVRHelper(Addr trigger_pc, unsigned program_uops,
                         unsigned lanes,
                         const DVRInstructionRecorder::ResourceCounts
-                        &resources = {});
+                        &resources = {},
+                        std::shared_ptr<const DVRReplayTemplate> replay =
+                            nullptr);
     unsigned dvrHelperWorkUnits(unsigned lanes) const
     {
         if (!dvrVectorChunkModel)
