@@ -765,6 +765,7 @@ class CPU : public BaseCPU
         statistics::Scalar dvrPrefetchesIssued;
         statistics::Scalar dvrPrefetchesCompleted;
         statistics::Scalar dvrPrefetchesDropped;
+        statistics::Scalar dvrPrefetchesCrossingLine;
         statistics::Scalar dvrPrefetchTranslationFaults;
         statistics::Scalar dvrSourcePrefetchTranslationFaults;
         statistics::Scalar dvrDependentPrefetchTranslationFaults;

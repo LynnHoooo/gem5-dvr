@@ -180,6 +180,9 @@ def parse_args():
         help="Override the maximum DVR source lanes for bounded-window experiments",
     )
     parser.add_argument("--dvr-no-dependent-prefetch", action="store_true")
+    # Keep the discovery-controller bound separate from the paper's 200-uop
+    # helper budget.  The existing RISC-V branch/NDM microbenchmarks need the
+    # longer controller window to reach their committed reconvergence point.
     parser.add_argument("--discovery-max-insts", type=int, default=512)
     parser.add_argument("--dvr-ndm-threshold", type=int, default=64)
     parser.add_argument("--dvr-ndm-max-insts", type=int, default=512)

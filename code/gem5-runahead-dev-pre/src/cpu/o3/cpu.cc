@@ -753,6 +753,8 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "DVR prefetch responses consumed by the CPU"),
       ADD_STAT(dvrPrefetchesDropped, statistics::units::Count::get(),
                "DVR prefetches dropped due to replacement or backpressure"),
+      ADD_STAT(dvrPrefetchesCrossingLine, statistics::units::Count::get(),
+               "DVR requests whose width crosses a cache line"),
       ADD_STAT(dvrPrefetchTranslationFaults, statistics::units::Count::get(),
                "DVR prefetch virtual-address translation faults"),
       ADD_STAT(dvrSourcePrefetchTranslationFaults,
@@ -2252,6 +2254,11 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                                       !dvrInstructionRecorder.overflow();
                 if (dvrInstructionRecorder.overflow()) {
                     ++cpuStats.dvrRecorderOverflows;
+                    dvrTraceVector(
+                        "recorder_overflow", curTick(), result.triggerPC,
+                        dvrTaintTracker.flr(),
+                        dvrInstructionRecorder.size(),
+                        dvrHelperMaxUops);
                     helper_allowed = false;
                 }
                 bool vir_control_fallback = false;
@@ -3313,6 +3320,50 @@ CPU::issueDVRReplayLanes(unsigned slots)
     else
         ++cpuStats.dvrVectorALUChunkIssues;
 
+    // A VIR issue group is the unit at which SIMT divergence is observed.
+    // Counting while walking individual lanes misses the case where one
+    // lane reaches the reconvergence PC and another lane takes the deferred
+    // path first.  Evaluate the complete same-PC group before updating lane
+    // PCs, then account for one divergent branch for the mixed mask.
+    if (uop.conditional) {
+        // Replay lanes originate from a completed source response.  Count
+        // the conditional group here as well as divergence below; otherwise
+        // this statistic only described the retired evaluator fallback and
+        // incorrectly stayed zero for the persistent helper path.
+        ++cpuStats.dvrVIRSourceValueBranches;
+        unsigned taken_lanes = 0;
+        unsigned fallthrough_lanes = 0;
+        for (Lane *lane : group) {
+            const auto &branch_uop = lane->program->uops[lane->uopIndex];
+            const RegVal source0 = branch_uop.source0 >= 0 &&
+                branch_uop.source0 <
+                    DVRLoopBoundDetector::MaxArchitecturalIntRegs ?
+                (lane->program->helperRegs ?
+                 lane->program->helperRegs->read(
+                     branch_uop.source0, lane->lane) :
+                 lane->regs[branch_uop.source0]) : 0;
+            const RegVal source1 = branch_uop.source1 >= 0 &&
+                branch_uop.source1 <
+                    DVRLoopBoundDetector::MaxArchitecturalIntRegs ?
+                (lane->program->helperRegs ?
+                 lane->program->helperRegs->read(
+                     branch_uop.source1, lane->lane) :
+                 lane->regs[branch_uop.source1]) : 0;
+            bool taken = false;
+            if (!branch_uop.evaluateBranch(source0, source1, taken))
+                continue;
+            if (taken)
+                ++taken_lanes;
+            else
+                ++fallthrough_lanes;
+        }
+        if (taken_lanes != 0 && fallthrough_lanes != 0) {
+            ++cpuStats.dvrDivergentBranches;
+            dvrTraceVector("vir_branch", curTick(), uop.pc,
+                           uop.branchTargetPC, group.size(), taken_lanes);
+        }
+    }
+
     for (Lane *lane : group) {
         const auto &lane_uop = lane->program->uops[lane->uopIndex];
         const RegVal source0 = lane_uop.source0 >= 0 &&
@@ -3348,6 +3399,40 @@ CPU::issueDVRReplayLanes(unsigned slots)
             }
             const unsigned next_index = findPC(lane->program, next_pc);
             if (next_index == std::numeric_limits<unsigned>::max()) {
+                // The alternate target may be outside the captured rolling
+                // window.  Keep the lane alive at the recorded boundary so
+                // the captured path can reconverge instead of dropping this
+                // lane for the rest of the helper generation.  The external
+                // path is still counted and is not treated as if its uops
+                // were executed.
+                if (lane_uop.reconvergencePC != 0 &&
+                    next_pc != lane_uop.reconvergencePC) {
+                    if (lane->reconvergenceDepth >=
+                        Lane::ReconvergenceEntries) {
+                        lane->active = false;
+                        ++cpuStats.dvrReconvergenceStackOverflows;
+                        ++lane->helperUops;
+                        continue;
+                    }
+                    auto &frame = lane->reconvergenceStack[
+                        lane->reconvergenceDepth++];
+                    frame.pc = lane_uop.reconvergencePC;
+                    frame.deferredPC = captured_pc == next_pc ?
+                        (taken ? lane_uop.fallthroughPC :
+                                 lane_uop.branchTargetPC) : captured_pc;
+                    frame.alternatePath = true;
+                    const unsigned reconvergence_index = findPC(
+                        lane->program, lane_uop.reconvergencePC);
+                    if (reconvergence_index !=
+                        std::numeric_limits<unsigned>::max()) {
+                        lane->lanePC = lane_uop.reconvergencePC;
+                        lane->uopIndex = reconvergence_index;
+                        ++cpuStats.dvrVIRExternalPathLanes;
+                        ++lane->helperUops;
+                        if (lane->helperUops < dvrHelperMaxUops)
+                            continue;
+                    }
+                }
                 lane->active = false;
                 ++cpuStats.dvrVIRExternalPathLanes;
                 ++lane->helperUops;
@@ -3368,7 +3453,6 @@ CPU::issueDVRReplayLanes(unsigned slots)
                     (taken ? lane_uop.fallthroughPC :
                              lane_uop.branchTargetPC) : captured_pc;
                 frame.alternatePath = next_pc != captured_pc;
-                ++cpuStats.dvrDivergentBranches;
                 if (frame.alternatePath)
                     ++cpuStats.dvrAlternatePathUopsReplayed;
             }
@@ -3453,7 +3537,27 @@ CPU::issueDVRReplayLanes(unsigned slots)
             } else {
                 ++cpuStats.dvrPrefetchesDeduplicated;
             }
-            lane->active = false;
+            ++lane->helperUops;
+            // The paper's FLR is a data-flow stop for the ordinary replay
+            // prefix, not necessarily the end of the helper instruction
+            // stream.  If a branch lies between FLR and LCR, keep this lane's
+            // PC alive so the persistent VIR can explore that path and later
+            // reconverge.  Without this, the helper always terminated at the
+            // first dependent load and silently dropped post-FLR control.
+            const unsigned next_index = lane->uopIndex + 1;
+            if (!lane->program->continuePastFLR ||
+                next_index >= lane->program->count) {
+                lane->active = false;
+                continue;
+            }
+            lane->lanePC = lane->program->uops[next_index].pc;
+            if (lane->lanePC == 0 || lane->lanePC == lane->triggerPC ||
+                lane->helperUops >= dvrHelperMaxUops) {
+                lane->active = false;
+                ++cpuStats.dvrVIRNormalTerminatedLanes;
+                continue;
+            }
+            lane->uopIndex = next_index;
             continue;
         }
 
@@ -3620,14 +3724,21 @@ CPU::serviceDVRPrefetchQueue()
     dvrQueuedPrefetchAddresses.erase(prefetch.address);
     if (!prefetch.source)
         dvrQueuedDependentLines.erase(dvrPrefetchLine(prefetch.address));
-    const unsigned request_bytes = dvrPrefetchBytes(prefetch);
+    unsigned request_bytes = dvrPrefetchBytes(prefetch);
     const unsigned line_offset = prefetch.address & (cacheLineSize() - 1);
-    if (prefetch.source && line_offset + request_bytes > cacheLineSize()) {
-        // The helper packet bypasses the architectural load-splitting path.
-        // Never consume a partial scalar as a trigger value.
-        ++cpuStats.dvrPrefetchesDropped;
-        retireDVRPredicateLane(prefetch.predicate, prefetch.lane, false);
-        return;
+    if (line_offset + request_bytes > cacheLineSize()) {
+        ++cpuStats.dvrPrefetchesCrossingLine;
+        if (prefetch.source) {
+            // The helper packet bypasses the architectural load-splitting
+            // path.  Never consume a partial scalar as a trigger value.
+            ++cpuStats.dvrPrefetchesDropped;
+            retireDVRPredicateLane(prefetch.predicate, prefetch.lane, false);
+            return;
+        }
+        // Dependent requests only warm the target line and do not return an
+        // architectural value.  A one-byte packet preserves that behavior
+        // while satisfying BaseCache's single-line packet contract.
+        request_bytes = 1;
     }
     Request::Flags flags;
     flags.set(Request::PREFETCH | Request::DVR_PREFETCH);
