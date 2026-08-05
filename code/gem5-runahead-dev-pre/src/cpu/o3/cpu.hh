@@ -830,6 +830,7 @@ class CPU : public BaseCPU
         statistics::Scalar dvrAlternatePathUopsReplayed;
         statistics::Scalar dvrAlternatePathDependentTargets;
         statistics::Scalar dvrAlternatePathDemandCovered;
+        statistics::Scalar dvrAlternatePathReconvergenceFallbacks;
         statistics::Scalar dvrReconvergenceResumeSuccesses;
         statistics::Scalar dvrQualityIssuedBytes;
         statistics::Scalar dvrQualityCompletedBytes;
@@ -1082,6 +1083,7 @@ class CPU : public BaseCPU
         std::shared_ptr<const DVRReplayTemplate> replay;
         std::shared_ptr<DVRPredicateGeneration> predicate;
         unsigned lane = 0;
+        bool alternatePath = false;
     };
 
     /**
