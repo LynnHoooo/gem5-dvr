@@ -649,6 +649,10 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Helper compute uops granted a native O3 FU"),
       ADD_STAT(dvrHelperFUStalls, statistics::units::Count::get(),
                "Helper compute uops stalled by native FU availability"),
+      ADD_STAT(dvrHelperIssueQueueStalls, statistics::units::Count::get(),
+               "Helper issue-queue head stalls"),
+      ADD_STAT(dvrHelperScoreboardWaitCycles, statistics::units::Cycle::get(),
+               "Cycles helper issue waited for a virtual register"),
       ADD_STAT(dvrVectorALUChunkIssues, statistics::units::Count::get(),
                "DVR vector ALU chunks issued"),
       ADD_STAT(dvrVectorShiftChunkIssues, statistics::units::Count::get(),
@@ -2958,33 +2962,65 @@ CPU::issueDVRHelperCompute()
         return 0;
     slots -= dvrHelperIssuesThisCycle;
 
-    unsigned issued = 0;
-    bool vector_fu_conflict = false;
-    if (dvrVectorChunkModel)
+    if (dvrVectorChunkModel) {
         cpuStats.dvrHelperUopsBecameReady +=
             dvrHelperThread.refillComputeReady();
-    auto issue_class = [&](unsigned &remaining, OpClass op_class,
-                           statistics::Scalar &chunk_issues) {
-        while (remaining != 0 && slots != 0 &&
-               (!dvrVectorChunkModel || dvrHelperThread.readyUops != 0)) {
+        dvrHelperThread.refillIssueQueue();
+        if (dvrHelperThread.issueQueue.empty())
+            return 0;
+        if (dvrHelperThread.readyUops == 0 ||
+            !dvrHelperThread.issueQueueReady(curTick())) {
+            ++cpuStats.dvrHelperIssueQueueStalls;
+            if (!dvrHelperThread.issueQueue.empty() &&
+                dvrHelperThread.readyCycle[0] > curTick()) {
+                ++cpuStats.dvrHelperScoreboardWaitCycles;
+            }
+            return 0;
+        }
+
+        const auto kind = dvrHelperThread.issueQueue.front().kind;
+        const OpClass op_class = kind ==
+                DVRHelperThread::ComputeKind::Alu ? SimdAluOp :
+            kind == DVRHelperThread::ComputeKind::Shift ? SimdShiftOp :
+                SimdMultOp;
+        ++cpuStats.dvrHelperFURequests;
+        ++cpuStats.dvrVectorChunkRequests;
+        Cycles latency(1);
+        const bool granted = dvrVectorUnlimitedFU ||
+            iew.tryIssueDVRHelperFU(op_class, latency);
+        if (!granted) {
+            ++cpuStats.dvrHelperFUStalls;
+            ++cpuStats.dvrVectorFUConflictCycles;
+            return 0;
+        }
+
+        const Tick ready_tick = curTick() +
+            static_cast<uint64_t>(latency) * clockPeriod();
+        dvrHelperThread.issueCompute(ready_tick);
+        --slots;
+        ++dvrHelperComputeIssuesThisCycle;
+        ++cpuStats.dvrHelperFUGrants;
+        ++cpuStats.dvrHelperUopsIssued;
+        cpuStats.dvrVectorLatencyCycles +=
+            static_cast<uint64_t>(latency);
+        if (kind == DVRHelperThread::ComputeKind::Alu)
+            ++cpuStats.dvrVectorALUChunkIssues;
+        else if (kind == DVRHelperThread::ComputeKind::Shift)
+            ++cpuStats.dvrVectorShiftChunkIssues;
+        else
+            ++cpuStats.dvrVectorMultiplyChunkIssues;
+        return 1;
+    }
+
+    unsigned issued = 0;
+    auto issue_class = [&](unsigned &remaining, OpClass op_class) {
+        while (remaining != 0 && slots != 0) {
             ++cpuStats.dvrHelperFURequests;
-            if (dvrVectorChunkModel)
-                ++cpuStats.dvrVectorChunkRequests;
             Cycles latency(1);
-            const bool granted = dvrVectorUnlimitedFU ||
-                iew.tryIssueDVRHelperFU(op_class, latency);
+            const bool granted = iew.tryIssueDVRHelperFU(op_class, latency);
             if (!granted) {
                 ++cpuStats.dvrHelperFUStalls;
-                if (dvrVectorChunkModel)
-                    vector_fu_conflict = true;
                 break;
-            }
-            if (dvrVectorChunkModel) {
-                dvrHelperThread.noteComputeLatency(
-                    curTick() + static_cast<uint64_t>(latency) *
-                        clockPeriod());
-                cpuStats.dvrVectorLatencyCycles +=
-                    static_cast<uint64_t>(latency);
             }
             --remaining;
             --slots;
@@ -2992,25 +3028,12 @@ CPU::issueDVRHelperCompute()
             ++dvrHelperComputeIssuesThisCycle;
             ++cpuStats.dvrHelperFUGrants;
             ++cpuStats.dvrHelperUopsIssued;
-            if (dvrVectorChunkModel)
-                dvrHelperThread.issueCompute();
-            if (dvrVectorChunkModel)
-                ++chunk_issues;
         }
     };
 
-    const OpClass alu_class = dvrVectorChunkModel ? SimdAluOp : IntAluOp;
-    const OpClass shift_class = dvrVectorChunkModel ? SimdShiftOp : IntAluOp;
-    const OpClass multiply_class =
-        dvrVectorChunkModel ? SimdMultOp : IntMultOp;
-    issue_class(dvrHelperThread.aluRemaining, alu_class,
-                cpuStats.dvrVectorALUChunkIssues);
-    issue_class(dvrHelperThread.shiftRemaining, shift_class,
-                cpuStats.dvrVectorShiftChunkIssues);
-    issue_class(dvrHelperThread.multiplyRemaining, multiply_class,
-                cpuStats.dvrVectorMultiplyChunkIssues);
-    if (vector_fu_conflict)
-        ++cpuStats.dvrVectorFUConflictCycles;
+    issue_class(dvrHelperThread.aluRemaining, IntAluOp);
+    issue_class(dvrHelperThread.shiftRemaining, IntAluOp);
+    issue_class(dvrHelperThread.multiplyRemaining, IntMultOp);
     return issued;
 }
 
@@ -3327,10 +3350,11 @@ CPU::startDVRHelper(
     helper_resources.lsu *= work_units;
     if (dvrHelperThread.active()) {
         dvrHelperThread.extend(trigger_pc, program_uops, work_units,
-                               helper_resources);
+                               helper_resources, dvrVectorChunkModel);
     } else {
         dvrHelperThread.begin(dvrNextHelperId++, trigger_pc, program_uops,
-                              work_units, dvrHelperMaxUops, helper_resources);
+                              work_units, dvrHelperMaxUops, helper_resources,
+                              dvrVectorChunkModel);
     }
     if (dvrVectorChunkModel)
         cpuStats.dvrVectorActiveLanes += lanes;

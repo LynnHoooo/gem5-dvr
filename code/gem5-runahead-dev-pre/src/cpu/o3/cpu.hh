@@ -43,6 +43,7 @@
 #ifndef __CPU_O3_CPU_HH__
 #define __CPU_O3_CPU_HH__
 
+#include <array>
 #include <cstdio>
 #include <iostream>
 #include <list>
@@ -713,6 +714,8 @@ class CPU : public BaseCPU
         statistics::Scalar dvrHelperFURequests;
         statistics::Scalar dvrHelperFUGrants;
         statistics::Scalar dvrHelperFUStalls;
+        statistics::Scalar dvrHelperIssueQueueStalls;
+        statistics::Scalar dvrHelperScoreboardWaitCycles;
         statistics::Scalar dvrVectorALUChunkIssues;
         statistics::Scalar dvrVectorShiftChunkIssues;
         statistics::Scalar dvrVectorMultiplyChunkIssues;
@@ -994,6 +997,20 @@ class CPU : public BaseCPU
         unsigned shiftRemaining = 0;
         unsigned multiplyRemaining = 0;
         Tick computeReadyTick = 0;
+        bool vectorChunkModel = false;
+
+        enum class ComputeKind { Alu, Shift, Multiply };
+        struct IssueEntry
+        {
+            ComputeKind kind = ComputeKind::Alu;
+            unsigned sourceReg = 0;
+            unsigned destinationReg = 0;
+            Tick readyTick = 0;
+        };
+        static constexpr unsigned IssueQueueCapacity = 8;
+        static constexpr unsigned ScoreboardRegisters = 4;
+        std::deque<IssueEntry> issueQueue;
+        std::array<Tick, ScoreboardRegisters> readyCycle = {};
 
         void reset()
         {
@@ -1013,11 +1030,15 @@ class CPU : public BaseCPU
             shiftRemaining = 0;
             multiplyRemaining = 0;
             computeReadyTick = 0;
+            vectorChunkModel = false;
+            issueQueue.clear();
+            readyCycle.fill(0);
         }
 
         void begin(uint64_t helper_id, Addr pc, unsigned uops,
                    unsigned units, unsigned budget,
-                   const DVRInstructionRecorder::ResourceCounts &resources)
+                   const DVRInstructionRecorder::ResourceCounts &resources,
+                   bool vector_model)
         {
             id = helper_id;
             triggerPC = pc;
@@ -1036,14 +1057,18 @@ class CPU : public BaseCPU
             aluRemaining = resources.alu;
             shiftRemaining = resources.shift;
             multiplyRemaining = resources.multiply;
+            vectorChunkModel = vector_model;
+            issueQueue.clear();
+            readyCycle.fill(0);
             state = fetchRemaining == 0 ? State::Idle : State::Fetch;
         }
 
         void extend(Addr pc, unsigned uops, unsigned units,
-                    const DVRInstructionRecorder::ResourceCounts &resources)
+                    const DVRInstructionRecorder::ResourceCounts &resources,
+                    bool vector_model)
         {
             if (state == State::Idle) {
-                begin(id, pc, uops, units, maxUops, resources);
+                begin(id, pc, uops, units, maxUops, resources, vector_model);
                 return;
             }
 
@@ -1058,6 +1083,7 @@ class CPU : public BaseCPU
             aluRemaining += resources.alu;
             shiftRemaining += resources.shift;
             multiplyRemaining += resources.multiply;
+            vectorChunkModel = vector_model;
             if (state == State::Draining || state == State::Decode)
                 state = State::Fetch;
         }
@@ -1109,7 +1135,44 @@ class CPU : public BaseCPU
         bool computePending() const
         {
             return aluRemaining != 0 || shiftRemaining != 0 ||
-                   multiplyRemaining != 0;
+                   multiplyRemaining != 0 || !issueQueue.empty();
+        }
+
+        void refillIssueQueue()
+        {
+            if (!vectorChunkModel)
+                return;
+            while (issueQueue.size() < IssueQueueCapacity &&
+                   (aluRemaining != 0 || shiftRemaining != 0 ||
+                    multiplyRemaining != 0)) {
+                IssueEntry entry;
+                // The evaluator does not expose per-uop register operands to
+                // this timing shell.  Use one virtual address-generation
+                // token so a dependent chain observes FU latency without
+                // fabricating a main-thread DynInst.
+                entry.sourceReg = 0;
+                entry.destinationReg = 0;
+                if (aluRemaining != 0) {
+                    entry.kind = ComputeKind::Alu;
+                    --aluRemaining;
+                } else if (shiftRemaining != 0) {
+                    entry.kind = ComputeKind::Shift;
+                    --shiftRemaining;
+                } else {
+                    entry.kind = ComputeKind::Multiply;
+                    --multiplyRemaining;
+                }
+                issueQueue.push_back(entry);
+            }
+        }
+
+        bool issueQueueReady(Tick now) const
+        {
+            if (!vectorChunkModel || issueQueue.empty())
+                return false;
+            const auto &entry = issueQueue.front();
+            return entry.readyTick <= now &&
+                   readyCycle[entry.sourceReg] <= now;
         }
 
         bool canIssue() const
@@ -1138,30 +1201,32 @@ class CPU : public BaseCPU
             return became_ready;
         }
 
-        void issueCompute()
+        void issueCompute(Tick ready_tick)
         {
             assert(readyUops != 0);
+            assert(vectorChunkModel);
+            assert(!issueQueue.empty());
+            const auto entry = issueQueue.front();
+            issueQueue.pop_front();
             ++issuedUops;
             --readyUops;
+            readyCycle[entry.destinationReg] = ready_tick;
+            computeReadyTick = std::max(computeReadyTick, ready_tick);
             if (issuedUops >= maxUops && readyUops == 0 &&
                 fetchRemaining == 0 && decodeRemaining == 0 &&
-                outstanding == 0)
+                outstanding == 0 && !computePending())
                 state = State::Draining;
         }
 
         unsigned refillComputeReady()
         {
+            refillIssueQueue();
             if (!computePending() || readyUops != 0 ||
                 fetchRemaining != 0 || decodeRemaining != 0)
                 return 0;
             state = State::Running;
             readyUops = 1;
             return 1;
-        }
-
-        void noteComputeLatency(Tick ready_tick)
-        {
-            computeReadyTick = std::max(computeReadyTick, ready_tick);
         }
 
         bool computeComplete(Tick now) const
