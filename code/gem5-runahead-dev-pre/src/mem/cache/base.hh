@@ -1143,6 +1143,21 @@ class BaseCache : public ClockedObject
         /** The average overall latency of an MSHR miss. */
         statistics::Formula overallAvgMshrUncacheableLatency;
 
+        /** Provenance-separated request accounting, independent of the
+         * legacy command-based demand formulas above. */
+        statistics::Scalar architecturalDemandAccesses;
+        statistics::Scalar architecturalDemandHits;
+        statistics::Scalar architecturalDemandMisses;
+        statistics::Scalar architecturalDemandBytes;
+        statistics::Scalar dvrSourceIssued;
+        statistics::Scalar dvrSourceHits;
+        statistics::Scalar dvrSourceMisses;
+        statistics::Scalar dvrSourceBytes;
+        statistics::Scalar dvrDependentIssued;
+        statistics::Scalar dvrDependentHits;
+        statistics::Scalar dvrDependentMisses;
+        statistics::Scalar dvrDependentBytes;
+
         /** Number of replacements of valid blocks. */
         statistics::Scalar replacements;
 

@@ -157,6 +157,23 @@ def parse_args():
     )
     parser.add_argument("--dvr-helper-max-uops", type=int, default=200)
     parser.add_argument(
+        "--dvr-vector-chunks",
+        action="store_true",
+        help="Model DVR compute as 512-bit vector chunks",
+    )
+    parser.add_argument(
+        "--dvr-unlimited-vector-fu",
+        action="store_true",
+        help="Run vector chunks without shared vector FU constraints",
+    )
+    parser.add_argument(
+        "--dvr-vector-element-bits",
+        type=int,
+        choices=(8, 16, 32, 64),
+        default=64,
+        help="Element width used to form 512-bit DVR vector chunks",
+    )
+    parser.add_argument(
         "--dvr-max-lanes",
         type=int,
         default=0,
@@ -205,6 +222,9 @@ def main():
         ),
         dvrDiscoveryMaxInsts=args.discovery_max_insts,
         dvrHelperMaxUops=args.dvr_helper_max_uops,
+        dvrVectorChunkModel=args.dvr_vector_chunks,
+        dvrVectorUnlimitedFU=args.dvr_unlimited_vector_fu,
+        dvrVectorElementBits=args.dvr_vector_element_bits,
         dvrEnableDependentPrefetch=not args.dvr_no_dependent_prefetch,
         dvrNDMThreshold=args.dvr_ndm_threshold,
         dvrNDMMaxInsts=args.dvr_ndm_max_insts,

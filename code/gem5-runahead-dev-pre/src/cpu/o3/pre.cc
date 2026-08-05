@@ -362,7 +362,7 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
             uop.semantic = Semantic::LoadAddress;
             uop.immediate =
                 ((compressed >> 10) & 0x7) << 3 |
-                ((compressed >> 5) & 0x3) << 1;
+                ((compressed >> 6) & 0x1) << 2;
             return;
         }
 
