@@ -6,27 +6,20 @@
 
 ### P0：论文级 helper 微结构
 
-1. **VRAT 仍是 private register file**：`DVRHelperVectorRegisterFile` 保存每 lane
-   的值和 ready time，但还没有映射到 O3 共享 physical register file、free list 和
-   rename map。
+1. **P0 helper 实现尚待合入主 worktree 并做端到端回归**：`dvr-p0-helper` 的
+   `7658292`、`ee19b8f` 已实现 helper 私有 VRAT physical bank/free-list、16-copy
+   VIR mask/state、16-entry helper LQ、8-entry timing frontend 和 helper DynUop。
+   这些是论文所需的独立 in-order subthread 状态，不应改为主 O3 的第二条 ROB 线程。
+   但当前主 worktree 的 `cpu.cc/.hh/pre.cc/.hh` 有并行未提交修改，必须先做冲突审查、
+   合并并重新验证，不能在主分支提前宣称已生效。
 
-2. **VIR 仍不是论文的完整 16-copy VIR**：当前主要是 512-bit chunk scheduler，单次
-   最多 8 个 64-bit lanes；还缺少 16 个 vector copies 的独立 issued/executed mask、
-   dead-source 状态和多 copy in-flight 管理。
-
-3. **helper memory path 仍不是完整 LSQ DynInst 生命周期**：请求经过 MMU、O3 data
-   port 和真实 cache/memory hierarchy，但仍由 CPU 直接构造 Packet，没有 helper-owned
-   DynInst、真实 load queue entry、wakeup/writeback 和 fault 生命周期。
-
-4. **helper fetch/decode 的完整硬件模型仍有边界**：独立 instruction-cache timing
-   request/response/retry 已实现并接入 L2 timing hierarchy；helper miss 会保留 lane，
-   response 后由 RISC-V decoder 填充 helper-owned cache，再申请 FU。尚未等同论文的
-   独立 8-entry I-cache front-end（当前使用独立 port + L2，主线程优先 arbitration 仍
-   是 CPU 级近似）。
-
-5. **Nested DVR 仍是 execution-driven data-plane model**：branch inversion、IR/ILR/LCR、
+2. **NDM 仍是 execution-driven data-plane model**：branch inversion、IR/ILR/LCR、
    outer invocation collection 和 128-lane flatten 已有，但还不是论文级 bit-exact NDM
    helper pipeline。
+
+3. **共享资源仲裁仍是近似模型**：helper 已使用共享 FU pool、O3 data port、MMU 和
+   cache hierarchy，但 fetch/decode 竞争仍以 residual-width 近似；需要在合入后做
+   main-priority、round-robin、unlimited/constrained FU 的敏感性验证。
 
 ### P1：算法和 workload 覆盖
 
@@ -67,6 +60,26 @@ uop。因此不能把缓存命中统计当成 cross-discovery coverage 已完成
 5. GAP/BFS/Camel 的不改变微结构的回归和差异分析。
 
 ## 已解决过程与验证记录
+
+### P0 独立 helper 子线程（待合入主 worktree）
+
+`dvr-p0-helper` 分支的 `7658292` 和 `ee19b8f` 已完成以下子线程内部结构：
+
+- helper 私有 VRAT physical register bank、free-list 和每 replay uop 的 physical
+  source/destination mapping；它与主线程的 architectural state 隔离，符合 transient
+  in-order subthread 的所有权边界；
+- 16-copy VIR 状态：每 copy 有 active/issued/executed/dead-source mask，64-bit 元素为
+  16 copies x 8 lanes，最多 128 lanes；
+- helper-owned `DVRDynUop` 生命周期和有限 VIR；uop 在共享 FU 完成前保持 issued，完成
+  后才 retire；
+- 16-entry helper LQ：请求在共享 O3 data port 成功发送后分配 entry，response 回收 entry，
+  capacity、translation fault 与 wakeup 均可统计；
+- 独立 8-entry timing frontend：`NeedFetch -> FetchPending -> Fetched`，只有 RISC-V
+  decoder 返回 `StaticInst` 后才提供 ready credit；
+- helper 与主线程共享 FU pool、MMU、data port、cache/DRAM，但不进入主 O3 的 IQ/ROB。
+
+这解决的是旧文档中“没有 helper-owned physical/16-copy/LQ/8-entry frontend 状态”的
+缺口；不等于主 worktree 已验证完成，也不等于论文 NDM 已 bit-exact。
 
 ### Helper fetch/decode
 
