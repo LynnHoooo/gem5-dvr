@@ -102,6 +102,13 @@ REMOTE_MERGED = true;
 %   completed = 33/33, translation faults = 0.  The helper-LQ peak was 16;
 %   155584 entries were allocated, 124447 completed and 31123 retried before
 %   the process exited, showing bounded retry behavior rather than overflow.
+% NDM regression (dvr_nested-v2.riscv):
+%   contexts/programs = 40050/13366; outer invocations = 13146; flatten
+%   batches = 6573; flattened/expected lanes = 803056/803056; invariant
+%   failures = 0; variable-lane batches = 4609.
+%   Nested helper generated/issued/completed = 790594/738234/738234;
+%   replay attempts/targets/fallbacks = 695824/42410/0.  Generated is below
+%   flattened because duplicate addresses are removed before queueing.
 
 % Evidence locations
 % BFS result:

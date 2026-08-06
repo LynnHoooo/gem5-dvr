@@ -52,6 +52,8 @@ vir="$(read_stat "$stats" system.cpu.dvrNestedVIRExecutions)"
 generated="$(read_stat "$stats" system.cpu.dvrNestedHelpersGenerated)"
 issued="$(read_stat "$stats" system.cpu.dvrNestedHelpersIssued)"
 completed="$(read_stat "$stats" system.cpu.dvrNestedHelpersCompleted)"
+nested_flat="$(read_stat "$stats" system.cpu.dvrNestedFlattenedLanes)"
+nested_dedup="$(read_stat "$stats" system.cpu.dvrPrefetchesDeduplicated)"
 replay_attempts="$(read_stat "$stats" system.cpu.dvrNestedReplayAttempts)"
 replay_targets="$(read_stat "$stats" system.cpu.dvrNestedReplayTargetsGenerated)"
 replay_fallbacks="$(read_stat "$stats" system.cpu.dvrNestedReplayFallbacks)"
@@ -69,9 +71,14 @@ require_nonzero nested_helpers_completed "$completed"
 require_nonzero nested_replay_attempts "$replay_attempts"
 require_nonzero nested_replay_targets "$replay_targets"
 require_nonzero nested_dependent_generated "$nested_dependent"
-if [[ "$replay_attempts" -ne "$replay_targets" ]]; then
-    printf 'error: nested replay attempts (%s) != targets (%s)\n' \
-        "$replay_attempts" "$replay_targets" >&2
+if [[ "$issued" -gt "$generated" || "$completed" -ne "$issued" ]]; then
+    printf 'error: nested helper lifecycle generated=%s issued=%s completed=%s\n' \
+        "$generated" "$issued" "$completed" >&2
+    exit 1
+fi
+if [[ "$replay_targets" -gt "$replay_attempts" ]]; then
+    printf 'error: nested replay targets (%s) exceed attempts (%s)\n' \
+        "$replay_targets" "$replay_attempts" >&2
     exit 1
 fi
 if [[ -z "$replay_fallbacks" || "$replay_fallbacks" -ne 0 ]]; then
@@ -82,7 +89,8 @@ fi
 require_nonzero all_vector_programs "$root_programs"
 require_nonzero all_helpers "$root_helpers"
 
-printf 'DVR_STAGE13_NESTED_PASSED contexts=%s programs=%s vrat=%s vir=%s generated=%s issued=%s completed=%s replay_attempts=%s replay_targets=%s replay_fallbacks=%s nested_dependent=%s all_programs=%s all_helpers=%s\n' \
-    "$contexts" "$programs" "$vrat" "$vir" "$generated" "$issued" \
-    "$completed" "$replay_attempts" "$replay_targets" "$replay_fallbacks" \
-    "$nested_dependent" "$root_programs" "$root_helpers"
+printf 'DVR_STAGE13_NESTED_PASSED contexts=%s programs=%s vrat=%s vir=%s flattened=%s generated=%s issued=%s completed=%s deduplicated=%s replay_attempts=%s replay_targets=%s replay_fallbacks=%s nested_dependent=%s all_programs=%s all_helpers=%s\n' \
+    "$contexts" "$programs" "$vrat" "$vir" "$nested_flat" "$generated" \
+    "$issued" "$completed" "$nested_dedup" "$replay_attempts" \
+    "$replay_targets" "$replay_fallbacks" "$nested_dependent" \
+    "$root_programs" "$root_helpers"
