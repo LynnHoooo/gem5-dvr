@@ -2142,6 +2142,7 @@ DVRLoopBoundDetector::updateFinalLoad(Addr final_load_pc)
     branchValuesValid = false;
     comparison = Comparison::Unknown;
     seenBranch = false;
+    earlyExitSeen = false;
 }
 
 DVRLoopBoundDetector::Observation

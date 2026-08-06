@@ -6,7 +6,7 @@
 
 STATUS = 'mechanism-level implementation; paper-level gaps remain';
 BRANCH = 'docs/dvr-reproduction-plan';
-LOCAL_HEAD = 'a8aaed2';
+LOCAL_HEAD = 'working-tree (early-exit reset pending commit)';
 REMOTE_HEAD = 'b5642dd';
 REMOTE_MERGED = true;
 
@@ -66,11 +66,15 @@ REMOTE_MERGED = true;
 %   Note: the binary recorded complete suffixes, but this run did not expose
 %   the opposite branch as a cache lookup; it is not evidence of alternate
 %   replay failure by itself.
-% BFS, serial GAPBS -g6 -n1:
-%   graph completed (64 nodes, 390 edges), no translation fault observed;
+% BFS, serial GAPBS -g6 -n1 (binary rebuilt after early-exit reset):
+%   graph completed (64 nodes, 390 edges);
 %   baseline/full committed = 1207080/1207082;
 %   full loop-bound matches/vector programs = 196/196;
 %   dependent issued/completed = 592/592; active-mask failures = 0;
+%   helper load faults = 387 (source 359, dependent 28), so the translation-fault
+%   gate is NOT PASS; resetting earlyExitSeen at each FLR did not change this count.
+%   Alternate cache lookups/hits/complete-hits = 2179/75/0;
+%   alternate uops/targets/demand-covered/resumes = 125/8/2/0.
 %   strict committed-instruction gate = NOT PASS (difference 2).
 % Camel trace binary:
 %   baseline/full program result = 2125659619/2125659619;
