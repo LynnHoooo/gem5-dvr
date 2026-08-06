@@ -1740,17 +1740,17 @@ DVRVectorInstructionRegister::resumeSourceLanes(
         vectorRegs[source_destination][lane] = source_value;
     laneReady[lane] = true;
 
-    // A memory response only makes a lane eligible to issue.  Do not execute
-    // the first response immediately: the next response can arrive before
-    // the next helper issue opportunity and join the same-PC group.  This is
-    // the response-side analogue of the paper's in-order VIR issue register.
+    // A memory response makes one lane eligible to issue.  Other lanes that
+    // are ready at the same PC join this issue group, but a lone lane must
+    // still be admitted: waiting for a second response can strand a valid
+    // alternate path at its FLR and is not a property of an in-order VIR.
     unsigned ready_lanes = 0;
     for (unsigned candidate_lane = 0;
          candidate_lane < continuationLanes; ++candidate_lane) {
         if (laneActive[candidate_lane] && laneReady[candidate_lane])
             ++ready_lanes;
     }
-    if (ready_lanes < 2)
+    if (ready_lanes == 0)
         return result;
 
     for (unsigned step = 0; step < max_helper_uops; ++step) {

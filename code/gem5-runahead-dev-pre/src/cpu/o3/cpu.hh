@@ -769,6 +769,14 @@ class CPU : public BaseCPU
         statistics::Scalar dvrHelperShiftOps;
         statistics::Scalar dvrHelperMultiplyOps;
         statistics::Scalar dvrHelperLSUOps;
+        statistics::Scalar dvrHelperLoadEntriesAllocated;
+        statistics::Scalar dvrHelperLoadEntriesCompleted;
+        statistics::Scalar dvrHelperLoadEntryWritebacks;
+        statistics::Scalar dvrHelperLoadEntryFaults;
+        statistics::Scalar dvrHelperLoadEntryRetries;
+        statistics::Scalar dvrHelperLoadEntryDropped;
+        statistics::Scalar dvrHelperLoadEntryWakeups;
+        statistics::Scalar dvrHelperLoadEntryPeak;
         statistics::Scalar dvrMainIssueSlotsUsed;
         statistics::Scalar dvrMainALUSlotsUsed;
         statistics::Scalar dvrMainLSUSlotsUsed;
@@ -1156,6 +1164,9 @@ class CPU : public BaseCPU
         std::shared_ptr<DVRPredicateGeneration> predicate;
         unsigned lane;
         ThreadID tid;
+        // Helper-local identity, independent of the main DynInst/ROB.
+        uint64_t helperLoadId = 0;
+        Tick issueTick = 0;
 
         DVRPrefetchSenderState(bool is_source, bool is_nested,
             bool is_oracle,
@@ -1896,6 +1907,33 @@ class CPU : public BaseCPU
     // a bounded helper-LQ reservation until its timing response returns.
     static constexpr unsigned DvrHelperLoadQueueCapacity = 16;
     unsigned dvrHelperLoadQueueOccupancy = 0;
+    enum class DVRHelperLoadState : uint8_t
+    {
+        Allocated,
+        TranslationFault,
+        Retry,
+        WaitingResponse,
+        Writeback,
+        Completed,
+        Dropped
+    };
+    struct DVRHelperLoadEntry
+    {
+        Addr virtualAddress = 0;
+        Addr physicalAddress = 0;
+        Addr pc = 0;
+        unsigned lane = 0;
+        ThreadID tid = 0;
+        bool source = false;
+        bool nested = false;
+        DVRHelperLoadState state = DVRHelperLoadState::Allocated;
+        Tick allocatedTick = 0;
+        Tick issueTick = 0;
+        Tick responseTick = 0;
+    };
+    uint64_t dvrNextHelperLoadId = 1;
+    uint64_t dvrHelperLoadEntryPeakValue = 0;
+    std::unordered_map<uint64_t, DVRHelperLoadEntry> dvrHelperLoadEntries;
     std::deque<DVRPrefetchAddress> dvrPrefetchQueue;
     // Source values are lane-specific even when they share a cache line, so
     // source requests are deduplicated by byte address.  Dependent loads only
