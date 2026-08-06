@@ -1068,6 +1068,9 @@ class CPU : public BaseCPU
     // needs tag/fill/victim callbacks; the 1x1 shadow is therefore unused.
     DVRQualityTracker dvrQualityTracker;
     DVRVectorTaintTracker dvrTaintTracker;
+    // Dispatch taint is speculative; this is the committed-path FLR used
+    // to delimit helper work.
+    Addr dvrCommittedFinalLoadPC = 0;
     DVRLoopBoundDetector dvrLoopBoundDetector;
     DVRInstructionRecorder dvrInstructionRecorder;
     DVRVectorRenameTable dvrVectorRenameTable;
@@ -1975,7 +1978,11 @@ class CPU : public BaseCPU
                                  Addr dependent_address);
     void recordDVRAlternatePaths(const DVRInstructionRecorder &recorder,
                                  ContextID address_space_id);
-    void augmentDVRAlternatePaths(DVRInstructionRecorder &recorder,
+    /**
+     * Splice a validated opposite branch suffix into recorder. Returns true
+     * only when this generation admitted at least one complete cache entry.
+     */
+    bool augmentDVRAlternatePaths(DVRInstructionRecorder &recorder,
                                   ContextID address_space_id,
                                   const DVRLoopBoundDetector::RegisterSnapshot
                                       &initial_regs);

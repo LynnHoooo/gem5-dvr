@@ -57,7 +57,16 @@ class DVRStrideDetector
         bool discoverySeen = false;
     };
 
+    // Discovery starts at dispatch, therefore these one-bit RPT updates are
+    // speculative.  Only false-to-true transitions need recording.
+    struct DiscoverySeenWrite
+    {
+        InstSeqNum sequence = 0;
+        unsigned entry = 0;
+    };
+
     std::vector<Entry> entries;
+    std::vector<DiscoverySeenWrite> discoverySeenWrites;
     uint64_t timestamp = 0;
 
   public:
@@ -65,9 +74,14 @@ class DVRStrideDetector
     std::optional<Candidate> observe(Addr pc, Addr address);
     std::optional<Candidate> observeDispatch(Addr pc,
                                              bool discovery_active = false,
-                                             Addr trigger_pc = 0);
+                                             Addr trigger_pc = 0,
+                                             InstSeqNum sequence = 0);
     /** Initialize the one-bit-per-RPT-entry discovery register. */
     void beginDiscovery(Addr trigger_pc);
+    /** Undo seen-bit updates from instructions removed by an O3 squash. */
+    void squashDiscovery(InstSeqNum squash_sequence);
+    /** Clear only per-Discovery state; preserve RPT training. */
+    void endDiscovery();
     void reset();
 };
 
@@ -132,6 +146,13 @@ class DVRVectorTaintTracker
     static constexpr unsigned NumTrackedRegs = 32;
     uint32_t taint = 0;
     Addr finalLoadPC = 0;
+    struct SpeculativeState
+    {
+        InstSeqNum sequence = 0;
+        uint32_t taint = 0;
+        Addr finalLoadPC = 0;
+    };
+    std::vector<SpeculativeState> speculativeHistory;
 
     bool tracked(const RegId &reg) const;
     bool isTainted(const RegId &reg) const;
@@ -146,9 +167,14 @@ class DVRVectorTaintTracker
 
     void begin(const DynInstPtr &initiating_load);
     Observation observe(const DynInstPtr &inst);
+    /** Dispatch-side update with enough state to undo an O3 squash. */
+    Observation observeSpeculative(const DynInstPtr &inst,
+                                   InstSeqNum sequence);
+    void squash(InstSeqNum squash_sequence);
     Observation classify(const DynInstPtr &inst) const;
     void reset();
     Addr flr() const { return finalLoadPC; }
+    void setFLR(Addr pc) { finalLoadPC = pc; }
     uint32_t bits() const { return taint; }
 };
 
@@ -243,6 +269,10 @@ class DVRInstructionRecorder
         bool control = false;
         bool conditional = false;
         bool branchTaken = false;
+        // Captured at dispatch, before the tracker mutates destination
+        // taint.  Only a tainted conditional can legitimately diverge across
+        // helper lanes; untainted control is replayed on its observed path.
+        bool tainted = false;
         bool alternatePath = false;
 
         /**
@@ -262,10 +292,10 @@ class DVRInstructionRecorder
 
   public:
     void begin(const DynInstPtr &trigger);
-    bool record(const DynInstPtr &inst);
+    bool record(const DynInstPtr &inst, bool tainted = false);
     /** Import a committed helper template for response-driven replay. */
     void import(const std::array<Uop, MaxUops> &source, unsigned size);
-    /** Insert a validated alternate-path suffix immediately before reconvergence. */
+    /** Append a validated alternate suffix while retaining its reconvergence PC. */
     bool insertBeforePC(Addr reconvergence_pc, const std::vector<Uop> &path);
     /** Bind every conditional path to the DVR termination PC (the FLR). */
     void setReconvergencePC(Addr pc);
@@ -445,10 +475,15 @@ class DVRLoopBoundDetector
     };
     Addr triggerPC = 0;
     Addr finalLoadPC = 0;
+    Addr lastComparePC = 0;
     Addr loopBranchPC = 0;
     Addr loopTargetPC = 0;
     int boundSource0 = -1;
     int boundSource1 = -1;
+    int compareDestination = -1;
+    RegVal branchValue0 = 0;
+    RegVal branchValue1 = 0;
+    bool branchValuesValid = false;
     Comparison comparison = Comparison::Unknown;
     bool seenBranch = false;
 
@@ -466,6 +501,7 @@ class DVRLoopBoundDetector
     struct Inference
     {
         bool matched = false;
+        bool fallback = false;
         uint64_t bound = 0;
         int64_t increment = 0;
         uint64_t remaining = 0;
@@ -474,7 +510,8 @@ class DVRLoopBoundDetector
 
     void begin(Addr trigger_pc);
     void updateFinalLoad(Addr final_load_pc);
-    Observation observe(const DynInstPtr &inst);
+    Observation observe(const DynInstPtr &inst,
+                        const RegisterSnapshot *regs = nullptr);
     Inference infer(const RegisterSnapshot &start,
                     const RegisterSnapshot &finish,
                     unsigned max_lanes) const;

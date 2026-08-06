@@ -485,8 +485,12 @@ CPU::requestDVRInstructionFetch(ThreadID tid, Addr pc,
     if (tid >= threadContexts.size() || !threadContexts[tid])
         return false;
 
+    const unsigned line_bytes = cacheLineSize();
+    const unsigned line_offset = pc & (line_bytes - 1);
+    const unsigned request_bytes = std::min<unsigned>(4,
+        line_bytes - line_offset);
     RequestPtr req = std::make_shared<Request>(
-        pc, 4, Request::INST_FETCH, instRequestorId(), pc,
+        pc, request_bytes, Request::INST_FETCH, instRequestorId(), pc,
         thread[tid]->contextId());
     req->taskId(taskId());
     const Fault fault = mmu->translateFunctional(
@@ -499,7 +503,7 @@ CPU::requestDVRInstructionFetch(ThreadID tid, Addr pc,
     }
 
     PacketPtr pkt = new Packet(req, MemCmd::ReadReq);
-    pkt->dataDynamic(new uint8_t[4]);
+    pkt->dataDynamic(new uint8_t[request_bytes]);
     auto *state = new DVRInstructionFetchState;
     state->pc = pc;
     state->tid = tid;
@@ -524,10 +528,11 @@ CPU::completeDVRInstructionFetch(PacketPtr pkt)
     }
 
     StaticInstPtr decoded;
-    if (pkt->hasData() && pkt->getSize() >= 4 &&
+    if (pkt->hasData() && pkt->getSize() >= 2 &&
         state->tid < threadContexts.size() && threadContexts[state->tid]) {
         uint32_t raw = 0;
-        std::memcpy(&raw, pkt->getConstPtr<uint8_t>(), sizeof(raw));
+        std::memcpy(&raw, pkt->getConstPtr<uint8_t>(),
+                    std::min<unsigned>(pkt->getSize(), sizeof(raw)));
         auto *decoder = dynamic_cast<RiscvISA::Decoder *>(
             threadContexts[state->tid]->getDecoderPtr());
         if (decoder)
@@ -2142,7 +2147,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 const bool dispatch_dependent =
                     dvrDispatchDependentLoads.erase(inst->seqNum) != 0;
                 if (dispatch_recorded) {
-                    dvrInstructionRecorder.record(inst);
+                    dvrInstructionRecorder.record(inst, dispatch_tainted);
                     if (dispatch_tainted)
                         dvrTraceDependency("tainted", curTick(),
                             dvrCurrentTriggerPC,
@@ -2151,8 +2156,12 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                             dvrTaintTracker.bits());
                 }
                 if (dispatch_dependent) {
+                    // Only a committed dependent load may advance the FLR
+                    // that delimits the generated helper program.
+                    dvrCommittedFinalLoadPC =
+                        inst->pcState().instAddr();
                     dvrLoopBoundDetector.updateFinalLoad(
-                        dvrTaintTracker.flr());
+                        dvrCommittedFinalLoadPC);
                     if (inst->effAddrValid()) {
                         dvrTraceDependency("flr", curTick(),
                             dvrCurrentTriggerPC,
@@ -2163,8 +2172,10 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                             dvrInitiatingLoadValue, inst->effAddr);
                     }
                 }
+                DVRLoopBoundDetector::RegisterSnapshot branch_regs = {};
+                captureDVRRegisterSnapshot(tid, inst, branch_regs);
                 const auto loop_observation =
-                    dvrLoopBoundDetector.observe(inst);
+                    dvrLoopBoundDetector.observe(inst, &branch_regs);
                 if (loop_observation.backwardBranch)
                     ++cpuStats.dvrBackwardBranches;
                 if (loop_observation.boundFound)
@@ -2364,6 +2375,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                     ++cpuStats.dvrNestedRootStarts;
                 }
                 dvrTaintTracker.begin(inst);
+                dvrCommittedFinalLoadPC = 0;
                 dvrLoopBoundDetector.begin(result.triggerPC);
                 dvrInstructionRecorder.begin(inst);
                 // NDM is an outer-loop generation and may span several
@@ -2392,9 +2404,11 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                         static_cast<long long>(result.stride), inst->seqNum);
                 break;
               case DVRDiscoveryController::Event::Completed: {
+                dvrStrideDetector.endDiscovery();
+                const Addr committed_flr = dvrCommittedFinalLoadPC;
                 ++cpuStats.dvrDiscoveryCompletions;
                 cpuStats.dvrDiscoveredInstructions += result.instructions;
-                if (dvrTaintTracker.flr() != 0)
+                if (committed_flr != 0)
                     ++cpuStats.dvrDiscoveriesWithFLR;
                 if (dvrLoopBoundDetector.hasBound())
                     ++cpuStats.dvrDiscoveriesWithBounds;
@@ -2409,14 +2423,15 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 // for incomplete control metadata and must not be used when
                 // a real FLR is known.
                 dvrInstructionRecorder.setReconvergencePC(
-                    dvrTaintTracker.flr());
+                    committed_flr);
                 // Publish this complete dynamic path before looking up its
                 // opposite direction.  A later discovery can then splice
                 // the cached suffix into the same reconvergence point.
                 recordDVRAlternatePaths(dvrInstructionRecorder,
                                         inst->contextId());
-                augmentDVRAlternatePaths(dvrInstructionRecorder,
-                                         inst->contextId(), finish_regs);
+                const bool alternate_complete_hit =
+                    augmentDVRAlternatePaths(dvrInstructionRecorder,
+                                             inst->contextId(), finish_regs);
                 for (unsigned index = 0;
                      index < dvrInstructionRecorder.size(); ++index) {
                     const auto &uop = dvrInstructionRecorder[index];
@@ -2432,10 +2447,10 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                         DVRNestedDiscoveryMode::State::OuterFound &&
                     inference.matched && inference.lanes != 0 &&
                     dvrCurrentTriggerAddress != 0 &&
-                    dvrTaintTracker.flr() != 0 &&
+                    committed_flr != 0 &&
                     dvrNestedDiscoveryMode.recordOuterInvocation(
                         dvrCurrentTriggerAddress, inference.lanes,
-                        result.triggerPC, dvrTaintTracker.flr(),
+                        result.triggerPC, committed_flr,
                         inference.increment)) {
                     ++cpuStats.dvrNDMOuterInvocations;
                     dvrTraceVector("invocation", curTick(),
@@ -2490,8 +2505,35 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                                       inference.matched &&
                                       inference.lanes != 0 &&
                                       dvrInstructionRecorder.size() > 1 &&
-                                      dvrTaintTracker.flr() != 0 &&
+                                      committed_flr != 0 &&
                                       !dvrInstructionRecorder.overflow();
+                // Preserve the paper's bounded fallback when no loop bound
+                // can be proved.  It is distinct from an exact inference:
+                // no NDM/precise-loop admission is granted, but the helper
+                // can still issue up to 128 speculative future strides.
+                const bool fallback_allowed =
+                    dvrMode != "discovery" && !inference.matched &&
+                    inference.fallback && inference.lanes != 0 &&
+                    dvrInstructionRecorder.size() > 1 &&
+                    committed_flr != 0 &&
+                    !dvrInstructionRecorder.overflow();
+                // A complete opposite-path entry is independently safe to
+                // replay: it has a single entry/exit, a known reconvergence,
+                // and validated live-ins.  Do not discard it solely because
+                // the generic loop-bound detector could not infer the BFS
+                // induction variable.  This remains narrower than normal
+                // fallback because it is gated by a real cache hit and FLR.
+                // A cache-complete alternate path is also useful when the
+                // loop detector cannot prove a trip count.  In that case
+                // admit one bounded next-stride probe rather than inventing
+                // a full 128-lane loop bound.
+                const unsigned alternate_continuation_lanes =
+                    inference.lanes != 0 ? inference.lanes : 1;
+                const bool alternate_continuation_allowed =
+                    dvrMode != "discovery" && alternate_complete_hit &&
+                    dvrInstructionRecorder.size() > 1 &&
+                    committed_flr != 0 &&
+                    !dvrInstructionRecorder.overflow();
                 if (dvrInstructionRecorder.overflow()) {
                     ++cpuStats.dvrRecorderOverflows;
                     helper_allowed = false;
@@ -2591,7 +2633,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                     dvrMode == "nested" &&
                     dvrNestedDiscoveryMode.readyToVectorize() &&
                     inference.matched && inference.lanes != 0 &&
-                    dvrTaintTracker.flr() != 0 &&
+                    committed_flr != 0 &&
                     dvrInstructionRecorder.size() > 1 &&
                     !dvrInstructionRecorder.overflow();
                 bool ndm_launched = false;
@@ -2604,6 +2646,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                         dvrCurrentTriggerAddress;
                     dvrNestedContext.stride = inference.increment;
                     dvrNestedContext.taint = dvrTaintTracker;
+                    dvrNestedContext.taint.setFLR(committed_flr);
                     dvrNestedContext.recorder = dvrInstructionRecorder;
                     dvrNestedContext.startRegs = dvrDiscoveryStartRegs;
                     launchDVRNestedPrefetches(finish_regs);
@@ -2612,14 +2655,27 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                     ndm_launched = true;
                 }
                 if (!ndm_launched &&
-                    (helper_allowed || launch_source_fallback) &&
+                    (helper_allowed || fallback_allowed ||
+                     launch_source_fallback ||
+                     alternate_continuation_allowed) &&
                     inst->effAddrValid()) {
                     if (launch_source_fallback)
                         ++cpuStats.dvrControlFallbackSourceLaunches;
+                    if (fallback_allowed)
+                        dvrTraceVector("loop_bound_fallback_launch",
+                            curTick(), result.triggerPC, inst->effAddr,
+                            inference.lanes);
+                    if (alternate_continuation_allowed && !helper_allowed)
+                        dvrTraceVector("alternate_path_continuation_launch",
+                            curTick(), result.triggerPC, inst->effAddr,
+                            alternate_continuation_lanes);
                     launchDVRStridePrefetches(
                         tid, inst->effAddr, result.triggerPC,
-                        result.stride, inference.lanes, finish_regs);
-                } else if (dvrTaintTracker.flr() != 0) {
+                        result.stride,
+                        alternate_continuation_allowed && !helper_allowed ?
+                            alternate_continuation_lanes : inference.lanes,
+                        finish_regs);
+                } else if (committed_flr != 0) {
                     ++cpuStats.dvrHelpersSuppressed;
                 }
                 DPRINTF(O3CPU,
@@ -2628,7 +2684,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                         "bound=%#x increment=%lld remaining=%llu lanes=%u\n",
                         result.triggerPC,
                         static_cast<long long>(result.stride),
-                        result.instructions, dvrTaintTracker.flr(),
+                        result.instructions, committed_flr,
                         dvrTaintTracker.bits(),
                         dvrLoopBoundDetector.branchPC(),
                         dvrLoopBoundDetector.targetPC(), inference.bound,
@@ -2636,6 +2692,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                         static_cast<unsigned long long>(inference.remaining),
                         inference.lanes);
                 dvrTaintTracker.reset();
+                dvrCommittedFinalLoadPC = 0;
                 dvrLoopBoundDetector.reset();
                 dvrInstructionRecorder.reset();
                 dvrVectorRenameTable.reset();
@@ -2653,6 +2710,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 break;
               }
               case DVRDiscoveryController::Event::TimedOut:
+                dvrStrideDetector.endDiscovery();
                 ++cpuStats.dvrDiscoveryTimeouts;
                 DPRINTF(O3CPU,
                         "DVR discovery timeout pc=%#x stride=%lld insts=%u\n",
@@ -2660,6 +2718,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                         static_cast<long long>(result.stride),
                         result.instructions);
                 dvrTaintTracker.reset();
+                dvrCommittedFinalLoadPC = 0;
                 dvrLoopBoundDetector.reset();
                 dvrInstructionRecorder.reset();
                 dvrDiscoverySwitchedInnermost = false;
@@ -2673,8 +2732,10 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 }
                 break;
               case DVRDiscoveryController::Event::Abandoned:
+                dvrStrideDetector.endDiscovery();
                 ++cpuStats.dvrDiscoveryAbandons;
                 dvrTaintTracker.reset();
+                dvrCommittedFinalLoadPC = 0;
                 dvrLoopBoundDetector.reset();
                 dvrInstructionRecorder.reset();
                 dvrDiscoverySwitchedInnermost = false;
@@ -3420,6 +3481,13 @@ CPU::issueDVRReplayLanes(unsigned slots)
         return 0;
 
     using Lane = CPU::DVRHelperThread::ReplayLaneContext;
+    const auto executingAlternatePath = [](const Lane &lane) {
+        for (unsigned depth = 0; depth < lane.reconvergenceDepth; ++depth) {
+            if (lane.reconvergenceStack[depth].alternatePath)
+                return true;
+        }
+        return false;
+    };
     const auto findPC = [](const std::shared_ptr<const DVRReplayTemplate> &program,
                            Addr pc) {
         if (!program || pc == 0)
@@ -3440,8 +3508,12 @@ CPU::issueDVRReplayLanes(unsigned slots)
         while (lane.reconvergenceDepth != 0 &&
                lane.lanePC == lane.reconvergenceStack[
                    lane.reconvergenceDepth - 1].pc) {
+            const auto &frame = lane.reconvergenceStack[
+                lane.reconvergenceDepth - 1];
             --lane.reconvergenceDepth;
             ++cpuStats.dvrReconvergences;
+            if (frame.alternatePath)
+                ++cpuStats.dvrReconvergenceResumeSuccesses;
         }
         const unsigned pc_index = findPC(lane.program, lane.lanePC);
         if (pc_index == std::numeric_limits<unsigned>::max()) {
@@ -3607,8 +3679,9 @@ CPU::issueDVRReplayLanes(unsigned slots)
         RegVal result = 0;
         bool valid = true;
         if (lane_uop.conditional) {
-            bool taken = false;
-            valid = lane_uop.evaluateBranch(source0, source1, taken);
+            bool taken = lane_uop.branchTaken;
+            if (lane_uop.tainted)
+                valid = lane_uop.evaluateBranch(source0, source1, taken);
             if (!valid) {
                 lane->active = false;
                 ++cpuStats.dvrVIRSourceValueSemanticFailures;
@@ -3755,6 +3828,13 @@ CPU::issueDVRReplayLanes(unsigned slots)
                 ++cpuStats.dvrDependentPrefetchesGenerated;
                 ++cpuStats.dvrReplayTargetsGenerated;
                 ++cpuStats.dvrVectorizerDependentLanes;
+                if (lane_uop.alternatePath || executingAlternatePath(*lane)) {
+                    ++cpuStats.dvrAlternatePathDependentTargets;
+                    dvrAlternateDependentLines.insert(line);
+                    dvrTraceDependency("alternate_replay_target", curTick(),
+                        lane->triggerPC, lane_uop.pc, result,
+                        lane->predicate ? 1 : 0, lane->lane);
+                }
                 if (lane->nested) {
                     ++cpuStats.dvrNestedReplayTargetsGenerated;
                     ++cpuStats.dvrNestedDependentGenerated;
@@ -3781,8 +3861,12 @@ CPU::issueDVRReplayLanes(unsigned slots)
         }
         lane->regs[0] = 0;
         ++lane->helperUops;
-        lane->lanePC = lane->uopIndex + 1 < lane->program->count ?
-            lane->program->uops[lane->uopIndex + 1].pc : 0;
+        // A cached direct JAL/C.J must use its validated target rather than
+        // incorrectly falling through into a different suffix.
+        lane->lanePC = lane_uop.control && !lane_uop.conditional &&
+            lane_uop.branchTargetPC != 0 ? lane_uop.branchTargetPC :
+            (lane->uopIndex + 1 < lane->program->count ?
+             lane->program->uops[lane->uopIndex + 1].pc : 0);
         if (lane->lanePC == 0 || lane->helperUops >= dvrHelperMaxUops)
             lane->active = false;
         else
@@ -3935,11 +4019,14 @@ CPU::serviceDVRPrefetchQueue()
         dvrQueuedDependentLines.erase(dvrPrefetchLine(prefetch.address));
     const unsigned request_bytes = dvrPrefetchBytes(prefetch);
     const unsigned line_offset = prefetch.address & (cacheLineSize() - 1);
-    if (prefetch.source && line_offset + request_bytes > cacheLineSize()) {
-        // The helper packet bypasses the architectural load-splitting path.
-        // Never consume a partial scalar as a trigger value.
+    if (line_offset + request_bytes > cacheLineSize()) {
+        // Helper packets bypass the architectural LSQ load-splitting path.
+        // Never submit an instruction-sized scalar or dependent load that
+        // crosses a cache line; it would violate BaseCache's single-block
+        // packet contract.  A later aligned lane can still provide coverage.
         ++cpuStats.dvrPrefetchesDropped;
-        retireDVRPredicateLane(prefetch.predicate, prefetch.lane, false);
+        if (prefetch.source)
+            retireDVRPredicateLane(prefetch.predicate, prefetch.lane, false);
         return;
     }
     Request::Flags flags;
@@ -4357,8 +4444,8 @@ CPU::replayDVRSource(const DVRPrefetchSenderState &state,
         }
 
         if (uop.conditional) {
-            bool taken = false;
-            if (!uop.evaluateBranch(source0, source1, taken))
+            bool taken = uop.branchTaken;
+            if (uop.tainted && !uop.evaluateBranch(source0, source1, taken))
                 return false;
             const Addr next_pc = taken ? uop.branchTargetPC :
                                          uop.fallthroughPC;
@@ -4633,7 +4720,7 @@ CPU::recordDVRAlternatePaths(const DVRInstructionRecorder &recorder,
 {
     for (unsigned branch = 0; branch < recorder.size(); ++branch) {
         const auto &op = recorder[branch];
-        if (!op.conditional)
+        if (!op.conditional || !op.tainted)
             continue;
 
         const Addr reconvergence = op.reconvergencePC;
@@ -4666,6 +4753,10 @@ CPU::recordDVRAlternatePaths(const DVRInstructionRecorder &recorder,
                     if (recorder[candidate].pc == pc)
                         return true;
                 }
+                for (const auto &cached_uop : path.uops) {
+                    if (cached_uop.pc == pc)
+                        return true;
+                }
                 return false;
             };
             for (unsigned index = branch + 1; index < end; ++index) {
@@ -4679,8 +4770,7 @@ CPU::recordDVRAlternatePaths(const DVRInstructionRecorder &recorder,
                 // indirect/unresolved control flow).
                 const bool direct_jump = path_uop.control &&
                     !path_uop.conditional && path_uop.branchTargetPC != 0;
-                if (direct_jump && path_uop.intDestinations == 0 &&
-                    captured_pc(path_uop.branchTargetPC)) {
+                if (direct_jump && captured_pc(path_uop.branchTargetPC)) {
                     ++cpuStats.dvrAlternatePathDirectJumps;
                     auto cached_uop = path_uop;
                     cached_uop.alternatePath = true;
@@ -4715,14 +4805,63 @@ CPU::recordDVRAlternatePaths(const DVRInstructionRecorder &recorder,
                     ++cpuStats.dvrAlternatePathSafeSkips;
                     continue;
                 }
-                if (path_uop.control && path_uop.conditional &&
-                    (path_uop.branchTargetPC == 0 ||
-                     path_uop.fallthroughPC == 0 ||
-                     !captured_pc(path_uop.branchTargetPC) ||
-                     !captured_pc(path_uop.fallthroughPC))) {
-                    ++cpuStats.dvrAlternatePathControlRejects;
-                    path.complete = false;
-                    break;
+                if (path_uop.control && path_uop.conditional) {
+                    // A nested conditional can be replayed only when both
+                    // of its possible successors are represented.  The
+                    // current dynamic suffix supplies one side; compose the
+                    // missing side from an earlier *complete* cache entry.
+                    // This is deliberately one-level composition: a child
+                    // entry must already have passed its own control/live-in
+                    // validation, so an incomplete cache entry is never
+                    // upgraded merely by being referenced here.
+                    const auto append_cached_target = [&](Addr target) {
+                        if (target == 0 || captured_pc(target))
+                            return target != 0;
+                        const DVRAlternatePathKey nested_key{
+                            path_uop.pc, target, reconvergence,
+                            address_space_id};
+                        const auto nested = dvrAlternatePathCache.find(
+                            nested_key);
+                        if (nested == dvrAlternatePathCache.end() ||
+                            !nested->second.complete ||
+                            nested->second.uops.empty() ||
+                            path.uops.size() + nested->second.uops.size() >
+                                DVRInstructionRecorder::MaxUops) {
+                            return false;
+                        }
+                        path.liveInRegisters |=
+                            nested->second.liveInRegisters & ~defined;
+                        for (const auto &nested_uop : nested->second.uops) {
+                            defined |= nested_uop.intDestinations;
+                            auto cached_uop = nested_uop;
+                            cached_uop.alternatePath = true;
+                            path.uops.push_back(cached_uop);
+                        }
+                        dvrTraceVector("alternate_path_nested_compose",
+                            curTick(), path_uop.pc, target,
+                            nested->second.uops.size(),
+                            static_cast<int>(address_space_id));
+                        return captured_pc(target);
+                    };
+                    // Place the conditional in the template before adding a
+                    // cache-composed suffix.  Its PC selects the correct
+                    // successor at execution; no fall-through ordering is
+                    // used to choose a branch target.
+                    path.liveInRegisters |= path_uop.intSources & ~defined;
+                    defined |= path_uop.intDestinations;
+                    auto cached_branch = path_uop;
+                    cached_branch.alternatePath = true;
+                    path.uops.push_back(cached_branch);
+                    const bool target_ok = append_cached_target(
+                        path_uop.branchTargetPC);
+                    const bool fallthrough_ok = append_cached_target(
+                        path_uop.fallthroughPC);
+                    if (!target_ok || !fallthrough_ok) {
+                        ++cpuStats.dvrAlternatePathControlRejects;
+                        path.complete = false;
+                        break;
+                    }
+                    continue;
                 }
                 path.liveInRegisters |= path_uop.intSources & ~defined;
                 defined |= path_uop.intDestinations;
@@ -4748,11 +4887,12 @@ CPU::recordDVRAlternatePaths(const DVRInstructionRecorder &recorder,
     }
 }
 
-void
+bool
 CPU::augmentDVRAlternatePaths(
     DVRInstructionRecorder &recorder, ContextID address_space_id,
     const DVRLoopBoundDetector::RegisterSnapshot &initial_regs)
 {
+    bool admitted_complete_path = false;
     struct BranchOccurrence
     {
         unsigned index;
@@ -4760,7 +4900,7 @@ CPU::augmentDVRAlternatePaths(
     };
     std::vector<BranchOccurrence> branches;
     for (unsigned index = 0; index < recorder.size(); ++index) {
-        if (recorder[index].conditional)
+        if (recorder[index].conditional && recorder[index].tainted)
             branches.push_back({index, recorder[index]});
     }
     // Insert from the end of the captured stream.  Insertion before a
@@ -4805,6 +4945,12 @@ CPU::augmentDVRAlternatePaths(
         const auto &path = found->second;
         if (!path.complete) {
             ++cpuStats.dvrAlternatePathIncompleteRejects;
+            // Keep this trace intentionally at cache-lookup granularity:
+            // it identifies the branch/alternate target actually relevant to
+            // BFS/Camel admission without dumping every discovery uop.
+            dvrTraceVector("alternate_path_incomplete_hit", curTick(),
+                           op.pc, alternate_target, path.uops.size(),
+                           static_cast<int>(address_space_id));
             continue;
         }
         bool live_in_valid = true;
@@ -4825,10 +4971,12 @@ CPU::augmentDVRAlternatePaths(
             continue;
         }
         ++cpuStats.dvrAlternatePathCompleteHits;
+        admitted_complete_path = true;
         dvrTraceVector("alternate_path_complete_hit", curTick(), op.pc,
                        alternate_target, path.uops.size(),
                        static_cast<int>(address_space_id));
     }
+    return admitted_complete_path;
 }
 
 void
@@ -4929,9 +5077,15 @@ CPU::squashInstIt(const ListIt &instIt, ThreadID tid)
         // Discovery opens at dispatch.  If the trigger is later removed by
         // an O3 squash, commit cannot observe its abandonment; restore the
         // speculative DVR state at this boundary instead.
+        if (enableDVR)
+            dvrStrideDetector.squashDiscovery((*instIt)->seqNum);
+        if (enableDVR)
+            dvrTaintTracker.squash((*instIt)->seqNum);
         if (enableDVR && dvrDiscovery.rollback((*instIt)->seqNum)) {
             ++cpuStats.dvrDiscoveryRollbacks;
+            dvrStrideDetector.endDiscovery();
             dvrTaintTracker.reset();
+            dvrCommittedFinalLoadPC = 0;
             dvrLoopBoundDetector.reset();
             dvrInstructionRecorder.reset();
             dvrVectorRenameTable.reset();
@@ -5262,6 +5416,7 @@ CPU::beginDVRDiscoveryAtDispatch(
         ++cpuStats.dvrNestedRootStarts;
     }
     dvrTaintTracker.begin(inst);
+    dvrCommittedFinalLoadPC = 0;
     dvrLoopBoundDetector.begin(candidate.pc);
     dvrInstructionRecorder.begin(inst);
     dvrDispatchTainted.clear();
@@ -5289,7 +5444,8 @@ CPU::observeDVRDispatch(const DynInstPtr &inst)
     if (inst->isLoad()) {
         const auto candidate = dvrStrideDetector.observeDispatch(
             inst->pcState().instAddr(), dvrDiscovery.isDiscovering(),
-            dvrDiscovery.isDiscovering() ? dvrCurrentTriggerPC : 0);
+            dvrDiscovery.isDiscovering() ? dvrCurrentTriggerPC : 0,
+            inst->seqNum);
         if (candidate) {
             ++cpuStats.dvrStrideCandidates;
             if (dvrMode == "vr" &&
@@ -5328,7 +5484,8 @@ CPU::observeDVRDispatch(const DynInstPtr &inst)
 
     if (dvrDiscovery.isDiscovering() && !is_discovery_end &&
         inst->seqNum > dvrDiscovery.triggerSeq()) {
-        const auto observation = dvrTaintTracker.observe(inst);
+        const auto observation = dvrTaintTracker.observeSpeculative(
+            inst, inst->seqNum);
         // Alternate-path replay needs a complete decoded suffix, including
         // non-tainted arithmetic that computes a path's live-out address.
         // The taint sets still control dependency classification; this set

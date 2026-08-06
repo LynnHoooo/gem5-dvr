@@ -73,14 +73,17 @@ DVRStrideDetector::observe(Addr pc, Addr address)
 
 std::optional<DVRStrideDetector::Candidate>
 DVRStrideDetector::observeDispatch(Addr pc, bool discovery_active,
-                                   Addr trigger_pc)
+                                   Addr trigger_pc, InstSeqNum sequence)
 {
-    for (auto &entry : entries) {
+    for (unsigned index = 0; index < entries.size(); ++index) {
+        auto &entry = entries[index];
         if (entry.valid && entry.pc == pc && entry.stride != 0 &&
             entry.confidence >= 2) {
             const bool repeated = discovery_active && entry.discoverySeen;
-            if (discovery_active)
+            if (discovery_active && !entry.discoverySeen) {
+                discoverySeenWrites.push_back({sequence, index});
                 entry.discoverySeen = true;
+            }
             return Candidate{pc, static_cast<Addr>(
                 static_cast<int64_t>(entry.lastAddress) + entry.stride),
                 entry.stride, repeated && pc != trigger_pc};
@@ -98,6 +101,7 @@ DVRStrideDetector::beginDiscovery(Addr trigger_pc)
     // therefore identifies a more-inner candidate.
     for (auto &entry : entries)
         entry.discoverySeen = false;
+    discoverySeenWrites.clear();
     for (auto &entry : entries) {
         if (entry.valid && entry.pc == trigger_pc) {
             entry.discoverySeen = true;
@@ -107,11 +111,32 @@ DVRStrideDetector::beginDiscovery(Addr trigger_pc)
 }
 
 void
+DVRStrideDetector::squashDiscovery(InstSeqNum squash_sequence)
+{
+    // Dispatch order follows sequence number. Reverse undo retains an
+    // earlier observation of the same RPT entry on the surviving path.
+    while (!discoverySeenWrites.empty() &&
+           discoverySeenWrites.back().sequence >= squash_sequence) {
+        entries[discoverySeenWrites.back().entry].discoverySeen = false;
+        discoverySeenWrites.pop_back();
+    }
+}
+
+void
+DVRStrideDetector::endDiscovery()
+{
+    for (auto &entry : entries)
+        entry.discoverySeen = false;
+    discoverySeenWrites.clear();
+}
+
+void
 DVRStrideDetector::reset()
 {
     // 清空所有训练状态。
     for (auto &entry : entries)
         entry = Entry{};
+    discoverySeenWrites.clear();
     timestamp = 0;
 }
 
@@ -285,6 +310,27 @@ DVRVectorTaintTracker::observe(const DynInstPtr &inst)
 }
 
 DVRVectorTaintTracker::Observation
+DVRVectorTaintTracker::observeSpeculative(const DynInstPtr &inst,
+                                           InstSeqNum sequence)
+{
+    speculativeHistory.push_back({sequence, taint, finalLoadPC});
+    return observe(inst);
+}
+
+void
+DVRVectorTaintTracker::squash(InstSeqNum squash_sequence)
+{
+    // Dispatch is in sequence order.  Restoring the state immediately before
+    // the first squashed instruction removes all wrong-path taint and FLR.
+    while (!speculativeHistory.empty() &&
+           speculativeHistory.back().sequence >= squash_sequence) {
+        taint = speculativeHistory.back().taint;
+        finalLoadPC = speculativeHistory.back().finalLoadPC;
+        speculativeHistory.pop_back();
+    }
+}
+
+DVRVectorTaintTracker::Observation
 DVRVectorTaintTracker::classify(const DynInstPtr &inst) const
 {
     bool source_tainted = false;
@@ -302,6 +348,7 @@ DVRVectorTaintTracker::reset()
 {
     taint = 0;
     finalLoadPC = 0;
+    speculativeHistory.clear();
 }
 
 namespace
@@ -513,12 +560,40 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
                                          Semantic::BranchNotEqual;
             return;
         }
+        if (quadrant == 1 && funct3 == 5) {
+            // C.J is a direct transfer.  C.JR/C.JALR remain excluded
+            // because their target is data-dependent.
+            uop.semantic = Semantic::AddImmediate;
+            uop.source0 = 0;
+            uop.immediate = 0;
+            return;
+        }
         return;
     }
 
     const uint32_t opcode = uop.encoding & 0x7f;
     const uint32_t funct3 = (uop.encoding >> 12) & 0x7;
     const uint32_t funct7 = (uop.encoding >> 25) & 0x7f;
+
+    if (opcode == 0x37) { // LUI
+        uop.semantic = Semantic::AddImmediate;
+        uop.source0 = 0;
+        uop.immediate = dvrSignExtend(uop.encoding & 0xfffff000, 32);
+        return;
+    }
+    if (opcode == 0x17) { // AUIPC
+        uop.semantic = Semantic::AddImmediate;
+        uop.source0 = 0;
+        uop.immediate = static_cast<int64_t>(uop.pc) +
+            dvrSignExtend(uop.encoding & 0xfffff000, 32);
+        return;
+    }
+    if (opcode == 0x6f) { // JAL; redirect is handled by lane execution.
+        uop.semantic = Semantic::AddImmediate;
+        uop.source0 = 0;
+        uop.immediate = static_cast<int64_t>(uop.pc + 4);
+        return;
+    }
 
     if (opcode == 0x33) {
         if (funct3 == 0 && funct7 == 0) uop.semantic = Semantic::Add;
@@ -798,7 +873,7 @@ DVRInstructionRecorder::begin(const DynInstPtr &trigger)
 }
 
 bool
-DVRInstructionRecorder::record(const DynInstPtr &inst)
+DVRInstructionRecorder::record(const DynInstPtr &inst, bool tainted)
 {
     // The first instruction observed after a conditional branch is the
     // committed reconvergence boundary for this captured path.  Preserve it
@@ -828,6 +903,7 @@ DVRInstructionRecorder::record(const DynInstPtr &inst)
     uop.control = inst->isControl();
     uop.conditional = inst->isCondCtrl();
     uop.branchTaken = inst->pcState().branching();
+    uop.tainted = tainted;
     dvrDecodeRiscvSemantic(uop, inst);
     // RISC-V compressed control-flow instructions advance by two bytes.
     // Using a fixed four-byte fall-through silently sends C.BEQZ/C.BNEZ to
@@ -855,20 +931,21 @@ DVRInstructionRecorder::insertBeforePC(
         path.size() > MaxUops - count)
         return false;
 
-    unsigned insert = count;
+    bool has_reconvergence = false;
     for (unsigned index = 0; index < count; ++index) {
         if (uops[index].pc == reconvergence_pc) {
-            insert = index;
+            has_reconvergence = true;
             break;
         }
     }
-    if (insert == count)
+    if (!has_reconvergence)
         return false;
-
-    for (unsigned index = count; index > insert; --index)
-        uops[index + path.size() - 1] = uops[index - 1];
+    // PC, not physical array position, selects a helper successor.  Keeping
+    // the discovered path contiguous means its final sequential uop still
+    // reaches reconvergence; an alternate suffix appended here is entered
+    // only when a decoded branch actually selects its target PC.
     for (unsigned index = 0; index < path.size(); ++index)
-        uops[insert + index] = path[index];
+        uops[count + index] = path[index];
     count += path.size();
     return true;
 }
@@ -1128,8 +1205,8 @@ DVRVectorInstructionRegister::executeLanePC(
                 // conservative discovered-path behavior.  A response-driven
                 // continuation, in contrast, has a real source value and
                 // must evaluate the decoded architectural comparison.
-                bool lane_taken = (lhs != 0) == op.branchTaken;
-                if (start_index != 0 &&
+                bool lane_taken = op.branchTaken;
+                if (op.tainted && start_index != 0 &&
                     !op.evaluateBranch(lhs, rhs, lane_taken)) {
                     result.unsupportedControlFlow = true;
                     ++result.externalPathLanes;
@@ -1514,8 +1591,8 @@ DVRVectorInstructionRegister::resumeSourceLane(
         const RegVal rhs = op.source1 >= 0 ?
             vectorRegs[op.source1][lane] : 0;
         if (op.conditional) {
-            bool taken = false;
-            if (!op.evaluateBranch(lhs, rhs, taken)) {
+            bool taken = op.branchTaken;
+            if (op.tainted && !op.evaluateBranch(lhs, rhs, taken)) {
                 result.unsupportedControlFlow = true;
                 ++result.externalPathLanes;
                 taken = (lhs != 0) == op.branchTaken;
@@ -1812,8 +1889,8 @@ DVRVectorInstructionRegister::resumeSourceLanes(
             const RegVal rhs = op.source1 >= 0 ?
                 vectorRegs[op.source1][candidate_lane] : 0;
             if (op.conditional) {
-                bool taken = false;
-                if (!op.evaluateBranch(lhs, rhs, taken)) {
+                bool taken = op.branchTaken;
+                if (op.tainted && !op.evaluateBranch(lhs, rhs, taken)) {
                     result.unsupportedControlFlow = true;
                     ++result.externalPathLanes;
                     taken = (lhs != 0) == op.branchTaken;
@@ -2053,73 +2130,113 @@ DVRLoopBoundDetector::updateFinalLoad(Addr final_load_pc)
 {
     // FLR 改变后重新寻找包围完整依赖链的回边。
     finalLoadPC = final_load_pc;
+    lastComparePC = 0;
     loopBranchPC = 0;
     loopTargetPC = 0;
     boundSource0 = -1;
     boundSource1 = -1;
+    compareDestination = -1;
+    branchValue0 = 0;
+    branchValue1 = 0;
+    branchValuesValid = false;
+    comparison = Comparison::Unknown;
     seenBranch = false;
 }
 
 DVRLoopBoundDetector::Observation
-DVRLoopBoundDetector::observe(const DynInstPtr &inst)
+DVRLoopBoundDetector::observe(const DynInstPtr &inst,
+                              const RegisterSnapshot *regs)
 {
-    // 只关注直接的条件回跳分支。
+    uint64_t encoded = 0;
+    const size_t encoded_size = inst->staticInst->asBytes(
+        &encoded, sizeof(encoded));
+    const uint64_t opcode = encoded & 0x7f;
+    const uint64_t funct3 = (encoded >> 12) & 0x7;
+
+    // LCR: retain the most recent register-register SLT/SLTU after FLR.
+    // RISC-V materializes a compare result in an integer destination; a
+    // following BEQ/BNE must consume that destination to close the LCR/SBB
+    // pair described by the paper.
+    if (!seenBranch && finalLoadPC != 0 && encoded_size >= 4 &&
+        opcode == 0x33 && (funct3 == 2 || funct3 == 3)) {
+        int sources[2] = {-1, -1};
+        unsigned found = 0;
+        for (int idx = 0; idx < inst->numSrcRegs() && found < 2; ++idx) {
+            const RegId &src = inst->srcRegIdx(idx);
+            if (src.classValue() == IntRegClass)
+                sources[found++] = src.index();
+        }
+        int destination = -1;
+        for (int idx = 0; idx < inst->numDestRegs(); ++idx) {
+            const RegId &dest = inst->destRegIdx(idx);
+            if (dest.classValue() == IntRegClass) {
+                destination = dest.index();
+                break;
+            }
+        }
+        if (found == 2 && destination >= 0) {
+            lastComparePC = inst->pcState().instAddr();
+            boundSource0 = sources[0];
+            boundSource1 = sources[1];
+            compareDestination = destination;
+            comparison = funct3 == 2 ? Comparison::SignedLess :
+                                       Comparison::UnsignedLess;
+            branchValuesValid = false;
+        }
+        return {};
+    }
+
     if (!inst->isCondCtrl() || !inst->isDirectCtrl())
         return {};
-
     const Addr pc = inst->pcState().instAddr();
-    const Addr target = inst->branchTarget()->instAddr();
+    const auto target_state = inst->branchTarget();
+    if (!target_state)
+        return {};
+    const Addr target = target_state->instAddr();
     if (target > pc)
         return {};
 
     const bool encloses_chain = finalLoadPC != 0 && target <= triggerPC &&
                                 pc >= finalLoadPC;
-    // 回跳目标不晚于 trigger，且分支 PC 位于 FLR 之后，才包围完整链。
-    if (!seenBranch && encloses_chain) {
+    bool consumes_compare = false;
+    if (encoded_size >= 4 && opcode == 0x63 &&
+        (funct3 == 0 || funct3 == 1) && compareDestination >= 0) {
+        int integer_sources[2] = {-1, -1};
+        unsigned found = 0;
+        for (int idx = 0; idx < inst->numSrcRegs() && found < 2; ++idx) {
+            const RegId &src = inst->srcRegIdx(idx);
+            if (src.classValue() == IntRegClass)
+                integer_sources[found++] = src.index();
+        }
+        if (found == 2 &&
+            ((integer_sources[0] == compareDestination &&
+              integer_sources[1] == 0) ||
+             (integer_sources[1] == compareDestination &&
+              integer_sources[0] == 0))) {
+            consumes_compare = true;
+        }
+    }
+
+    if (!seenBranch && encloses_chain && consumes_compare) {
+        // BNE cmp, x0 takes the loop back-edge when compare is true; BEQ
+        // takes it when compare is false, so invert the LCR predicate.
+        if (funct3 == 0) {
+            if (comparison == Comparison::SignedLess)
+                comparison = Comparison::SignedGreaterEqual;
+            else if (comparison == Comparison::UnsignedLess)
+                comparison = Comparison::UnsignedGreaterEqual;
+        }
         loopBranchPC = pc;
         loopTargetPC = target;
-        uint64_t encoded = 0;
-        if (inst->staticInst->asBytes(&encoded, sizeof(encoded)) >= 4 &&
-            (encoded & 0x7f) == 0x63) {
-            switch ((encoded >> 12) & 0x7) {
-              case 0:
-                comparison = Comparison::Equal;
-                break;
-              case 1:
-                comparison = Comparison::NotEqual;
-                break;
-              case 4:
-                comparison = Comparison::SignedLess;
-                break;
-              case 5:
-                comparison = Comparison::SignedGreaterEqual;
-                break;
-              case 6:
-                comparison = Comparison::UnsignedLess;
-                break;
-              case 7:
-                comparison = Comparison::UnsignedGreaterEqual;
-                break;
-              default:
-                comparison = Comparison::Unknown;
-                break;
-            }
-        }
-        for (int idx = 0; idx < inst->numSrcRegs(); ++idx) {
-            const RegId &src = inst->srcRegIdx(idx);
-            if (src.classValue() != IntRegClass)
-                continue;
-            if (boundSource0 < 0)
-                boundSource0 = src.index();
-            else if (boundSource1 < 0) {
-                boundSource1 = src.index();
-                break;
-            }
+        if (regs) {
+            branchValue0 = (*regs)[boundSource0];
+            branchValue1 = (*regs)[boundSource1];
+            branchValuesValid = true;
         }
         seenBranch = true;
     }
 
-    return {true, seenBranch && encloses_chain};
+    return {true, seenBranch && encloses_chain && consumes_compare};
 }
 
 DVRLoopBoundDetector::Inference
@@ -2129,19 +2246,18 @@ DVRLoopBoundDetector::infer(const RegisterSnapshot &start,
 {
     // 一个寄存器应保持不变作为 bound，另一个应按固定步幅变化。
     Inference inference;
-    // A bound that cannot be proven must not silently become a 128-lane
-    // prefetch.  The paper's discovery path only vectorizes after a valid
-    // loop-control relation is established; callers treat lanes==0 as an
-    // explicit no-helper fallback.
-    inference.lanes = 0;
+    // Paper fallback: if the loop-control relation cannot be proven, still
+    // launch a bounded 128-element speculative runahead generation.
+    inference.fallback = true;
+    inference.lanes = std::min<unsigned>(128, max_lanes);
     if (!seenBranch || boundSource0 < 0 || boundSource1 < 0 ||
         boundSource0 >= MaxArchitecturalIntRegs ||
         boundSource1 >= MaxArchitecturalIntRegs)
         return inference;
 
     const RegVal start0 = start[boundSource0];
-    const RegVal finish0 = finish[boundSource0];
     const RegVal start1 = start[boundSource1];
+    const RegVal finish0 = finish[boundSource0];
     const RegVal finish1 = finish[boundSource1];
 
     RegVal bound;
@@ -2155,36 +2271,55 @@ DVRLoopBoundDetector::infer(const RegisterSnapshot &start,
         bound = finish1;
         current = finish0;
         increment = static_cast<int64_t>(finish0 - start0);
+    } else if (branchValuesValid && start0 == branchValue0 &&
+               start1 != branchValue1) {
+        bound = branchValue0;
+        current = branchValue1;
+        increment = static_cast<int64_t>(branchValue1 - start1);
+    } else if (branchValuesValid && start1 == branchValue1 &&
+               start0 != branchValue0) {
+        bound = branchValue1;
+        current = branchValue0;
+        increment = static_cast<int64_t>(branchValue0 - start0);
     } else {
         return inference;
     }
 
     uint64_t distance = 0;
     uint64_t step = 0;
-    const bool signed_compare =
-        comparison == Comparison::SignedLess ||
-        comparison == Comparison::SignedGreaterEqual;
     const int64_t signed_bound = static_cast<int64_t>(bound);
     const int64_t signed_current = static_cast<int64_t>(current);
-    const bool below_bound = signed_compare ?
-        signed_current < signed_bound : current < bound;
-    const bool above_bound = signed_compare ?
-        signed_current > signed_bound : current > bound;
-    if (increment > 0 && below_bound) {
-        distance = signed_compare ?
-            static_cast<uint64_t>(signed_bound - signed_current) :
-            bound - current;
+    switch (comparison) {
+      case Comparison::SignedLess:
+        if (increment <= 0 || signed_current >= signed_bound)
+            return inference;
+        distance = static_cast<uint64_t>(signed_bound - signed_current);
         step = increment;
-    } else if (increment < 0 && above_bound) {
-        distance = signed_compare ?
-            static_cast<uint64_t>(signed_current - signed_bound) :
-            current - bound;
+        break;
+      case Comparison::UnsignedLess:
+        if (increment <= 0 || current >= bound)
+            return inference;
+        distance = bound - current;
+        step = increment;
+        break;
+      case Comparison::SignedGreaterEqual:
+        if (increment >= 0 || signed_current < signed_bound)
+            return inference;
+        distance = static_cast<uint64_t>(signed_current - signed_bound) + 1;
         step = uint64_t(-(increment + 1)) + 1;
-    } else {
+        break;
+      case Comparison::UnsignedGreaterEqual:
+        if (increment >= 0 || current < bound)
+            return inference;
+        distance = current - bound + 1;
+        step = uint64_t(-(increment + 1)) + 1;
+        break;
+      default:
         return inference;
     }
 
     inference.matched = true;
+    inference.fallback = false;
     inference.bound = bound;
     inference.increment = increment;
     // 向上取整得到剩余迭代次数，再限制到最大 lane 数。
@@ -2198,10 +2333,15 @@ DVRLoopBoundDetector::reset()
 {
     triggerPC = 0;
     finalLoadPC = 0;
+    lastComparePC = 0;
     loopBranchPC = 0;
     loopTargetPC = 0;
     boundSource0 = -1;
     boundSource1 = -1;
+    compareDestination = -1;
+    branchValue0 = 0;
+    branchValue1 = 0;
+    branchValuesValid = false;
     comparison = Comparison::Unknown;
     seenBranch = false;
 }
