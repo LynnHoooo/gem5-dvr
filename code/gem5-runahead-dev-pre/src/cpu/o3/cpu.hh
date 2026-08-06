@@ -923,8 +923,11 @@ class CPU : public BaseCPU
         static constexpr unsigned VectorCopies = MaxLanes / LanesPerVectorCopy;
         static constexpr unsigned NumArchitecturalRegs =
             DVRLoopBoundDetector::MaxArchitecturalIntRegs;
-        static constexpr unsigned NumScalarPhysicalRegs = NumArchitecturalRegs;
-        static constexpr unsigned NumVectorPhysicalRegs = 32;
+        // Match the paper's helper-side physical-register budget: 256 scalar
+        // entries and 128 vector entries. The bank remains helper-private,
+        // but can now hold several vectorized destinations in flight.
+        static constexpr unsigned NumScalarPhysicalRegs = 256;
+        static constexpr unsigned NumVectorPhysicalRegs = 128;
         static constexpr unsigned NumPhysicalRegs =
             NumScalarPhysicalRegs + NumVectorPhysicalRegs;
 
@@ -933,6 +936,8 @@ class CPU : public BaseCPU
             std::array<RegVal, MaxLanes> values = {};
             std::array<Tick, MaxLanes> ready = {};
             std::array<uint64_t, 2> valid = {};
+            unsigned users = 0;
+            bool pendingRelease = false;
             bool vector = false;
             bool allocated = false;
         };
@@ -993,8 +998,42 @@ class CPU : public BaseCPU
         {
             if (phys < 0 || phys >= NumPhysicalRegs)
                 return;
+            auto &entry = physical[phys];
+            if (entry.users != 0) {
+                entry.pendingRelease = true;
+                return;
+            }
             allocated[phys] = false;
-            physical[phys] = PhysicalRegister();
+            entry = PhysicalRegister();
+        }
+
+        void retainPhysical(int16_t phys)
+        {
+            if (phys < 0 || phys >= NumPhysicalRegs || !allocated[phys])
+                return;
+            ++physical[phys].users;
+        }
+
+        void releasePhysical(int16_t phys)
+        {
+            if (phys < 0 || phys >= NumPhysicalRegs || !allocated[phys])
+                return;
+            auto &entry = physical[phys];
+            if (entry.users != 0)
+                --entry.users;
+            if (entry.users == 0 && entry.pendingRelease) {
+                allocated[phys] = false;
+                entry = PhysicalRegister();
+            }
+        }
+
+        int16_t physicalIndex(unsigned arch, unsigned lane) const
+        {
+            if (arch >= NumArchitecturalRegs || lane >= MaxLanes)
+                return -1;
+            const unsigned copy = lane / LanesPerVectorCopy;
+            return vrat[arch].vectorized ? vrat[arch].vector[copy] :
+                vrat[arch].scalar;
         }
 
         void reset()
@@ -1006,6 +1045,8 @@ class CPU : public BaseCPU
                 entry.values.fill(0);
                 entry.ready.fill(0);
                 entry.valid = {};
+                entry.users = 0;
+                entry.pendingRelease = false;
                 entry.vector = false;
                 entry.allocated = false;
             }
@@ -1052,6 +1093,11 @@ class CPU : public BaseCPU
                 }
             }
             vrat[arch].vectorized = true;
+            // The scalar mapping is no longer current, but may still be a
+            // source of an already-issued VIR copy. Defer reclamation until
+            // that copy retires.
+            if (old_scalar >= 0)
+                release(old_scalar);
             return true;
         }
 
@@ -1315,6 +1361,11 @@ class CPU : public BaseCPU
             unsigned copy = 0;
             std::array<uint64_t, 2> activeMask = {};
             std::vector<unsigned> lanes;
+            // Physical source names are captured at issue. The VRAT mapping
+            // can be renamed before this vector copy retires, so retirement
+            // must release these names rather than re-resolving arch regs.
+            std::vector<int16_t> source0Physical;
+            std::vector<int16_t> source1Physical;
             unsigned chunksRemaining = 1;
             Tick issueCycle = 0;
             Tick completeCycle = 0;
@@ -1628,6 +1679,12 @@ class CPU : public BaseCPU
                          it->destination == it->source1);
                     copy.deadSourceMask = copy.deadSource ?
                         it->activeMask : std::array<uint64_t, 2>{};
+                    if (it->program && it->program->helperRegs) {
+                        for (const auto phys : it->source0Physical)
+                            it->program->helperRegs->releasePhysical(phys);
+                        for (const auto phys : it->source1Physical)
+                            it->program->helperRegs->releasePhysical(phys);
+                    }
                     ++retired;
                     it = virBuffer.erase(it);
                 } else {

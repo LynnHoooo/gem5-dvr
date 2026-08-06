@@ -3664,11 +3664,27 @@ CPU::issueDVRReplayLanes(unsigned slots)
     dyn_uop.issueCycle = curTick();
     dyn_uop.state = DVRHelperThread::DVRDynUop::State::Ready;
     dyn_uop.lanes.reserve(group.size());
+    dyn_uop.source0Physical.reserve(group.size());
+    dyn_uop.source1Physical.reserve(group.size());
     for (Lane *lane : group) {
         dyn_uop.lanes.push_back(lane->lane);
         if (lane->lane < DVRHelperVectorRegisterFile::MaxLanes)
             dyn_uop.activeMask[lane->lane / 64] |=
                 uint64_t(1) << (lane->lane % 64);
+        const int16_t source0_phys =
+            lane->program->helperRegs && uop.source0 >= 0 ?
+            lane->program->helperRegs->physicalIndex(
+                uop.source0, lane->lane) : -1;
+        const int16_t source1_phys =
+            lane->program->helperRegs && uop.source1 >= 0 ?
+            lane->program->helperRegs->physicalIndex(
+                uop.source1, lane->lane) : -1;
+        dyn_uop.source0Physical.push_back(source0_phys);
+        dyn_uop.source1Physical.push_back(source1_phys);
+        if (lane->program->helperRegs) {
+            lane->program->helperRegs->retainPhysical(source0_phys);
+            lane->program->helperRegs->retainPhysical(source1_phys);
+        }
     }
     ++cpuStats.dvrVIRActiveMaskChecks;
     const unsigned mask_lanes =
@@ -4142,6 +4158,13 @@ CPU::serviceDVRPrefetchQueue()
         else {
             ++cpuStats.dvrDependentPrefetchTranslationFaults;
         }
+        // Keep the exact virtual address and provenance available in the
+        // workload trace.  A speculative fault can be a real out-of-range
+        // lane, a bad dependent value, or a valid high-address stack lane;
+        // aggregate counters alone cannot distinguish these cases.
+        dvrTraceDependency("translation_fault", curTick(), prefetch.pc,
+                           prefetch.pc, prefetch.address,
+                           prefetch.source ? 1 : 0, prefetch.lane);
         finish_helper_entry(DVRHelperLoadState::TranslationFault);
         if (prefetch.source)
             retireDVRPredicateLane(

@@ -4,7 +4,7 @@
 % suffix is .m.  The authoritative source comparison is the paper at
 % /home/lynnhoo/dvr-repro/decouple vector runahead.md.
 
-STATUS = 'mechanism-level implementation; paper-level gaps remain';
+STATUS = 'mechanism-level implementation with paper-sized helper VRAT; strict workload gaps remain';
 BRANCH = 'docs/dvr-reproduction-plan';
 LOCAL_HEAD = 'working-tree (early-exit reset pending commit)';
 REMOTE_HEAD = 'b5642dd';
@@ -20,10 +20,13 @@ REMOTE_MERGED = true;
 %    stride and target architectural register; VTT/Discovery propagates taint.
 %    Loop-bound inference now rejects observed early exits and handles signed
 %    induction deltas without unsigned wraparound.
-% 2. VRAT: implemented in helper-private form.  All architectural integer
-%    registers first map to helper scalar physical entries copied from the
-%    committed register snapshot.  The trigger destination maps to 16 vector
-%    copies, 8 x 64-bit elements each (128 scalar-equivalent lanes).
+% 2. VRAT: implemented in helper-private form with the paper-sized budget.
+%    All architectural integer registers first map to helper scalar physical
+%    entries copied from the committed register snapshot.  The trigger
+%    destination maps to 16 vector copies, 8 x 64-bit elements each (128
+%    scalar-equivalent lanes); the bank now has 256 scalar and 128 vector
+%    physical names.  VIR issue captures physical source IDs and retirement
+%    releases them, so overwritten names are deferred while still in use.
 % 3. VIR: implemented as an execution-driven 16-copy model.  Each copy now
 %    has active/issued/executed/dead-source masks and an in-flight count.
 %    Vectorized sources cause a destination vector bundle allocation.
@@ -40,9 +43,10 @@ REMOTE_MERGED = true;
 
 % Explicit non-completions
 % - VRAT is not mapped into the main O3 UnifiedFreeList/ROB/rename map.  This
-%   is deliberate: the helper is an independent in-order subthread.  The
-%   remaining work is exact dead-source reclamation and full scalar/vector WAW
-%   rename behavior.
+%   is deliberate: the helper is an independent in-order subthread.  Scalar
+%   WAW renaming across divergent subsets still needs a dedicated per-copy
+%   mapping; the current deferred-release path covers physical source lifetime
+%   but does not claim full branch-subset rename equivalence.
 % - VIR scheduling, helper LSU merge behavior, frontend retry timing and NDM
 %   control flow are still execution-driven approximations, not bit-exact
 %   paper hardware.
@@ -66,7 +70,8 @@ REMOTE_MERGED = true;
 %   Note: the binary recorded complete suffixes, but this run did not expose
 %   the opposite branch as a cache lookup; it is not evidence of alternate
 %   replay failure by itself.
-% BFS, serial GAPBS -g6 -n1 (binary rebuilt after early-exit reset):
+% BFS, serial GAPBS -g6 -n1 (binary rebuilt after early-exit reset and VRAT
+% physical-lifetime changes):
 %   graph completed (64 nodes, 390 edges);
 %   baseline/full committed = 1207080/1207082;
 %   full loop-bound matches/vector programs = 196/196;
@@ -75,20 +80,21 @@ REMOTE_MERGED = true;
 %   gate is NOT PASS; resetting earlyExitSeen at each FLR did not change this count.
 %   Alternate cache lookups/hits/complete-hits = 2179/75/0;
 %   alternate uops/targets/demand-covered/resumes = 125/8/2/0.
+%   Fault provenance shows 359 source lanes past the current graph allocation
+%   and 28 dependent lanes at address 0x8; these are speculative fallback
+%   addresses, not architectural faults.
 %   strict committed-instruction gate = NOT PASS (difference 2).
-% Camel trace binary:
+% Camel trace binary (same rebuilt binary for both runs):
 %   baseline/full program result = 2125659619/2125659619;
-%   full helper/vector execution completed without translation fault;
-%   baseline/full committed = 6874840/6874833;
-%   strict committed-instruction gate = NOT PASS (difference 7).
-%   A scalar helper run (without --dvr-vector-chunks) reproduced the baseline
-%   committed count 6874840 and had zero translation faults; the vector-chunk
-%   mode remains the failing gate.
+%   baseline/full committed = 6874814/6874814;
+%   full helper/vector translation faults = 0; strict Camel committed gate
+%   PASS for this run.  Older 6874840/6874833 results came from a different
+%   generated Camel image/build and are retained only as historical evidence.
 %   After the dependent-prefetch gate fix, --dvr-no-dependent-prefetch reports
 %   dependent issued/completed = 0/0 as required.
 % Baseline repeat control:
-%   Camel baseline repeated twice at 6874840/6874840, so the 7-instruction
-%   vector-mode difference is deterministic and must not be ignored.
+%   Camel baseline/full were rerun from the same generated image after the
+%   paper-sized VRAT update; both committed counts are 6874814.
 % LBD/VTT microbenchmark:
 %   dvr_lbd_vtt completed with no alternate path observed; its run reached
 %   the normal exit path and reported max same-PC group width 8.  Baseline/full
