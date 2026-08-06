@@ -6,8 +6,8 @@
 
 STATUS = 'mechanism-level implementation with paper-sized helper VRAT; strict workload gaps remain';
 BRANCH = 'docs/dvr-reproduction-plan';
-LOCAL_HEAD = '8c9fe47';
-REMOTE_HEAD = '8c9fe47';
+LOCAL_HEAD = 'fcd2480';
+REMOTE_HEAD = 'fcd2480';
 REMOTE_MERGED = true;
 
 % Merge audit
