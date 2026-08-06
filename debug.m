@@ -18,6 +18,8 @@ REMOTE_MERGED = true;
 % Paper-to-code mapping
 % 1. Stride detector/VTT: implemented.  The detector identifies trigger PC,
 %    stride and target architectural register; VTT/Discovery propagates taint.
+%    Loop-bound inference now rejects observed early exits and handles signed
+%    induction deltas without unsigned wraparound.
 % 2. VRAT: implemented in helper-private form.  All architectural integer
 %    registers first map to helper scalar physical entries copied from the
 %    committed register snapshot.  The trigger destination maps to 16 vector
