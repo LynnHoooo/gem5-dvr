@@ -84,6 +84,17 @@ REMOTE_MERGED = true;
 %   and 28 dependent lanes at address 0x8; these are speculative fallback
 %   addresses, not architectural faults.
 %   strict committed-instruction gate = NOT PASS (difference 2).
+% Latest strict-bound BFS rerun (2026-08-06):
+%   command uses --dvr-no-bounded-fallback, which disables only launches
+%   without a proven loop bound while retaining exact-bound replay.
+%   evidence: /home/lynnhoo/dvr-repro/results/bfs-no-fallback2/
+%   baseline/full committed = 1207080/1207082;
+%   loop-bound matches/vector programs = 195/195;
+%   source/dependent translation faults = 0/0;
+%   dependent issued/completed = 377/377.
+%   The BFS graph completes normally, but the committed strict gate remains
+%   NOT PASS (delta 2).  The delta persists with fallback disabled, so it is
+%   separate from the previously diagnosed out-of-range speculative lanes.
 % Camel trace binary (same rebuilt binary for both runs):
 %   baseline/full program result = 2125659619/2125659619;
 %   baseline/full committed = 6874814/6874814;

@@ -174,6 +174,7 @@ CPU::CPU(const BaseO3CPUParams &params)
       dvrMaxLanes(params.dvrMaxLanes),
       dvrHelperMaxUops(params.dvrHelperMaxUops),
       dvrEnableDependentPrefetch(params.dvrEnableDependentPrefetch),
+      dvrAllowBoundedFallback(params.dvrAllowBoundedFallback),
       oraclePrefetch(params.oraclePrefetch),
       oracleTraceFile(params.oracleTraceFile),
       oracleLookahead(params.oracleLookahead),
@@ -2533,7 +2534,8 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 // no NDM/precise-loop admission is granted, but the helper
                 // can still issue up to 128 speculative future strides.
                 const bool fallback_allowed =
-                    dvrMode != "discovery" && !inference.matched &&
+                    dvrAllowBoundedFallback && dvrMode != "discovery" &&
+                    !inference.matched &&
                     inference.fallback && inference.lanes != 0 &&
                     dvrInstructionRecorder.size() > 1 &&
                     committed_flr != 0 &&
@@ -4103,6 +4105,15 @@ CPU::serviceDVRPrefetchQueue()
     dvrQueuedPrefetchAddresses.erase(prefetch.address);
     if (!prefetch.source)
         dvrQueuedDependentLines.erase(dvrPrefetchLine(prefetch.address));
+    if (prefetch.source && prefetch.predicate &&
+        prefetch.predicate->sourceTranslationFaulted) {
+        // A contiguous source stream has already crossed an unmapped page;
+        // mask the not-yet-issued lanes instead of probing the same invalid
+        // suffix repeatedly.
+        ++cpuStats.dvrPrefetchesDropped;
+        retireDVRPredicateLane(prefetch.predicate, prefetch.lane, false);
+        return;
+    }
     const uint64_t helper_load_id = dvrNextHelperLoadId++;
     dvrHelperLoadEntries.emplace(helper_load_id, DVRHelperLoadEntry{
         prefetch.address, 0, prefetch.pc, prefetch.lane, prefetch.tid,
@@ -4165,6 +4176,8 @@ CPU::serviceDVRPrefetchQueue()
         dvrTraceDependency("translation_fault", curTick(), prefetch.pc,
                            prefetch.pc, prefetch.address,
                            prefetch.source ? 1 : 0, prefetch.lane);
+        if (prefetch.source && prefetch.predicate)
+            prefetch.predicate->sourceTranslationFaulted = true;
         finish_helper_entry(DVRHelperLoadState::TranslationFault);
         if (prefetch.source)
             retireDVRPredicateLane(
@@ -4424,7 +4437,7 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
                 // RISC-V user virtual addresses in this SE model are below
                 // the canonical 47-bit boundary.  Do not enqueue an affine
                 // target that can only become an MMU translation fault.
-                if (dependent.address == 0 ||
+                if (dependent.address < 4096 ||
                     dependent.address >= (Addr(1) << 47)) {
                     continue;
                 }
@@ -4680,7 +4693,7 @@ CPU::replayDVRSource(const DVRPrefetchSenderState &state,
             }
             DVRPrefetchAddress dependent;
             dependent.address = static_cast<Addr>(result);
-            if (dependent.address == 0 ||
+            if (dependent.address < 4096 ||
                 dependent.address >= (Addr(1) << 47))
                 return false;
             const Addr line = dvrPrefetchLine(dependent.address);

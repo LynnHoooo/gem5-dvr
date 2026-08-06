@@ -197,6 +197,8 @@ class BaseO3CPU(BaseCPU):
         "Element width used to form 512-bit DVR chunks")
     dvrEnableDependentPrefetch = Param.Bool(True,
         "Enable DVR dependent target prefetch generation")
+    dvrAllowBoundedFallback = Param.Bool(True,
+        "Allow bounded speculative launches without a proven loop bound")
     dvrDiscoveryMaxInsts = Param.Unsigned(512,
         "一次 DVR 发现区间允许提交的最大指令数")
     dvrNDMThreshold = Param.Unsigned(64,

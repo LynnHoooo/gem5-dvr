@@ -192,6 +192,9 @@ def parse_args():
         help="Override the maximum DVR source lanes for bounded-window experiments",
     )
     parser.add_argument("--dvr-no-dependent-prefetch", action="store_true")
+    parser.add_argument(
+        "--dvr-no-bounded-fallback", action="store_true",
+        help="Disable speculative launches without a proven loop bound")
     parser.add_argument("--discovery-max-insts", type=int, default=512)
     parser.add_argument("--dvr-ndm-threshold", type=int, default=64)
     parser.add_argument("--dvr-ndm-max-insts", type=int, default=512)
@@ -243,6 +246,7 @@ def main():
         dvrVectorUnlimitedFU=args.dvr_unlimited_vector_fu,
         dvrVectorElementBits=args.dvr_vector_element_bits,
         dvrEnableDependentPrefetch=not args.dvr_no_dependent_prefetch,
+        dvrAllowBoundedFallback=not args.dvr_no_bounded_fallback,
         dvrNDMThreshold=args.dvr_ndm_threshold,
         dvrNDMMaxInsts=args.dvr_ndm_max_insts,
     )

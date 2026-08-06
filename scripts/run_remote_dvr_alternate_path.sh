@@ -108,6 +108,7 @@ run_workload() {
         >"$baseline/stdout.log" 2>&1
     DVR_TRACE_DIR="$trace" "$GEM5" --outdir="$full" "$CONFIG" --cmd="$bench" \
         --dvr --dvr-mode=full --dvr-vector-chunks \
+        --dvr-no-bounded-fallback \
         "${options[@]}" \
         >"$full/stdout.log" 2>&1
 

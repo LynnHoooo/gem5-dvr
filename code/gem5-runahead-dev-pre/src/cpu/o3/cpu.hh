@@ -1194,6 +1194,10 @@ class CPU : public BaseCPU
         DVRLanePredicateTracker tracker;
         bool divergenceCounted = false;
         bool reported = false;
+        // A source translation fault invalidates the remaining speculative
+        // lanes of this generation; they must not continue issuing past the
+        // first proven-invalid element of a bounded stride stream.
+        bool sourceTranslationFaulted = false;
     };
 
     struct DVRPrefetchSenderState : public Packet::SenderState
@@ -1266,6 +1270,7 @@ class CPU : public BaseCPU
     unsigned dvrMaxLanes;
     unsigned dvrHelperMaxUops;
     bool dvrEnableDependentPrefetch;
+    bool dvrAllowBoundedFallback;
     bool oraclePrefetch;
     std::string oracleTraceFile;
     unsigned oracleLookahead;
