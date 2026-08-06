@@ -4,61 +4,21 @@
 
 ## 当前未解决
 
-### 2026-08-06：资源仲裁、VRAT 与专项回归状态
-
-1. **Helper memory/LSQ arbitration 已收紧**：helper request 现在只有在 (a) 主线程
-   本周期未用尽 LSU budget、(b) 16-entry helper LQ 未满、(c) 主 LSQ 对该 thread 仍有
-   free load entry 时才能使用同一个 LSQ data port；timing response 返回时释放 helper-LQ
-   reservation。helper load 仍不创建可 commit 的 `DynInst`，这是为了避免 transient
-   prefetch 错误进入 ROB/commit/squash 语义。
-
-2. **VRAT 的正确边界**：当前 `DVRHelperVectorRegisterFile` 是 helper-owned、有限的
-   physical bank，存放每 lane 的 transient 值；它不应直接从 `UnifiedFreeList` 借主线程
-   scalar physical registers。后者没有 vector-lane storage，且会把 transient helper
-   生命周期耦合进 rename/ROB reclaim。共享资源模型应覆盖 FU、LSQ data port、MMU、cache
-   和 DRAM；helper register bank 保持独立，符合论文的 DVR 子线程所有权。
-
-3. **VTT/LBD 专项 gate**：已实现 VTT dispatch undo、显式 `slt/sltu + beq/bne` LCR/SBB、
-   RISC-V `blt/bge/bltu/bgeu` 虚拟 LCR，以及 `min(128, max_lanes)` loop-bound fallback。
-   下次端到端回归必须分别覆盖：显式 LCR、fused LCR、mispredict squash、无 bound fallback、
-   divergent path、短 inner-loop NDM。现有 `run_remote_dvr_helper_regression.sh` 已覆盖
-   divergent path 与 NDM；其余四项需要独立 microbenchmark gate 后才可标为验证完成。
-
-4. **VIR 16-copy state**：helper VIR 现在固定为 16 个 copy slot，每 slot 管理一个
-   8-lane 512-bit copy 的 active mask、PC/uop、issued、executed 与 dead-source 状态。
-   同一 copy 在其前一个 helper DynUop 完成前不可重发；不同 copy 仍可在共享 FU 可用时
-   独立 issue。该项已通过 `cpu.o` 编译，仍需在有 RISC-V toolchain 的节点运行
-   `run_remote_dvr_helper_regression.sh` 验证 16-copy occupancy、分歧与 replay 守恒。
-
-### P0：论文级 helper 微结构
-
-1. **P0 helper 实现尚待合入主 worktree 并做端到端回归**：`dvr-p0-helper` 的
-   `7658292`、`ee19b8f` 已实现 helper 私有 VRAT physical bank/free-list、16-copy
-   VIR mask/state、16-entry helper LQ、8-entry timing frontend 和 helper DynUop。
-   这些是论文所需的独立 in-order subthread 状态，不应改为主 O3 的第二条 ROB 线程。
-   但当前主 worktree 的 `cpu.cc/.hh/pre.cc/.hh` 有并行未提交修改，必须先做冲突审查、
-   合并并重新验证，不能在主分支提前宣称已生效。
-
-2. **NDM 仍是 execution-driven data-plane model**：branch inversion、IR/ILR/LCR、
-   outer invocation collection 和 128-lane flatten 已有，但还不是论文级 bit-exact NDM
-   helper pipeline。
-
-3. **共享资源仲裁仍是近似模型**：helper 已使用共享 FU pool、O3 data port、MMU 和
-   cache hierarchy，但 fetch/decode 竞争仍以 residual-width 近似；需要在合入后做
-   main-priority、round-robin、unlimited/constrained FU 的敏感性验证。
-
 ### P1：算法和 workload 覆盖
 
-1. loop-bound detector 仍偏向简单 induction loop；复杂 compare、复杂 induction
-   expression、中途进入、early exit 和一般 LCR/SBB 组合仍可能 fallback。
+1. loop-bound detector 已覆盖显式 `slt/sltu + beq/bne`、fused `bne` 和
+   `blt/bge/bltu/bgeu`，但复杂 compare、复杂 induction expression、中途进入、一般
+   LCR/SBB 组合和带 live-out 的 early exit 仍可能 fallback，需要继续专项覆盖。
 
 2. `LBU/LHU` 已进入构建，不再作为缺口；但更多 arithmetic、word operation、indirect
    control-flow、break/early-exit 和 path live-out 组合仍需专项测试。
 
-3. BFS/Camel 的 cross-discovery alternate coverage 仍未完成：最新 multi-workload 回归中
-   BFS/Camel 虽然分别有 `complete_hits=7/6`，但 `alternate_uops=0`、
-   `alternate_targets=0`、`demand_covered=0`。缓存命中尚未进入实际 continuation，仍需
-   修复命中后的 lane admission/replay 链，并用 BFS/Camel 重新证明 dependent coverage。
+3. BFS/Camel 的严格 alternate-path demand coverage 仍未完成。真实 serial GAPBS BFS
+   `-g 11 -n 1` 已经产生 `complete_hits=2`、`alternate_uops=99`、
+   `alternate_targets=1`，说明 cache-to-lane admission/replay 已接通；但该 target 的
+   `alternate_demand_covered=0`、`reconvergence_resume=0`，所以 timeliness/路径恢复仍
+   未被证明。当前 Camel 实际 workload 的普通 DVR 路径有效，但本次没有暴露 alternate
+   complete path（`complete_hits=0`），不能沿用旧的 complete-hit 结果声称 Camel 已覆盖。
 
 ### P2：资源模型和论文复现
 
@@ -73,9 +33,11 @@
 
 ## Alternate-path 当前判断
 
-当前 unresolved 的边界是：`dvr_divergent.riscv` 的 alternate continuation 已经能够生成
-dependent target，但 BFS/Camel 只有 cached complete hit，尚未产生 alternate continuation
-uop。因此不能把缓存命中统计当成 cross-discovery coverage 已完成。
+`dvr_divergent.riscv` 的 alternate continuation 已能生成 dependent target、覆盖 demand
+并恢复 reconvergence；真实 BFS 也已跨过 cached-hit 到 alternate uop/target 的 admission
+门槛。当前剩余问题是 BFS target 的时序覆盖，以及 Camel 没有在实际输入中产生可观察的
+alternate complete path。后续应针对这两个 workload 调整输入或增加专项 workload，而不是
+把 zero hit 误判为执行链失败。
 
 ## 并行 P0 期间可继续做的非冲突修改
 
@@ -87,7 +49,7 @@ uop。因此不能把缓存命中统计当成 cross-discovery coverage 已完成
 
 ## 已解决过程与验证记录
 
-### P0 独立 helper 子线程（待合入主 worktree）
+### P0 独立 helper 子线程（已合入主 worktree并完成 smoke 验证）
 
 `dvr-p0-helper` 分支的 `7658292` 和 `ee19b8f` 已完成以下子线程内部结构：
 
@@ -104,8 +66,10 @@ uop。因此不能把缓存命中统计当成 cross-discovery coverage 已完成
   decoder 返回 `StaticInst` 后才提供 ready credit；
 - helper 与主线程共享 FU pool、MMU、data port、cache/DRAM，但不进入主 O3 的 IQ/ROB。
 
-这解决的是旧文档中“没有 helper-owned physical/16-copy/LQ/8-entry frontend 状态”的
-缺口；不等于主 worktree 已验证完成，也不等于论文 NDM 已 bit-exact。
+这解决了旧文档中“没有 helper-owned physical/16-copy/LQ/8-entry frontend 状态”的
+缺口；主 worktree 已能编译并在 Camel/BFS/LBD 回归中产生 helper DynUop 生命周期统计。
+这仍不等于论文 NDM 已 bit-exact；helper 不进入主线程 ROB/commit，fetch/decode 仲裁也
+仍是显式 helper frontend 的近似模型。
 
 ### Helper fetch/decode
 

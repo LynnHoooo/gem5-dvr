@@ -12,6 +12,11 @@ set -euo pipefail
 # dvr_divergent is the strict functional gate.  BFS and Camel are reported in
 # the same CSV, but are not required to manufacture an alternate path: a zero
 # is an observation about workload coverage, not a failed implementation test.
+#
+# For the real serial GAPBS binary, use for example:
+#   BENCHES=/path/dvr_divergent.riscv,/path/gapbs/bfs,/path/camel.riscv \
+#   BFS_OPTIONS='-g 11 -n 1' REQUIRE_BFS_ALTERNATE=1 \
+#   scripts/run_remote_dvr_alternate_path.sh
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
@@ -21,6 +26,9 @@ GEM5="${GEM5:-$ROOT/build/RISCV/gem5.opt}"
 CONFIG="${CONFIG:-$ROOT/configs/dvr/table1_se.py}"
 OUT_ROOT="${OUT_ROOT:-/home/lynnhoo/dvr-repro/results/dvr-next-alternate-path}"
 RUN_ID="$(date +%Y%m%dT%H%M%S)-$$"
+BFS_OPTIONS="${BFS_OPTIONS:--g 11 -n 1}"
+REQUIRE_BFS_ALTERNATE="${REQUIRE_BFS_ALTERNATE:-0}"
+REQUIRE_CAMEL_ALTERNATE="${REQUIRE_CAMEL_ALTERNATE:-0}"
 
 if [[ -n "${BENCHES:-}" ]]; then
     BENCH_SPEC="$BENCHES"
@@ -89,12 +97,18 @@ run_workload() {
     local baseline="$workload_out/baseline"
     local full="$workload_out/full"
     local trace="$full/trace"
+    local options=()
+    case "$name" in
+        bfs) options=(--options="$BFS_OPTIONS") ;;
+    esac
 
     mkdir -p "$baseline" "$trace"
     "$GEM5" --outdir="$baseline" "$CONFIG" --cmd="$bench" \
+        "${options[@]}" \
         >"$baseline/stdout.log" 2>&1
     DVR_TRACE_DIR="$trace" "$GEM5" --outdir="$full" "$CONFIG" --cmd="$bench" \
         --dvr --dvr-mode=full --dvr-vector-chunks \
+        "${options[@]}" \
         >"$full/stdout.log" 2>&1
 
     [[ -s "$baseline/stats.txt" && -s "$full/stats.txt" ]] || {
@@ -106,6 +120,20 @@ run_workload() {
     baseline_committed="$(read_stat "$baseline/stats.txt" system.cpu.committedInsts)"
     full_committed="$(read_stat "$full/stats.txt" system.cpu.committedInsts)"
     equal "$name committed_instructions" "$full_committed" "$baseline_committed"
+    case "$name" in
+        bfs)
+            grep -q 'BFS Tree has' "$full/stdout.log" || {
+                printf 'error: %s did not complete BFS\n' "$name" >&2
+                exit 1
+            }
+            ;;
+        camel)
+            grep -q '^Result ' "$full/stdout.log" || {
+                printf 'error: %s did not complete Camel\n' "$name" >&2
+                exit 1
+            }
+            ;;
+    esac
     stats="$full/stats.txt"
 
     local complete_hits alternate_uops alternate_targets alternate_covered
@@ -175,6 +203,19 @@ run_workload() {
         positive "$name trace_single_lane_alternate_uops" "$trace_alt_single"
         positive "$name trace_partial_chunk_alternate_uops" "$trace_alt_partial"
         status="strict_pass"
+    elif [[ "$name" == "bfs" && "$REQUIRE_BFS_ALTERNATE" == 1 ]]; then
+        # A real BFS run is allowed to terminate an alternate lane at its FLR:
+        # target generation proves cache-to-lane admission; demand coverage
+        # and reconvergence are reported independently rather than required.
+        positive "$name alternate_path_complete_hits" "$complete_hits"
+        positive "$name alternate_path_uops_replayed" "$alternate_uops"
+        positive "$name alternate_path_dependent_targets" "$alternate_targets"
+        status="bfs_alternate_pass"
+    elif [[ "$name" == "camel" && "$REQUIRE_CAMEL_ALTERNATE" == 1 ]]; then
+        positive "$name alternate_path_complete_hits" "$complete_hits"
+        positive "$name alternate_path_uops_replayed" "$alternate_uops"
+        positive "$name alternate_path_dependent_targets" "$alternate_targets"
+        status="camel_alternate_pass"
     elif [[ "$alternate_uops" -gt 0 || "$alternate_targets" -gt 0 ||
             "$alternate_covered" -gt 0 ]]; then
         status="alternate_observed"

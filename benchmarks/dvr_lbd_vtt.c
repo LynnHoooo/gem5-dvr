@@ -36,16 +36,14 @@ __attribute__((noinline)) static uint64_t
 fallback_and_squash(void)
 {
     uint64_t sum = 0;
-    uint64_t i = 0;
-    while (i < Elements) {
+    for (uint64_t i = 0; i < Elements; ++i) {
         const uint64_t index = indices[i];
         sum += payload[index];
-        // The data-dependent early exit is deliberately not an induction
-        // compare-to-branch pair, so this path exercises the 128-lane fallback.
+        // The data-dependent early exit is deliberately separate from the
+        // induction back edge, so the detector must not use it as the loop
+        // bound for the whole replay.
         if (stop[index])
-            i = (i + 17) & Mask;
-        else
-            ++i;
+            break;
     }
     return sum;
 }

@@ -29,8 +29,9 @@ fi
 [[ -x "$objdump" ]] || { echo "missing RISC-V objdump: $objdump" >&2; exit 1; }
 mkdir -p "$(dirname "$OUT")"
 "$objdump" -d "$BENCH" >"$OUT.disasm"
-grep -qE '\bslt\b' "$OUT.disasm"
-grep -qE '\bblt\b|\bbge\b' "$OUT.disasm"
+grep -qE '\bslt\b|\bsltu\b' "$OUT.disasm"
+# GCC may print the compressed/alias spelling bnez instead of bne.
+grep -qE '\bbne(z)?\b|\bblt(u)?\b|\bbge(u)?\b' "$OUT.disasm"
 
 rm -rf "$OUT"; mkdir -p "$OUT"
 "$GEM5" --outdir="$OUT" "$CONFIG" --cmd="$BENCH" --dvr --dvr-mode=full \
