@@ -2198,16 +2198,17 @@ DVRLoopBoundDetector::observe(const DynInstPtr &inst,
 
     const bool encloses_chain = finalLoadPC != 0 && target <= triggerPC &&
                                 pc >= finalLoadPC;
+    int integer_sources[2] = {-1, -1};
+    unsigned found = 0;
+    for (int idx = 0; idx < inst->numSrcRegs() && found < 2; ++idx) {
+        const RegId &src = inst->srcRegIdx(idx);
+        if (src.classValue() == IntRegClass)
+            integer_sources[found++] = src.index();
+    }
+
     bool consumes_compare = false;
     if (encoded_size >= 4 && opcode == 0x63 &&
         (funct3 == 0 || funct3 == 1) && compareDestination >= 0) {
-        int integer_sources[2] = {-1, -1};
-        unsigned found = 0;
-        for (int idx = 0; idx < inst->numSrcRegs() && found < 2; ++idx) {
-            const RegId &src = inst->srcRegIdx(idx);
-            if (src.classValue() == IntRegClass)
-                integer_sources[found++] = src.index();
-        }
         if (found == 2 &&
             ((integer_sources[0] == compareDestination &&
               integer_sources[1] == 0) ||
@@ -2217,7 +2218,35 @@ DVRLoopBoundDetector::observe(const DynInstPtr &inst,
         }
     }
 
-    if (!seenBranch && encloses_chain && consumes_compare) {
+    // RISC-V commonly fuses the compare and branch.  Model BLT/BGE/BLTU/BGEU
+    // as a virtual LCR whose result is consumed by that same branch, rather
+    // than forcing normal compiler output down the 128-lane fallback path.
+    bool virtual_compare = false;
+    if (!seenBranch && encoded_size >= 4 && opcode == 0x63 && found == 2 &&
+        funct3 >= 4 && funct3 <= 7) {
+        switch (funct3) {
+          case 4:
+            comparison = Comparison::SignedLess;
+            break;
+          case 5:
+            comparison = Comparison::SignedGreaterEqual;
+            break;
+          case 6:
+            comparison = Comparison::UnsignedLess;
+            break;
+          case 7:
+            comparison = Comparison::UnsignedGreaterEqual;
+            break;
+        }
+        lastComparePC = pc;
+        boundSource0 = integer_sources[0];
+        boundSource1 = integer_sources[1];
+        compareDestination = -1;
+        virtual_compare = true;
+    }
+
+    if (!seenBranch && encloses_chain &&
+        (consumes_compare || virtual_compare)) {
         // BNE cmp, x0 takes the loop back-edge when compare is true; BEQ
         // takes it when compare is false, so invert the LCR predicate.
         if (funct3 == 0) {
@@ -2236,7 +2265,8 @@ DVRLoopBoundDetector::observe(const DynInstPtr &inst,
         seenBranch = true;
     }
 
-    return {true, seenBranch && encloses_chain && consumes_compare};
+    return {true, seenBranch && encloses_chain &&
+                  (consumes_compare || virtual_compare)};
 }
 
 DVRLoopBoundDetector::Inference
