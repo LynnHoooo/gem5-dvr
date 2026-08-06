@@ -1,6 +1,7 @@
 #include "cpu/o3/pre.hh"
 
 #include <algorithm>
+#include <limits>
 
 #include "cpu/o3/dyn_inst.hh"
 
@@ -2193,6 +2194,8 @@ DVRLoopBoundDetector::observe(const DynInstPtr &inst,
     if (!target_state)
         return {};
     const Addr target = target_state->instAddr();
+    if (seenBranch && target > pc && target > loopBranchPC)
+        earlyExitSeen = true;
     if (target > pc)
         return {};
 
@@ -2284,7 +2287,8 @@ DVRLoopBoundDetector::infer(const RegisterSnapshot &start,
     // launch a bounded 128-element speculative runahead generation.
     inference.fallback = true;
     inference.lanes = std::min<unsigned>(128, max_lanes);
-    if (!seenBranch || boundSource0 < 0 || boundSource1 < 0 ||
+    if (!seenBranch || earlyExitSeen || boundSource0 < 0 ||
+        boundSource1 < 0 ||
         boundSource0 >= MaxArchitecturalIntRegs ||
         boundSource1 >= MaxArchitecturalIntRegs)
         return inference;
@@ -2297,24 +2301,39 @@ DVRLoopBoundDetector::infer(const RegisterSnapshot &start,
     RegVal bound;
     RegVal current;
     int64_t increment;
+    const auto signedDelta = [](RegVal finish_value,
+                                RegVal start_value) -> int64_t {
+        constexpr RegVal max_int64 = static_cast<RegVal>(
+            std::numeric_limits<int64_t>::max());
+        if (finish_value >= start_value) {
+            const RegVal delta = finish_value - start_value;
+            return delta > max_int64 ?
+                std::numeric_limits<int64_t>::max() :
+                static_cast<int64_t>(delta);
+        }
+        const RegVal delta = start_value - finish_value;
+        return delta > max_int64 ?
+            std::numeric_limits<int64_t>::min() :
+            -static_cast<int64_t>(delta);
+    };
     if (start0 == finish0 && start1 != finish1) {
         bound = finish0;
         current = finish1;
-        increment = static_cast<int64_t>(finish1 - start1);
+        increment = signedDelta(finish1, start1);
     } else if (start1 == finish1 && start0 != finish0) {
         bound = finish1;
         current = finish0;
-        increment = static_cast<int64_t>(finish0 - start0);
+        increment = signedDelta(finish0, start0);
     } else if (branchValuesValid && start0 == branchValue0 &&
                start1 != branchValue1) {
         bound = branchValue0;
         current = branchValue1;
-        increment = static_cast<int64_t>(branchValue1 - start1);
+        increment = signedDelta(branchValue1, start1);
     } else if (branchValuesValid && start1 == branchValue1 &&
                start0 != branchValue0) {
         bound = branchValue1;
         current = branchValue0;
-        increment = static_cast<int64_t>(branchValue0 - start0);
+        increment = signedDelta(branchValue0, start0);
     } else {
         return inference;
     }
@@ -2402,6 +2421,7 @@ DVRLoopBoundDetector::reset()
     branchValuesValid = false;
     comparison = Comparison::Unknown;
     seenBranch = false;
+    earlyExitSeen = false;
 }
 
 SST::SST(CPU *_cpu, const BaseO3CPUParams &params)

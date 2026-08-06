@@ -486,6 +486,7 @@ class DVRLoopBoundDetector
     bool branchValuesValid = false;
     Comparison comparison = Comparison::Unknown;
     bool seenBranch = false;
+    bool earlyExitSeen = false;
 
   public:
     static constexpr unsigned MaxArchitecturalIntRegs = 32;
