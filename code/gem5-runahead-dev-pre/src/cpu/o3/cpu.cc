@@ -927,6 +927,8 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Helper load entries retried by data-port backpressure"),
       ADD_STAT(dvrHelperLoadEntryDropped, statistics::units::Count::get(),
                "Helper load entries dropped before a memory request"),
+      ADD_STAT(dvrHelperLoadEntryPending, statistics::units::Count::get(),
+               "Helper load entries still waiting at simulation end"),
       ADD_STAT(dvrHelperLoadEntryWakeups, statistics::units::Count::get(),
                "Helper replay wakeups from load responses"),
       ADD_STAT(dvrHelperLoadEntryPeak, statistics::units::Count::get(),
@@ -4091,6 +4093,7 @@ CPU::serviceDVRPrefetchQueue()
         prefetch.source, prefetch.nested, DVRHelperLoadState::Allocated,
         curTick(), 0, 0});
     ++cpuStats.dvrHelperLoadEntriesAllocated;
+    cpuStats.dvrHelperLoadEntryPending = dvrHelperLoadEntries.size();
     dvrHelperLoadEntryPeakValue = std::max<uint64_t>(
         dvrHelperLoadEntryPeakValue, dvrHelperLoadEntries.size());
     cpuStats.dvrHelperLoadEntryPeak = dvrHelperLoadEntryPeakValue;
@@ -4106,6 +4109,7 @@ CPU::serviceDVRPrefetchQueue()
         else if (state == DVRHelperLoadState::Dropped)
             ++cpuStats.dvrHelperLoadEntryDropped;
         dvrHelperLoadEntries.erase(entry);
+        cpuStats.dvrHelperLoadEntryPending = dvrHelperLoadEntries.size();
     };
     const unsigned request_bytes = dvrPrefetchBytes(prefetch);
     const unsigned line_offset = prefetch.address & (cacheLineSize() - 1);
@@ -4456,6 +4460,7 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
         helper_entry->second.state = DVRHelperLoadState::Completed;
         ++cpuStats.dvrHelperLoadEntriesCompleted;
         dvrHelperLoadEntries.erase(helper_entry);
+        cpuStats.dvrHelperLoadEntryPending = dvrHelperLoadEntries.size();
     }
     dvrHelperThread.complete();
     if (!dvrHelperThread.active() && !dvrPrefetchQueue.empty()) {

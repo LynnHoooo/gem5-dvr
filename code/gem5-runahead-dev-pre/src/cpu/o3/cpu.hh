@@ -775,6 +775,7 @@ class CPU : public BaseCPU
         statistics::Scalar dvrHelperLoadEntryFaults;
         statistics::Scalar dvrHelperLoadEntryRetries;
         statistics::Scalar dvrHelperLoadEntryDropped;
+        statistics::Scalar dvrHelperLoadEntryPending;
         statistics::Scalar dvrHelperLoadEntryWakeups;
         statistics::Scalar dvrHelperLoadEntryPeak;
         statistics::Scalar dvrMainIssueSlotsUsed;
