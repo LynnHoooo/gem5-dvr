@@ -912,6 +912,25 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Captured helper multiply uops profiled"),
       ADD_STAT(dvrHelperLSUOps, statistics::units::Count::get(),
                "Captured helper load/store uops profiled"),
+      ADD_STAT(dvrHelperLoadEntriesAllocated,
+               statistics::units::Count::get(),
+               "Helper load queue entries allocated"),
+      ADD_STAT(dvrHelperLoadEntriesCompleted,
+               statistics::units::Count::get(),
+               "Helper load queue entries completed"),
+      ADD_STAT(dvrHelperLoadEntryWritebacks,
+               statistics::units::Count::get(),
+               "Helper load responses that woke a helper context"),
+      ADD_STAT(dvrHelperLoadEntryFaults, statistics::units::Count::get(),
+               "Helper load entries terminated by translation fault"),
+      ADD_STAT(dvrHelperLoadEntryRetries, statistics::units::Count::get(),
+               "Helper load entries retried by data-port backpressure"),
+      ADD_STAT(dvrHelperLoadEntryDropped, statistics::units::Count::get(),
+               "Helper load entries dropped before a memory request"),
+      ADD_STAT(dvrHelperLoadEntryWakeups, statistics::units::Count::get(),
+               "Helper replay wakeups from load responses"),
+      ADD_STAT(dvrHelperLoadEntryPeak, statistics::units::Count::get(),
+               "Peak helper load queue entries in flight"),
       ADD_STAT(dvrMainIssueSlotsUsed, statistics::units::Count::get(),
                "Demand instructions executed before DVR arbitration"),
       ADD_STAT(dvrMainALUSlotsUsed, statistics::units::Count::get(),
@@ -2897,6 +2916,10 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
     ++cpuStats.dvrHelperVRATPrograms;
     if (replay->count != 0) {
         replay->triggerDestination = dvrInstructionRecorder[0].destination;
+        if (replay->triggerDestination >= 0 &&
+            replay->triggerDestination <
+                DVRLoopBoundDetector::MaxArchitecturalIntRegs)
+            replay->helperRegs->vectorize(replay->triggerDestination);
         replay->valid = replay->scalarCount > 1 &&
             replay->triggerDestination > 0 &&
             replay->triggerDestination <
@@ -3180,6 +3203,10 @@ CPU::launchDVRNestedPrefetches(
     if (replay->count != 0) {
         replay->triggerDestination =
             dvrNestedContext.recorder[0].destination;
+        if (replay->triggerDestination >= 0 &&
+            replay->triggerDestination <
+                DVRLoopBoundDetector::MaxArchitecturalIntRegs)
+            replay->helperRegs->vectorize(replay->triggerDestination);
         replay->valid = replay->scalarCount > 1 &&
             replay->triggerDestination > 0 &&
             replay->triggerDestination <
@@ -3649,8 +3676,12 @@ CPU::issueDVRReplayLanes(unsigned slots)
         ++cpuStats.dvrVIRActiveMaskFailures;
     auto &copy = dvrHelperThread.virCopies.at(dyn_uop.copy);
     copy.activeMask = dyn_uop.activeMask;
+    copy.issuedMask = dyn_uop.activeMask;
+    copy.executedMask = {};
+    copy.deadSourceMask = {};
     copy.pc = uop.pc;
     copy.uopIndex = seed->uopIndex;
+    copy.inFlight = 1;
     copy.active = true;
     copy.issued = true;
     copy.executed = false;
@@ -3817,6 +3848,10 @@ CPU::issueDVRReplayLanes(unsigned slots)
                 ++cpuStats.dvrPredicateMisses;
                 continue;
             }
+            if (!dvrEnableDependentPrefetch) {
+                lane->active = false;
+                continue;
+            }
             const Addr line = dvrPrefetchLine(result);
             if (dvrQueuedDependentLines.count(line) == 0 &&
                 dvrDependentOutstandingLines.count(line) == 0 &&
@@ -3867,6 +3902,16 @@ CPU::issueDVRReplayLanes(unsigned slots)
 
         if (lane_uop.destination >= 0 &&
             lane_uop.destination < DVRLoopBoundDetector::MaxArchitecturalIntRegs) {
+            // A destination fed by a vectorized source gets the paper's
+            // 16-copy VRAT mapping before its first lane result is written.
+            // The trigger load is already vectorized during helper launch.
+            const bool vector_source = lane->program->helperRegs &&
+                ((lane_uop.source0 >= 0 &&
+                  lane->program->helperRegs->isVectorized(lane_uop.source0)) ||
+                 (lane_uop.source1 >= 0 &&
+                  lane->program->helperRegs->isVectorized(lane_uop.source1)));
+            if (vector_source)
+                lane->program->helperRegs->vectorize(lane_uop.destination);
             lane->regs[lane_uop.destination] = result;
             lane->readyCycle[lane_uop.destination] = ready_tick;
             if (lane->program->helperRegs)
@@ -4040,6 +4085,28 @@ CPU::serviceDVRPrefetchQueue()
     dvrQueuedPrefetchAddresses.erase(prefetch.address);
     if (!prefetch.source)
         dvrQueuedDependentLines.erase(dvrPrefetchLine(prefetch.address));
+    const uint64_t helper_load_id = dvrNextHelperLoadId++;
+    dvrHelperLoadEntries.emplace(helper_load_id, DVRHelperLoadEntry{
+        prefetch.address, 0, prefetch.pc, prefetch.lane, prefetch.tid,
+        prefetch.source, prefetch.nested, DVRHelperLoadState::Allocated,
+        curTick(), 0, 0});
+    ++cpuStats.dvrHelperLoadEntriesAllocated;
+    dvrHelperLoadEntryPeakValue = std::max<uint64_t>(
+        dvrHelperLoadEntryPeakValue, dvrHelperLoadEntries.size());
+    cpuStats.dvrHelperLoadEntryPeak = dvrHelperLoadEntryPeakValue;
+    auto finish_helper_entry = [&](DVRHelperLoadState state) {
+        auto entry = dvrHelperLoadEntries.find(helper_load_id);
+        if (entry == dvrHelperLoadEntries.end())
+            return;
+        entry->second.state = state;
+        if (state == DVRHelperLoadState::TranslationFault)
+            ++cpuStats.dvrHelperLoadEntryFaults;
+        else if (state == DVRHelperLoadState::Retry)
+            ++cpuStats.dvrHelperLoadEntryRetries;
+        else if (state == DVRHelperLoadState::Dropped)
+            ++cpuStats.dvrHelperLoadEntryDropped;
+        dvrHelperLoadEntries.erase(entry);
+    };
     const unsigned request_bytes = dvrPrefetchBytes(prefetch);
     const unsigned line_offset = prefetch.address & (cacheLineSize() - 1);
     if (line_offset + request_bytes > cacheLineSize()) {
@@ -4048,6 +4115,7 @@ CPU::serviceDVRPrefetchQueue()
         // crosses a cache line; it would violate BaseCache's single-block
         // packet contract.  A later aligned lane can still provide coverage.
         ++cpuStats.dvrPrefetchesDropped;
+        finish_helper_entry(DVRHelperLoadState::Dropped);
         if (prefetch.source)
             retireDVRPredicateLane(prefetch.predicate, prefetch.lane, false);
         return;
@@ -4070,6 +4138,7 @@ CPU::serviceDVRPrefetchQueue()
         else {
             ++cpuStats.dvrDependentPrefetchTranslationFaults;
         }
+        finish_helper_entry(DVRHelperLoadState::TranslationFault);
         if (prefetch.source)
             retireDVRPredicateLane(
                 prefetch.predicate, prefetch.lane, false);
@@ -4085,14 +4154,18 @@ CPU::serviceDVRPrefetchQueue()
     PacketPtr pkt = new Packet(
         req, prefetch.source ? MemCmd::ReadReq : MemCmd::SoftPFReq);
     pkt->allocate();
-    pkt->senderState = new DVRPrefetchSenderState(
+    auto *sender_state = new DVRPrefetchSenderState(
         prefetch.source, prefetch.nested, prefetch.oracle,
         prefetch.relationCount, prefetch.scales,
         prefetch.offsets, prefetch.masks, prefetch.patterns, prefetch.replay,
         prefetch.predicate, prefetch.lane, prefetch.tid);
+    sender_state->helperLoadId = helper_load_id;
+    sender_state->issueTick = curTick();
+    pkt->senderState = sender_state;
     auto &port = iew.ldstQueue.getDataPort();
     if (!port.tryTiming(pkt)) {
         ++cpuStats.dvrPrefetchesSuppressedMainThread;
+        finish_helper_entry(DVRHelperLoadState::Retry);
         // Main-thread priority is arbitration, not a reason to lose the
         // helper request.  Retain the bounded queue entry and retry it on a
         // later cycle; otherwise dependent replay is systematically erased
@@ -4108,6 +4181,7 @@ CPU::serviceDVRPrefetchQueue()
     }
     if (!port.sendTimingReq(pkt)) {
         ++cpuStats.dvrPrefetchesRejectedBackpressure;
+        finish_helper_entry(DVRHelperLoadState::Retry);
         dvrPrefetchQueue.push_front(prefetch);
         dvrQueuedPrefetchAddresses.insert(prefetch.address);
         if (!prefetch.source && !prefetch.oracle)
@@ -4116,6 +4190,12 @@ CPU::serviceDVRPrefetchQueue()
         pkt->senderState = nullptr;
         delete pkt;
         return;
+    }
+    if (auto entry = dvrHelperLoadEntries.find(helper_load_id);
+        entry != dvrHelperLoadEntries.end()) {
+        entry->second.physicalAddress = req->getPaddr();
+        entry->second.issueTick = curTick();
+        entry->second.state = DVRHelperLoadState::WaitingResponse;
     }
     ++cpuStats.dvrPrefetchesIssued;
     ++dvrHelperLoadQueueOccupancy;
@@ -4148,6 +4228,12 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
 {
     auto *state = dynamic_cast<DVRPrefetchSenderState*>(pkt->senderState);
     assert(state);
+    auto helper_entry = dvrHelperLoadEntries.find(state->helperLoadId);
+    if (helper_entry != dvrHelperLoadEntries.end()) {
+        helper_entry->second.state = DVRHelperLoadState::Writeback;
+        helper_entry->second.responseTick = curTick();
+        ++cpuStats.dvrHelperLoadEntryWritebacks;
+    }
     assert(dvrHelperLoadQueueOccupancy != 0);
     --dvrHelperLoadQueueOccupancy;
     ++cpuStats.dvrPrefetchesCompleted;
@@ -4176,6 +4262,7 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
     }
     dvrCompletedPrefetchLines[line] = curTick();
     if (state->source && pkt->hasData()) {
+        ++cpuStats.dvrHelperLoadEntryWakeups;
         // Read exactly the architectural width requested by the trigger and
         // apply RISC-V load-value semantics before installing the value in
         // the helper VRAT.  Reading a fixed RegVal here would incorrectly
@@ -4365,6 +4452,11 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
     }
     if (state->nested)
         ++cpuStats.dvrNestedHelpersCompleted;
+    if (helper_entry != dvrHelperLoadEntries.end()) {
+        helper_entry->second.state = DVRHelperLoadState::Completed;
+        ++cpuStats.dvrHelperLoadEntriesCompleted;
+        dvrHelperLoadEntries.erase(helper_entry);
+    }
     dvrHelperThread.complete();
     if (!dvrHelperThread.active() && !dvrPrefetchQueue.empty()) {
         // Source responses can arrive after the captured program's frontend

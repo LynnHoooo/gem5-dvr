@@ -910,30 +910,95 @@ class CPU : public BaseCPU
     struct DVRHelperVectorRegisterFile
     {
         static constexpr unsigned MaxLanes = DVRLanePredicateTracker::MaxLanes;
+        static constexpr unsigned LanesPerVectorCopy = 8;
+        static constexpr unsigned VectorCopies = MaxLanes / LanesPerVectorCopy;
         static constexpr unsigned NumArchitecturalRegs =
             DVRLoopBoundDetector::MaxArchitecturalIntRegs;
-        static constexpr unsigned NumPhysicalRegs = 64;
+        static constexpr unsigned NumScalarPhysicalRegs = NumArchitecturalRegs;
+        static constexpr unsigned NumVectorPhysicalRegs = 32;
+        static constexpr unsigned NumPhysicalRegs =
+            NumScalarPhysicalRegs + NumVectorPhysicalRegs;
 
         struct PhysicalRegister
         {
             std::array<RegVal, MaxLanes> values = {};
             std::array<Tick, MaxLanes> ready = {};
             std::array<uint64_t, 2> valid = {};
+            bool vector = false;
+            bool allocated = false;
         };
 
-        std::array<int16_t, NumArchitecturalRegs> vrat = {};
+        struct Mapping
+        {
+            int16_t scalar = -1;
+            std::array<int16_t, VectorCopies> vector = {};
+            bool vectorized = false;
+
+            Mapping() { vector.fill(-1); }
+        };
+
+        std::array<Mapping, NumArchitecturalRegs> vrat = {};
         std::array<PhysicalRegister, NumPhysicalRegs> physical = {};
-        unsigned nextPhysical = 0;
+        std::array<bool, NumPhysicalRegs> allocated = {};
+
+        int16_t allocateScalar()
+        {
+            for (unsigned phys = 0; phys < NumScalarPhysicalRegs; ++phys) {
+                if (!allocated[phys]) {
+                    allocated[phys] = true;
+                    physical[phys].allocated = true;
+                    physical[phys].vector = false;
+                    return phys;
+                }
+            }
+            return -1;
+        }
+
+        std::array<int16_t, VectorCopies> allocateVectorBundle()
+        {
+            std::array<int16_t, VectorCopies> result;
+            result.fill(-1);
+            unsigned found = 0;
+            for (unsigned phys = NumScalarPhysicalRegs;
+                 phys < NumPhysicalRegs && found < VectorCopies; ++phys) {
+                if (!allocated[phys]) {
+                    allocated[phys] = true;
+                    physical[phys].allocated = true;
+                    physical[phys].vector = true;
+                    result[found++] = phys;
+                }
+            }
+            if (found != VectorCopies) {
+                for (auto phys : result) {
+                    if (phys >= 0) {
+                        allocated[phys] = false;
+                        physical[phys] = PhysicalRegister();
+                    }
+                }
+                result.fill(-1);
+            }
+            return result;
+        }
+
+        void release(int16_t phys)
+        {
+            if (phys < 0 || phys >= NumPhysicalRegs)
+                return;
+            allocated[phys] = false;
+            physical[phys] = PhysicalRegister();
+        }
 
         void reset()
         {
-            nextPhysical = 0;
-            for (unsigned reg = 0; reg < NumArchitecturalRegs; ++reg)
-                vrat[reg] = -1;
+            allocated.fill(false);
+            for (auto &entry : vrat)
+                entry = Mapping();
             for (auto &entry : physical) {
                 entry.values.fill(0);
                 entry.ready.fill(0);
                 entry.valid = {};
+                entry.vector = false;
+                entry.allocated = false;
             }
         }
 
@@ -941,8 +1006,11 @@ class CPU : public BaseCPU
         {
             reset();
             for (unsigned arch = 0; arch < NumArchitecturalRegs; ++arch) {
-                vrat[arch] = nextPhysical++;
-                auto &entry = physical[vrat[arch]];
+                const int16_t phys = allocateScalar();
+                if (phys < 0)
+                    break;
+                vrat[arch].scalar = phys;
+                auto &entry = physical[phys];
                 for (unsigned lane = 0; lane < MaxLanes; ++lane) {
                     entry.values[lane] = regs[arch];
                     entry.valid[lane / 64] |= uint64_t(1) << (lane % 64);
@@ -950,42 +1018,97 @@ class CPU : public BaseCPU
             }
         }
 
+        // The trigger destination is the first architectural register that
+        // becomes vectorized.  Its scalar snapshot is copied into the 16
+        // vector physical registers before the first striding-load response
+        // overwrites individual lanes.
+        bool vectorize(unsigned arch)
+        {
+            if (arch >= NumArchitecturalRegs || vrat[arch].vectorized)
+                return arch < NumArchitecturalRegs;
+            const auto bundle = allocateVectorBundle();
+            if (bundle[0] < 0)
+                return false;
+            const int16_t old_scalar = vrat[arch].scalar;
+            for (unsigned copy = 0; copy < VectorCopies; ++copy) {
+                vrat[arch].vector[copy] = bundle[copy];
+                auto &dst = physical[bundle[copy]];
+                for (unsigned lane = 0; lane < LanesPerVectorCopy; ++lane) {
+                    const unsigned global = copy * LanesPerVectorCopy + lane;
+                    dst.values[lane] = old_scalar >= 0 ?
+                        physical[old_scalar].values[global] : 0;
+                    dst.ready[lane] = old_scalar >= 0 ?
+                        physical[old_scalar].ready[global] : 0;
+                    dst.valid[lane / 64] |= uint64_t(1) << (lane % 64);
+                }
+            }
+            vrat[arch].vectorized = true;
+            return true;
+        }
+
+        bool isVectorized(unsigned arch) const
+        {
+            return arch < NumArchitecturalRegs && vrat[arch].vectorized;
+        }
+
         int16_t rename(unsigned arch)
         {
             if (arch >= NumArchitecturalRegs)
                 return -1;
-            if (nextPhysical >= NumPhysicalRegs)
-                nextPhysical = 0;
-            vrat[arch] = nextPhysical++;
-            physical[vrat[arch]] = PhysicalRegister();
-            return vrat[arch];
+            const int16_t phys = allocateScalar();
+            if (phys < 0)
+                return -1;
+            if (vrat[arch].vectorized) {
+                for (const auto old : vrat[arch].vector)
+                    release(old);
+            } else {
+                release(vrat[arch].scalar);
+            }
+            vrat[arch] = Mapping();
+            vrat[arch].scalar = phys;
+            return phys;
         }
 
         RegVal read(unsigned arch, unsigned lane) const
         {
-            if (arch >= NumArchitecturalRegs || lane >= MaxLanes ||
-                vrat[arch] < 0)
+            if (arch >= NumArchitecturalRegs || lane >= MaxLanes)
                 return 0;
-            return physical[vrat[arch]].values[lane];
+            const unsigned copy = lane / LanesPerVectorCopy;
+            const unsigned element = lane % LanesPerVectorCopy;
+            const int16_t phys = vrat[arch].vectorized ?
+                vrat[arch].vector[copy] : vrat[arch].scalar;
+            return phys < 0 ? 0 : physical[phys].values[
+                vrat[arch].vectorized ? element : lane];
         }
 
         Tick readyAt(unsigned arch, unsigned lane) const
         {
-            if (arch >= NumArchitecturalRegs || lane >= MaxLanes ||
-                vrat[arch] < 0)
+            if (arch >= NumArchitecturalRegs || lane >= MaxLanes)
                 return 0;
-            return physical[vrat[arch]].ready[lane];
+            const unsigned copy = lane / LanesPerVectorCopy;
+            const unsigned element = lane % LanesPerVectorCopy;
+            const int16_t phys = vrat[arch].vectorized ?
+                vrat[arch].vector[copy] : vrat[arch].scalar;
+            return phys < 0 ? 0 : physical[phys].ready[
+                vrat[arch].vectorized ? element : lane];
         }
 
         void write(unsigned arch, unsigned lane, RegVal value, Tick ready_tick)
         {
-            if (arch >= NumArchitecturalRegs || lane >= MaxLanes ||
-                vrat[arch] < 0)
+            if (arch >= NumArchitecturalRegs || lane >= MaxLanes)
                 return;
-            auto &entry = physical[vrat[arch]];
-            entry.values[lane] = value;
-            entry.ready[lane] = ready_tick;
-            entry.valid[lane / 64] |= uint64_t(1) << (lane % 64);
+            const unsigned copy = lane / LanesPerVectorCopy;
+            const unsigned element = lane % LanesPerVectorCopy;
+            const int16_t phys = vrat[arch].vectorized ?
+                vrat[arch].vector[copy] : vrat[arch].scalar;
+            if (phys < 0)
+                return;
+            auto &entry = physical[phys];
+            const unsigned stored_lane = vrat[arch].vectorized ? element : lane;
+            entry.values[stored_lane] = value;
+            entry.ready[stored_lane] = ready_tick;
+            entry.valid[stored_lane / 64] |=
+                uint64_t(1) << (stored_lane % 64);
         }
     };
 
@@ -1193,8 +1316,12 @@ class CPU : public BaseCPU
         struct VIRCopyState
         {
             std::array<uint64_t, 2> activeMask = {};
+            std::array<uint64_t, 2> issuedMask = {};
+            std::array<uint64_t, 2> executedMask = {};
+            std::array<uint64_t, 2> deadSourceMask = {};
             Addr pc = 0;
             unsigned uopIndex = 0;
+            unsigned inFlight = 0;
             bool active = false;
             bool issued = false;
             bool executed = false;
@@ -1478,7 +1605,17 @@ class CPU : public BaseCPU
                     auto &copy = virCopies.at(it->copy);
                     copy.issued = false;
                     copy.executed = true;
-                    copy.deadSource = it->destination < 0;
+                    for (unsigned word = 0; word < 2; ++word) {
+                        copy.executedMask[word] |= it->activeMask[word];
+                        copy.issuedMask[word] &= ~it->activeMask[word];
+                    }
+                    if (copy.inFlight != 0)
+                        --copy.inFlight;
+                    copy.deadSource = it->destination >= 0 &&
+                        (it->destination == it->source0 ||
+                         it->destination == it->source1);
+                    copy.deadSourceMask = copy.deadSource ?
+                        it->activeMask : std::array<uint64_t, 2>{};
                     ++retired;
                     it = virBuffer.erase(it);
                 } else {
