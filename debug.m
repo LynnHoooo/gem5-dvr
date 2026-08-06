@@ -29,6 +29,9 @@ REMOTE_MERGED = true;
 %    eight-entry helper-local buffer are implemented; it is not O3 fetch/IQ.
 % 5. Helper memory: MMU/data-port/cache requests use helper sender state and a
 %    private 16-entry outstanding-load bound with retry and completion release.
+%    Each request now has a helperLoadId and Allocated/Retry/WaitingResponse/
+%    Writeback/Completed/Fault/Dropped state; response writeback and wakeup are
+%    counted independently of the main DynInst/LQ lifecycle.
 % 6. Branch/reconvergence: per-lane PC, branch masks and bounded stack are
 %    implemented.  NDM has branch inversion, outer invocation collection and
 %    max-16 invocation/max-128 flattening.
