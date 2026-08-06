@@ -6,13 +6,15 @@
 
 STATUS = 'mechanism-level implementation with paper-sized helper VRAT; strict workload gaps remain';
 BRANCH = 'docs/dvr-reproduction-plan';
-LOCAL_HEAD = '30f87e4';
-REMOTE_HEAD = '30f87e4';
+LOCAL_HEAD = 'd458b8e';
+REMOTE_HEAD = 'd458b8e';
 REMOTE_MERGED = true;
 
 % Merge audit
 % origin/docs/dvr-reproduction-plan was merged first at b5642dd and now points
-% to 30f87e4.  User benchmark/scripts and untracked trace artifacts were
+% to d458b8e.  gem5-dvr-next contains the equivalent cherry-pick fe865cc;
+% its pre-existing deleted debug.m is intentionally preserved.  User
+% benchmark/scripts and untracked trace artifacts were
 % preserved outside the commits.
 
 % Paper-to-code mapping
