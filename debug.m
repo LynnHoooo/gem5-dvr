@@ -6,14 +6,14 @@
 
 STATUS = 'mechanism-level implementation with paper-sized helper VRAT; strict workload gaps remain';
 BRANCH = 'docs/dvr-reproduction-plan';
-LOCAL_HEAD = 'working-tree (early-exit reset pending commit)';
-REMOTE_HEAD = 'b5642dd';
+LOCAL_HEAD = '30f87e4';
+REMOTE_HEAD = '30f87e4';
 REMOTE_MERGED = true;
 
 % Merge audit
-% origin/docs/dvr-reproduction-plan (b5642dd) is an ancestor of de2f0bc.
-% No cherry-pick was required.  User benchmark/scripts and the uncommitted
-% helper VRAT edits were preserved.
+% origin/docs/dvr-reproduction-plan was merged first at b5642dd and now points
+% to 30f87e4.  User benchmark/scripts and untracked trace artifacts were
+% preserved outside the commits.
 
 % Paper-to-code mapping
 % 1. Stride detector/VTT: implemented.  The detector identifies trigger PC,
@@ -112,8 +112,10 @@ REMOTE_MERGED = true;
 
 % Evidence locations
 % BFS result:
-%   /home/lynnhoo/dvr-repro/results/vrat-vir-bfs-g6/
+%   /home/lynnhoo/dvr-repro/results/bfs-vrat-v2/
 % Camel result:
-%   /home/lynnhoo/dvr-repro/results/vrat-vir-camel/
+%   /home/lynnhoo/dvr-repro/results/camel-vrat-v2/
 % Microbenchmark result:
-%   /home/lynnhoo/dvr-repro/results/vrat-vir-regression/
+%   /home/lynnhoo/dvr-repro/results/vrat-v2-lbd/
+% NDM result:
+%   /home/lynnhoo/dvr-repro/results/stage13-vrat-v2c/
