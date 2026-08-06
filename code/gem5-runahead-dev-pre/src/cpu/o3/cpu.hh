@@ -740,6 +740,7 @@ class CPU : public BaseCPU
         statistics::Scalar dvrHelperDecodeBlockedByMain;
         statistics::Scalar dvrHelperVIRCapacityStalls;
         statistics::Scalar dvrHelperVRATPrograms;
+        statistics::Scalar dvrHelperSharedVRATPrograms;
         statistics::Scalar dvrHelperVRATWrites;
         statistics::Scalar dvrHelperReadyUopCycles;
         statistics::Scalar dvrHelperReadyOccupancySamples;
@@ -936,8 +937,17 @@ class CPU : public BaseCPU
             std::array<RegVal, MaxLanes> values = {};
             std::array<Tick, MaxLanes> ready = {};
             std::array<uint64_t, 2> valid = {};
+            // In paper mode this entry names a slot in the O3 physical
+            // register file.  The local value array remains as metadata for
+            // private-bank mode and for per-lane ready/valid state.
+            PhysRegIdPtr sharedId = nullptr;
+            std::array<PhysRegIdPtr, LanesPerVectorCopy> sharedIds = {};
             unsigned users = 0;
             bool pendingRelease = false;
+            // A shared physical name cannot be returned while another lane
+            // of this replay template may still read the old mapping.  The
+            // template destructor returns deferred names as a unit.
+            bool deferredToTemplateEnd = false;
             bool vector = false;
             bool allocated = false;
         };
@@ -955,13 +965,96 @@ class CPU : public BaseCPU
         std::array<PhysicalRegister, NumPhysicalRegs> physical = {};
         std::array<bool, NumPhysicalRegs> allocated = {};
 
+        PhysRegFile *sharedRegFile = nullptr;
+        UnifiedFreeList *sharedFreeList = nullptr;
+
+        void configureSharedPhysicalBank(PhysRegFile *reg_file,
+                                          UnifiedFreeList *free_list)
+        {
+            sharedRegFile = reg_file;
+            sharedFreeList = free_list;
+        }
+
+        bool usesSharedPhysicalBank() const
+        {
+            return sharedRegFile != nullptr && sharedFreeList != nullptr;
+        }
+
+        ~DVRHelperVectorRegisterFile()
+        {
+            // Replay templates can outlive the helper thread.  Return every
+            // borrowed physical name when the last template reference dies.
+            releaseAll();
+        }
+
+        void releaseAll()
+        {
+            for (unsigned phys = 0; phys < NumPhysicalRegs; ++phys) {
+                if (!allocated[phys])
+                    continue;
+                auto &entry = physical[phys];
+                if (usesSharedPhysicalBank()) {
+                    if (entry.sharedId)
+                        sharedFreeList->addReg(entry.sharedId);
+                    for (auto shared_id : entry.sharedIds)
+                        if (shared_id)
+                            sharedFreeList->addReg(shared_id);
+                }
+                allocated[phys] = false;
+                entry = PhysicalRegister();
+            }
+        }
+
+        RegVal readPhysical(int16_t phys, unsigned lane) const
+        {
+            if (phys < 0 || phys >= NumPhysicalRegs ||
+                !allocated[phys] || lane >= MaxLanes)
+                return 0;
+            const auto &entry = physical[phys];
+            // A scalar physical name is a single O3 value, while the helper
+            // still carries one scalar value per lane until that register is
+            // vectorized.  Never overwrite the shared scalar slot once per
+            // lane; that would collapse the lane state to the last writer.
+            if (usesSharedPhysicalBank() && entry.vector) {
+                const auto shared_id = entry.sharedIds[lane %
+                    LanesPerVectorCopy];
+                if (shared_id)
+                    return sharedRegFile->getReg(shared_id);
+            }
+            return entry.values[lane];
+        }
+
+        void writePhysical(int16_t phys, unsigned lane, RegVal value)
+        {
+            if (phys < 0 || phys >= NumPhysicalRegs ||
+                !allocated[phys] || lane >= MaxLanes)
+                return;
+            auto &entry = physical[phys];
+            if (usesSharedPhysicalBank() && entry.vector) {
+                const auto shared_id = entry.sharedIds[lane %
+                    LanesPerVectorCopy];
+                if (shared_id)
+                    sharedRegFile->setReg(shared_id, value);
+            }
+            entry.values[lane] = value;
+        }
+
         int16_t allocateScalar()
         {
             for (unsigned phys = 0; phys < NumScalarPhysicalRegs; ++phys) {
                 if (!allocated[phys]) {
+                    PhysRegIdPtr shared_id = nullptr;
+                    if (usesSharedPhysicalBank() &&
+                        sharedFreeList->hasFreeRegs(IntRegClass)) {
+                        // Shared names are opportunistic.  The helper still
+                        // owns a local scalar slot when the O3 free list is
+                        // temporarily exhausted by other live templates.
+                        shared_id = sharedFreeList->getReg(IntRegClass);
+                    }
                     allocated[phys] = true;
                     physical[phys].allocated = true;
                     physical[phys].vector = false;
+                    physical[phys].sharedId = shared_id;
                     return phys;
                 }
             }
@@ -976,9 +1069,29 @@ class CPU : public BaseCPU
             for (unsigned phys = NumScalarPhysicalRegs;
                  phys < NumPhysicalRegs && found < VectorCopies; ++phys) {
                 if (!allocated[phys]) {
+                    std::array<PhysRegIdPtr, LanesPerVectorCopy> shared_ids = {};
+                    if (usesSharedPhysicalBank()) {
+                        bool enough = true;
+                        for (unsigned element = 0;
+                             element < LanesPerVectorCopy; ++element) {
+                            if (!sharedFreeList->hasFreeRegs(VecElemClass)) {
+                                enough = false;
+                                break;
+                            }
+                            shared_ids[element] =
+                                sharedFreeList->getReg(VecElemClass);
+                        }
+                        if (!enough) {
+                            for (auto shared_id : shared_ids)
+                                if (shared_id)
+                                    sharedFreeList->addReg(shared_id);
+                            shared_ids.fill(nullptr);
+                        }
+                    }
                     allocated[phys] = true;
                     physical[phys].allocated = true;
                     physical[phys].vector = true;
+                    physical[phys].sharedIds = shared_ids;
                     result[found++] = phys;
                 }
             }
@@ -986,6 +1099,11 @@ class CPU : public BaseCPU
                 for (auto phys : result) {
                     if (phys >= 0) {
                         allocated[phys] = false;
+                        if (usesSharedPhysicalBank()) {
+                            for (auto shared_id : physical[phys].sharedIds)
+                                if (shared_id)
+                                    sharedFreeList->addReg(shared_id);
+                        }
                         physical[phys] = PhysicalRegister();
                     }
                 }
@@ -999,8 +1117,15 @@ class CPU : public BaseCPU
             if (phys < 0 || phys >= NumPhysicalRegs)
                 return;
             auto &entry = physical[phys];
+            if (usesSharedPhysicalBank())
+                entry.deferredToTemplateEnd = true;
             if (entry.users != 0) {
                 entry.pendingRelease = true;
+                return;
+            }
+            if (usesSharedPhysicalBank()) {
+                entry.pendingRelease = true;
+                entry.deferredToTemplateEnd = true;
                 return;
             }
             allocated[phys] = false;
@@ -1021,7 +1146,15 @@ class CPU : public BaseCPU
             auto &entry = physical[phys];
             if (entry.users != 0)
                 --entry.users;
-            if (entry.users == 0 && entry.pendingRelease) {
+            if (entry.users == 0 && entry.pendingRelease &&
+                !entry.deferredToTemplateEnd) {
+                if (usesSharedPhysicalBank()) {
+                    if (entry.sharedId)
+                        sharedFreeList->addReg(entry.sharedId);
+                    for (auto shared_id : entry.sharedIds)
+                        if (shared_id)
+                            sharedFreeList->addReg(shared_id);
+                }
                 allocated[phys] = false;
                 entry = PhysicalRegister();
             }
@@ -1038,15 +1171,18 @@ class CPU : public BaseCPU
 
         void reset()
         {
-            allocated.fill(false);
+            releaseAll();
             for (auto &entry : vrat)
                 entry = Mapping();
             for (auto &entry : physical) {
                 entry.values.fill(0);
                 entry.ready.fill(0);
                 entry.valid = {};
+                entry.sharedId = nullptr;
+                entry.sharedIds.fill(nullptr);
                 entry.users = 0;
                 entry.pendingRelease = false;
+                entry.deferredToTemplateEnd = false;
                 entry.vector = false;
                 entry.allocated = false;
             }
@@ -1062,7 +1198,7 @@ class CPU : public BaseCPU
                 vrat[arch].scalar = phys;
                 auto &entry = physical[phys];
                 for (unsigned lane = 0; lane < MaxLanes; ++lane) {
-                    entry.values[lane] = regs[arch];
+                    writePhysical(phys, lane, regs[arch]);
                     entry.valid[lane / 64] |= uint64_t(1) << (lane % 64);
                 }
             }
@@ -1085,8 +1221,8 @@ class CPU : public BaseCPU
                 auto &dst = physical[bundle[copy]];
                 for (unsigned lane = 0; lane < LanesPerVectorCopy; ++lane) {
                     const unsigned global = copy * LanesPerVectorCopy + lane;
-                    dst.values[lane] = old_scalar >= 0 ?
-                        physical[old_scalar].values[global] : 0;
+                    writePhysical(bundle[copy], lane, old_scalar >= 0 ?
+                        readPhysical(old_scalar, global) : 0);
                     dst.ready[lane] = old_scalar >= 0 ?
                         physical[old_scalar].ready[global] : 0;
                     dst.valid[lane / 64] |= uint64_t(1) << (lane % 64);
@@ -1132,8 +1268,8 @@ class CPU : public BaseCPU
             const unsigned element = lane % LanesPerVectorCopy;
             const int16_t phys = vrat[arch].vectorized ?
                 vrat[arch].vector[copy] : vrat[arch].scalar;
-            return phys < 0 ? 0 : physical[phys].values[
-                vrat[arch].vectorized ? element : lane];
+            return phys < 0 ? 0 : readPhysical(phys,
+                vrat[arch].vectorized ? element : lane);
         }
 
         Tick readyAt(unsigned arch, unsigned lane) const
@@ -1160,7 +1296,7 @@ class CPU : public BaseCPU
                 return;
             auto &entry = physical[phys];
             const unsigned stored_lane = vrat[arch].vectorized ? element : lane;
-            entry.values[stored_lane] = value;
+            writePhysical(phys, stored_lane, value);
             entry.ready[stored_lane] = ready_tick;
             entry.valid[stored_lane / 64] |=
                 uint64_t(1) << (stored_lane % 64);
@@ -1271,6 +1407,7 @@ class CPU : public BaseCPU
     unsigned dvrHelperMaxUops;
     bool dvrEnableDependentPrefetch;
     bool dvrAllowBoundedFallback;
+    bool dvrSharedPhysicalBank;
     bool oraclePrefetch;
     std::string oracleTraceFile;
     unsigned oracleLookahead;

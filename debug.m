@@ -6,8 +6,8 @@
 
 STATUS = 'mechanism-level implementation with paper-sized helper VRAT; strict workload gaps remain';
 BRANCH = 'docs/dvr-reproduction-plan';
-LOCAL_HEAD = 'd458b8e';
-REMOTE_HEAD = 'd458b8e';
+LOCAL_HEAD = '8c9fe47';
+REMOTE_HEAD = '8c9fe47';
 REMOTE_MERGED = true;
 
 % Merge audit
@@ -22,12 +22,13 @@ REMOTE_MERGED = true;
 %    stride and target architectural register; VTT/Discovery propagates taint.
 %    Loop-bound inference now rejects observed early exits and handles signed
 %    induction deltas without unsigned wraparound.
-% 2. VRAT: implemented in helper-private form with the paper-sized budget.
-%    All architectural integer registers first map to helper scalar physical
-%    entries copied from the committed register snapshot.  The trigger
-%    destination maps to 16 vector copies, 8 x 64-bit elements each (128
-%    scalar-equivalent lanes); the bank now has 256 scalar and 128 vector
-%    physical names.  VIR issue captures physical source IDs and retirement
+% 2. VRAT: implemented with a configurable shared O3 physical bank and a
+%    helper-local resource-exhaustion fallback.  Architectural integer
+%    registers map to scalar entries copied from the committed snapshot; the
+%    trigger destination maps to 16 vector copies, 8 x 64-bit elements each
+%    (128 scalar-equivalent lanes).  Shared mode borrows IntRegClass and
+%    VecElemClass names from UnifiedFreeList and accesses them through
+%    PhysRegFile.  VIR issue captures physical source IDs and retirement
 %    releases them, so overwritten names are deferred while still in use.
 % 3. VIR: implemented as an execution-driven 16-copy model.  Each copy now
 %    has active/issued/executed/dead-source masks and an in-flight count.
@@ -44,11 +45,11 @@ REMOTE_MERGED = true;
 %    max-16 invocation/max-128 flattening.
 
 % Explicit non-completions
-% - VRAT is not mapped into the main O3 UnifiedFreeList/ROB/rename map.  This
-%   is deliberate: the helper is an independent in-order subthread.  Scalar
-%   WAW renaming across divergent subsets still needs a dedicated per-copy
-%   mapping; the current deferred-release path covers physical source lifetime
-%   but does not claim full branch-subset rename equivalence.
+% - Shared VRAT borrows free O3 physical names but is not inserted into the
+%   main O3 rename map, ROB, scoreboard, commit or squash protocol.  Scalar
+%   WAW/WAR renaming across divergent subsets still needs a dedicated
+%   per-copy mapping; deferred release covers helper source lifetime but does
+%   not claim full branch-subset rename equivalence.
 % - VIR scheduling, helper LSU merge behavior, frontend retry timing and NDM
 %   control flow are still execution-driven approximations, not bit-exact
 %   paper hardware.
@@ -122,6 +123,17 @@ REMOTE_MERGED = true;
 %   Nested helper generated/issued/completed = 790594/738234/738234;
 %   replay attempts/targets/fallbacks = 695824/42410/0.  Generated is below
 %   flattened because duplicate addresses are removed before queueing.
+
+% Shared VRAT regression (2026-08-06):
+%   LBD/VTT shared/private both committed 996495; translation faults 0/0;
+%   dependent issued/completed 33/33.  Shared mapped 1945 replay templates.
+%   Camel shared full committed 6874814, translation faults 0, vector programs
+%   9073, replay targets 67793, dependent issued/completed 67793/67793.
+%   Serial GAPBS BFS -g6 -n1 --dvr-no-bounded-fallback had full committed
+%   1207082 versus baseline 1207080 (delta 2), loop-bound/vector programs
+%   200/200, helper load faults 0, and dependent issued/completed 461/461.
+%   BFS alternate complete hits/uops/targets/reconvergence resumes remained
+%   0/0/0/0; this is not a strict cross-discovery reconvergence pass.
 
 % Evidence locations
 % BFS result:

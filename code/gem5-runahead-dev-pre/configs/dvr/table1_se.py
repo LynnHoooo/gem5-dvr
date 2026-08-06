@@ -195,6 +195,9 @@ def parse_args():
     parser.add_argument(
         "--dvr-no-bounded-fallback", action="store_true",
         help="Disable speculative launches without a proven loop bound")
+    parser.add_argument(
+        "--dvr-private-physical-bank", action="store_true",
+        help="Keep helper VRAT values in its private bank for comparison")
     parser.add_argument("--discovery-max-insts", type=int, default=512)
     parser.add_argument("--dvr-ndm-threshold", type=int, default=64)
     parser.add_argument("--dvr-ndm-max-insts", type=int, default=512)
@@ -247,6 +250,7 @@ def main():
         dvrVectorElementBits=args.dvr_vector_element_bits,
         dvrEnableDependentPrefetch=not args.dvr_no_dependent_prefetch,
         dvrAllowBoundedFallback=not args.dvr_no_bounded_fallback,
+        dvrSharedPhysicalBank=not args.dvr_private_physical_bank,
         dvrNDMThreshold=args.dvr_ndm_threshold,
         dvrNDMMaxInsts=args.dvr_ndm_max_insts,
     )

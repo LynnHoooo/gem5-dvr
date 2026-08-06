@@ -175,6 +175,7 @@ CPU::CPU(const BaseO3CPUParams &params)
       dvrHelperMaxUops(params.dvrHelperMaxUops),
       dvrEnableDependentPrefetch(params.dvrEnableDependentPrefetch),
       dvrAllowBoundedFallback(params.dvrAllowBoundedFallback),
+      dvrSharedPhysicalBank(params.dvrSharedPhysicalBank),
       oraclePrefetch(params.oraclePrefetch),
       oracleTraceFile(params.oracleTraceFile),
       oracleLookahead(params.oracleLookahead),
@@ -852,6 +853,8 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Helper uops blocked by the finite VIR capacity"),
       ADD_STAT(dvrHelperVRATPrograms, statistics::units::Count::get(),
                "Replay programs initialized with a private helper VRAT"),
+      ADD_STAT(dvrHelperSharedVRATPrograms, statistics::units::Count::get(),
+               "Replay programs mapped into the shared O3 physical register file"),
       ADD_STAT(dvrHelperVRATWrites, statistics::units::Count::get(),
                "Lane writes into private helper vector registers"),
       ADD_STAT(dvrHelperReadyUopCycles, statistics::units::Count::get(),
@@ -2916,8 +2919,12 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
     // dynamic iterations.
     replay->initialRegs = finish_regs;
     replay->helperRegs = std::make_shared<DVRHelperVectorRegisterFile>();
+    if (dvrSharedPhysicalBank)
+        replay->helperRegs->configureSharedPhysicalBank(&regFile, &freeList);
     replay->helperRegs->initialize(replay->initialRegs);
     ++cpuStats.dvrHelperVRATPrograms;
+    if (replay->helperRegs->usesSharedPhysicalBank())
+        ++cpuStats.dvrHelperSharedVRATPrograms;
     if (replay->count != 0) {
         replay->triggerDestination = dvrInstructionRecorder[0].destination;
         if (replay->triggerDestination >= 0 &&
@@ -3202,8 +3209,12 @@ CPU::launchDVRNestedPrefetches(
     }
     replay->initialRegs = finish_regs;
     replay->helperRegs = std::make_shared<DVRHelperVectorRegisterFile>();
+    if (dvrSharedPhysicalBank)
+        replay->helperRegs->configureSharedPhysicalBank(&regFile, &freeList);
     replay->helperRegs->initialize(replay->initialRegs);
     ++cpuStats.dvrHelperVRATPrograms;
+    if (replay->helperRegs->usesSharedPhysicalBank())
+        ++cpuStats.dvrHelperSharedVRATPrograms;
     if (replay->count != 0) {
         replay->triggerDestination =
             dvrNestedContext.recorder[0].destination;
