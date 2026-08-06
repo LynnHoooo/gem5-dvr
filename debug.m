@@ -85,7 +85,11 @@ REMOTE_MERGED = true;
 %   vector-mode difference is deterministic and must not be ignored.
 % LBD/VTT microbenchmark:
 %   dvr_lbd_vtt completed with no alternate path observed; its run reached
-%   the normal exit path and reported max same-PC group width 8.
+%   the normal exit path and reported max same-PC group width 8.  Baseline/full
+%   committed = 996495/996495, vector programs = 55, dependent issued/
+%   completed = 33/33, translation faults = 0.  The helper-LQ peak was 16;
+%   155584 entries were allocated, 124447 completed and 31123 retried before
+%   the process exited, showing bounded retry behavior rather than overflow.
 
 % Evidence locations
 % BFS result:
