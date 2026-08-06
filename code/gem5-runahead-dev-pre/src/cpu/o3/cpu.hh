@@ -1177,12 +1177,28 @@ class CPU : public BaseCPU
             int8_t source1 = -1;
             int8_t destination = -1;
             Addr pc = 0;
+            unsigned copy = 0;
             std::array<uint64_t, 2> activeMask = {};
             std::vector<unsigned> lanes;
             unsigned chunksRemaining = 1;
             Tick issueCycle = 0;
             Tick completeCycle = 0;
             State state = State::Decoded;
+        };
+        // Paper DVR holds sixteen independent 512-bit copies in the VIR.
+        // A copy owns eight 64-bit lanes and cannot be reissued until its
+        // prior uop completes, even when another copy is ready.
+        static constexpr unsigned VIRCopies = 16;
+        static constexpr unsigned LanesPerVIRCopy = 8;
+        struct VIRCopyState
+        {
+            std::array<uint64_t, 2> activeMask = {};
+            Addr pc = 0;
+            unsigned uopIndex = 0;
+            bool active = false;
+            bool issued = false;
+            bool executed = false;
+            bool deadSource = false;
         };
         // Paper DVR has a helper-local eight-entry fetch/decode buffer.  It
         // is intentionally separate from the main O3 fetch queue.
@@ -1243,6 +1259,7 @@ class CPU : public BaseCPU
         std::deque<ReplayGeneration> replayGenerations;
         std::deque<ReplayLaneContext> replayLanes;
         std::deque<DVRDynUop> virBuffer;
+        std::array<VIRCopyState, VIRCopies> virCopies = {};
         // Decoded instructions belong to the helper context and never enter
         // the main O3 fetch queue.
         std::unordered_map<Addr, StaticInstPtr> decodedUopCache;
@@ -1277,6 +1294,7 @@ class CPU : public BaseCPU
             replayGenerations.clear();
             replayLanes.clear();
             virBuffer.clear();
+            virCopies = {};
             decodedUopCache.clear();
             readyCycle.fill(0);
         }
@@ -1316,6 +1334,7 @@ class CPU : public BaseCPU
             replayGenerations.clear();
             replayLanes.clear();
             virBuffer.clear();
+            virCopies = {};
             decodedUopCache.clear();
             readyCycle.fill(0);
             state = fetchRemaining == 0 ? State::Idle : State::Fetch;
@@ -1456,6 +1475,10 @@ class CPU : public BaseCPU
                 if (it->state == DVRDynUop::State::Issued &&
                     it->completeCycle <= now) {
                     it->state = DVRDynUop::State::Completed;
+                    auto &copy = virCopies.at(it->copy);
+                    copy.issued = false;
+                    copy.executed = true;
+                    copy.deadSource = it->destination < 0;
                     ++retired;
                     it = virBuffer.erase(it);
                 } else {
@@ -1732,6 +1755,10 @@ class CPU : public BaseCPU
     // residual LSU slot drains source lanes, burying dependent targets behind
     // an unbounded source queue.
     static constexpr unsigned DvrMaxQueuedPrefetches = 256;
+    // Helper loads are transient and never enter the ROB, but each one holds
+    // a bounded helper-LQ reservation until its timing response returns.
+    static constexpr unsigned DvrHelperLoadQueueCapacity = 16;
+    unsigned dvrHelperLoadQueueOccupancy = 0;
     std::deque<DVRPrefetchAddress> dvrPrefetchQueue;
     // Source values are lane-specific even when they share a cache line, so
     // source requests are deduplicated by byte address.  Dependent loads only

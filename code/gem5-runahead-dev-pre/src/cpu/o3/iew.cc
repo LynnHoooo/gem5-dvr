@@ -852,6 +852,12 @@ IEW::tryIssueDVRHelperFU(OpClass op_class, Cycles &latency)
     return true;
 }
 
+bool
+IEW::hasFreeDVRHelperLoadEntry(ThreadID tid)
+{
+    return ldstQueue.numFreeLoadEntries(tid) > 0;
+}
+
 void
 IEW::activateStage()
 {

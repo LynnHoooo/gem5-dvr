@@ -215,6 +215,9 @@ class IEW
     /** Reserve a native O3 FU for one DVR helper compute uop. */
     bool tryIssueDVRHelperFU(OpClass op_class, Cycles &latency);
 
+    /** True only while the architectural LSQ retains a demand-load slot. */
+    bool hasFreeDVRHelperLoadEntry(ThreadID tid);
+
     /** Tells CPU that the IEW stage is active and running. */
     void activateStage();
 

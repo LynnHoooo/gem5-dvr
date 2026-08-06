@@ -3535,16 +3535,22 @@ CPU::issueDVRReplayLanes(unsigned slots)
              lane.readyCycle[uop.source1]) <= curTick();
         if (!source0_ready || !source1_ready)
             continue;
+        const unsigned copy = lane_id /
+            DVRHelperThread::LanesPerVIRCopy;
+        if (copy >= DVRHelperThread::VIRCopies ||
+            dvrHelperThread.virCopies[copy].issued)
+            continue;
         if (!seed) {
             seed = &lane;
         } else if (lane.program != seed->program ||
                    lane.uopIndex != seed->uopIndex ||
+                   copy != seed->lane / DVRHelperThread::LanesPerVIRCopy ||
                    lane.program->uops[lane.uopIndex].pc !=
                        seed->program->uops[seed->uopIndex].pc) {
             continue;
         }
         group.push_back(&lane);
-        if (group.size() == dvrElementsPerChunk())
+        if (group.size() == DVRHelperThread::LanesPerVIRCopy)
             break;
     }
     if (group.empty())
@@ -3625,6 +3631,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
     dyn_uop.source1 = uop.source1;
     dyn_uop.destination = uop.destination;
     dyn_uop.pc = uop.pc;
+    dyn_uop.copy = seed->lane / DVRHelperThread::LanesPerVIRCopy;
     dyn_uop.issueCycle = curTick();
     dyn_uop.state = DVRHelperThread::DVRDynUop::State::Ready;
     dyn_uop.lanes.reserve(group.size());
@@ -3640,6 +3647,14 @@ CPU::issueDVRReplayLanes(unsigned slots)
         __builtin_popcountll(dyn_uop.activeMask[1]);
     if (mask_lanes != group.size())
         ++cpuStats.dvrVIRActiveMaskFailures;
+    auto &copy = dvrHelperThread.virCopies.at(dyn_uop.copy);
+    copy.activeMask = dyn_uop.activeMask;
+    copy.pc = uop.pc;
+    copy.uopIndex = seed->uopIndex;
+    copy.active = true;
+    copy.issued = true;
+    copy.executed = false;
+    copy.deadSource = false;
     dvrTraceVector("vir_issue_group", curTick(), uop.pc, 0,
                    static_cast<int>(group.size()),
                    static_cast<int>(seed->lane));
@@ -4011,8 +4026,16 @@ CPU::serviceDVRPrefetchQueue()
         ++cpuStats.dvrLSUBudgetConflicts;
         return;
     }
-
     const auto prefetch = dvrPrefetchQueue.front();
+    if (dvrHelperLoadQueueOccupancy >= DvrHelperLoadQueueCapacity) {
+        ++cpuStats.dvrHelperVIRCapacityStalls;
+        return;
+    }
+    if (!iew.hasFreeDVRHelperLoadEntry(prefetch.tid)) {
+        ++cpuStats.dvrPrefetchesSuppressedMainThread;
+        return;
+    }
+
     dvrPrefetchQueue.pop_front();
     dvrQueuedPrefetchAddresses.erase(prefetch.address);
     if (!prefetch.source)
@@ -4095,6 +4118,7 @@ CPU::serviceDVRPrefetchQueue()
         return;
     }
     ++cpuStats.dvrPrefetchesIssued;
+    ++dvrHelperLoadQueueOccupancy;
     ++dvrHelperIssuesThisCycle;
     ++cpuStats.dvrHelperIssueCycles;
     ++cpuStats.dvrHelperUopsIssued;
@@ -4124,6 +4148,8 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
 {
     auto *state = dynamic_cast<DVRPrefetchSenderState*>(pkt->senderState);
     assert(state);
+    assert(dvrHelperLoadQueueOccupancy != 0);
+    --dvrHelperLoadQueueOccupancy;
     ++cpuStats.dvrPrefetchesCompleted;
     if (state->oracle) {
         ++cpuStats.oraclePrefetchesCompleted;

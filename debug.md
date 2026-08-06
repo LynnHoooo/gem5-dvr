@@ -4,6 +4,32 @@
 
 ## 当前未解决
 
+### 2026-08-06：资源仲裁、VRAT 与专项回归状态
+
+1. **Helper memory/LSQ arbitration 已收紧**：helper request 现在只有在 (a) 主线程
+   本周期未用尽 LSU budget、(b) 16-entry helper LQ 未满、(c) 主 LSQ 对该 thread 仍有
+   free load entry 时才能使用同一个 LSQ data port；timing response 返回时释放 helper-LQ
+   reservation。helper load 仍不创建可 commit 的 `DynInst`，这是为了避免 transient
+   prefetch 错误进入 ROB/commit/squash 语义。
+
+2. **VRAT 的正确边界**：当前 `DVRHelperVectorRegisterFile` 是 helper-owned、有限的
+   physical bank，存放每 lane 的 transient 值；它不应直接从 `UnifiedFreeList` 借主线程
+   scalar physical registers。后者没有 vector-lane storage，且会把 transient helper
+   生命周期耦合进 rename/ROB reclaim。共享资源模型应覆盖 FU、LSQ data port、MMU、cache
+   和 DRAM；helper register bank 保持独立，符合论文的 DVR 子线程所有权。
+
+3. **VTT/LBD 专项 gate**：已实现 VTT dispatch undo、显式 `slt/sltu + beq/bne` LCR/SBB、
+   RISC-V `blt/bge/bltu/bgeu` 虚拟 LCR，以及 `min(128, max_lanes)` loop-bound fallback。
+   下次端到端回归必须分别覆盖：显式 LCR、fused LCR、mispredict squash、无 bound fallback、
+   divergent path、短 inner-loop NDM。现有 `run_remote_dvr_helper_regression.sh` 已覆盖
+   divergent path 与 NDM；其余四项需要独立 microbenchmark gate 后才可标为验证完成。
+
+4. **VIR 16-copy state**：helper VIR 现在固定为 16 个 copy slot，每 slot 管理一个
+   8-lane 512-bit copy 的 active mask、PC/uop、issued、executed 与 dead-source 状态。
+   同一 copy 在其前一个 helper DynUop 完成前不可重发；不同 copy 仍可在共享 FU 可用时
+   独立 issue。该项已通过 `cpu.o` 编译，仍需在有 RISC-V toolchain 的节点运行
+   `run_remote_dvr_helper_regression.sh` 验证 16-copy occupancy、分歧与 replay 守恒。
+
 ### P0：论文级 helper 微结构
 
 1. **P0 helper 实现尚待合入主 worktree 并做端到端回归**：`dvr-p0-helper` 的

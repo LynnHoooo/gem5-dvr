@@ -2219,12 +2219,16 @@ DVRLoopBoundDetector::observe(const DynInstPtr &inst,
     }
 
     // RISC-V commonly fuses the compare and branch.  Model BLT/BGE/BLTU/BGEU
-    // as a virtual LCR whose result is consumed by that same branch, rather
-    // than forcing normal compiler output down the 128-lane fallback path.
+    // and the canonical BNE induction-variable back edge as a virtual LCR
+    // whose result is consumed by that same branch, rather than forcing
+    // normal compiler output down the 128-lane fallback path.
     bool virtual_compare = false;
     if (!seenBranch && encoded_size >= 4 && opcode == 0x63 && found == 2 &&
-        funct3 >= 4 && funct3 <= 7) {
+        (funct3 == 1 || (funct3 >= 4 && funct3 <= 7))) {
         switch (funct3) {
+          case 1:
+            comparison = Comparison::NotEqual;
+            break;
           case 4:
             comparison = Comparison::SignedLess;
             break;
@@ -2344,6 +2348,30 @@ DVRLoopBoundDetector::infer(const RegisterSnapshot &start,
         distance = current - bound + 1;
         step = uint64_t(-(increment + 1)) + 1;
         break;
+      case Comparison::NotEqual: {
+        if (increment == 0)
+            return inference;
+        const uint64_t magnitude = increment > 0 ?
+            static_cast<uint64_t>(increment) :
+            uint64_t(-(increment + 1)) + 1;
+        if (increment > 0) {
+            if (current >= bound)
+                return inference;
+            distance = bound - current;
+        } else {
+            if (current <= bound)
+                return inference;
+            distance = current - bound;
+        }
+        // A BNE loop terminates exactly at equality.  A non-integral number
+        // of observed induction steps can be an early exit, wraparound, or a
+        // non-linear update, all of which must remain on the bounded
+        // speculative fallback path.
+        if (distance == 0 || distance % magnitude != 0)
+            return inference;
+        step = magnitude;
+        break;
+      }
       default:
         return inference;
     }
