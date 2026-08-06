@@ -1184,6 +1184,9 @@ class CPU : public BaseCPU
             Tick completeCycle = 0;
             State state = State::Decoded;
         };
+        // Paper DVR has a helper-local eight-entry fetch/decode buffer.  It
+        // is intentionally separate from the main O3 fetch queue.
+        static constexpr unsigned FrontEndBufferCapacity = 8;
         static constexpr unsigned VIRCapacity = 8;
         struct ReplayGeneration
         {
@@ -1356,7 +1359,11 @@ class CPU : public BaseCPU
 
             unsigned fetched = 0;
             if (fetchRemaining != 0) {
-                fetched = std::min(fetch_width, fetchRemaining);
+                const unsigned buffer_space =
+                    FrontEndBufferCapacity > decodeRemaining ?
+                    FrontEndBufferCapacity - decodeRemaining : 0;
+                fetched = std::min({fetch_width, fetchRemaining,
+                                    buffer_space});
                 fetchRemaining -= fetched;
                 decodeRemaining += fetched;
             }
