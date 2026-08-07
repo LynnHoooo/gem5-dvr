@@ -543,9 +543,11 @@ CPU::completeDVRInstructionFetch(PacketPtr pkt)
     }
     if (decoded) {
         dvrHelperThread.decodedUopCache[state->pc] = decoded;
+        dvrHelperThread.frontendDecoded(state->pc, false, curTick());
         ++cpuStats.dvrHelperInstructionsDecoded;
     } else {
         dvrHelperThread.decodedUopCache[state->pc] = state->captured;
+        dvrHelperThread.frontendDecoded(state->pc, true, curTick());
         ++cpuStats.dvrHelperDecodeFallbacks;
     }
     ++cpuStats.dvrHelperInstructionTimingResponses;
@@ -1337,9 +1339,13 @@ CPU::tick()
             program->uops[dvrHelperThread.frontendUopIndex++];
         bool fetch_fault = false;
         bool cache_hit = false;
-        fetchDecodeDVRUop(
+        dvrHelperThread.frontendFetched(frontend_uop.pc, curTick());
+        const StaticInstPtr frontend_decoded = fetchDecodeDVRUop(
             dvrHelperThread.frontendTid, frontend_uop.pc,
             frontend_uop.staticInst, fetch_fault, cache_hit);
+        if (frontend_decoded)
+            dvrHelperThread.frontendDecoded(
+                frontend_uop.pc, fetch_fault, curTick());
         dvrHelperThread.helperPC = frontend_uop.pc;
         // Timing misses are accounted by request/response handlers.  A
         // nullptr here means the helper front-end is waiting on its cache
@@ -3611,6 +3617,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
         // eligible after completeDVRInstructionFetch fills the decode cache.
         return 0;
     }
+    dvrHelperThread.retireFrontend(uop.pc);
     if (instruction_fetch_fault)
         DPRINTF(O3CPU, "DVR helper fetch fault at pc=%#x; using captured "
                 "semantic metadata\n", uop.pc);

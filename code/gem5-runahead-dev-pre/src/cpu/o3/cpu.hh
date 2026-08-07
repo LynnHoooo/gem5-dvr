@@ -1546,6 +1546,14 @@ class CPU : public BaseCPU
         // is intentionally separate from the main O3 fetch queue.
         static constexpr unsigned FrontEndBufferCapacity = 8;
         static constexpr unsigned VIRCapacity = 8;
+        struct FrontendEntry
+        {
+            enum class State { FetchPending, DecodePending, Ready, Fault };
+            Addr pc = 0;
+            State state = State::FetchPending;
+            Tick fetchTick = 0;
+            Tick decodeTick = 0;
+        };
         struct ReplayGeneration
         {
             std::shared_ptr<const DVRReplayTemplate> program;
@@ -1601,6 +1609,7 @@ class CPU : public BaseCPU
         std::deque<ReplayGeneration> replayGenerations;
         std::deque<ReplayLaneContext> replayLanes;
         std::deque<DVRDynUop> virBuffer;
+        std::deque<FrontendEntry> frontendBuffer;
         std::array<VIRCopyState, VIRCopies> virCopies = {};
         // Decoded instructions belong to the helper context and never enter
         // the main O3 fetch queue.
@@ -1636,6 +1645,7 @@ class CPU : public BaseCPU
             replayGenerations.clear();
             replayLanes.clear();
             virBuffer.clear();
+            frontendBuffer.clear();
             virCopies = {};
             decodedUopCache.clear();
             readyCycle.fill(0);
@@ -1676,6 +1686,7 @@ class CPU : public BaseCPU
             replayGenerations.clear();
             replayLanes.clear();
             virBuffer.clear();
+            frontendBuffer.clear();
             virCopies = {};
             decodedUopCache.clear();
             readyCycle.fill(0);
@@ -1721,8 +1732,8 @@ class CPU : public BaseCPU
             unsigned fetched = 0;
             if (fetchRemaining != 0) {
                 const unsigned buffer_space =
-                    FrontEndBufferCapacity > decodeRemaining ?
-                    FrontEndBufferCapacity - decodeRemaining : 0;
+                    FrontEndBufferCapacity > frontendBuffer.size() ?
+                    FrontEndBufferCapacity - frontendBuffer.size() : 0;
                 fetched = std::min({fetch_width, fetchRemaining,
                                     buffer_space});
                 fetchRemaining -= fetched;
@@ -1746,6 +1757,41 @@ class CPU : public BaseCPU
                 state = State::Decode;
             }
             return fetched + decoded;
+        }
+
+        void frontendFetched(Addr pc, Tick now)
+        {
+            if (frontendBuffer.size() >= FrontEndBufferCapacity)
+                return;
+            frontendBuffer.push_back(FrontendEntry{
+                pc, FrontendEntry::State::FetchPending, now, 0});
+        }
+
+        void frontendDecoded(Addr pc, bool fault, Tick now)
+        {
+            for (auto &entry : frontendBuffer) {
+                if (entry.pc != pc ||
+                    entry.state == FrontendEntry::State::Ready ||
+                    entry.state == FrontendEntry::State::Fault)
+                    continue;
+                entry.state = fault ? FrontendEntry::State::Fault :
+                    FrontendEntry::State::Ready;
+                entry.decodeTick = now;
+                return;
+            }
+        }
+
+        void retireFrontend(Addr pc)
+        {
+            for (auto it = frontendBuffer.begin();
+                 it != frontendBuffer.end(); ++it) {
+                if (it->pc == pc &&
+                    (it->state == FrontendEntry::State::Ready ||
+                     it->state == FrontendEntry::State::Fault)) {
+                    frontendBuffer.erase(it);
+                    return;
+                }
+            }
         }
 
         unsigned advanceCompute(unsigned alu_width, unsigned shift_width,
@@ -2030,6 +2076,7 @@ class CPU : public BaseCPU
             assert(!issueQueue.empty());
             const auto entry = issueQueue.front();
             issueQueue.pop_front();
+            retireFrontend(entry.pc);
             ++issuedUops;
             --readyUops;
             if (entry.destination >= 0 &&
