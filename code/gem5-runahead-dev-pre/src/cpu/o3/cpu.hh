@@ -1117,16 +1117,22 @@ class CPU : public BaseCPU
             if (phys < 0 || phys >= NumPhysicalRegs)
                 return;
             auto &entry = physical[phys];
-            if (usesSharedPhysicalBank())
-                entry.deferredToTemplateEnd = true;
             if (entry.users != 0) {
                 entry.pendingRelease = true;
                 return;
             }
+            // Shared physical names are transient helper allocations, not
+            // architectural mappings.  Once all issued VIR copies released
+            // their source references, return the name immediately so a
+            // later tainted destination can reuse it.  The old policy kept
+            // every shared name until template destruction and made
+            // dead-source reclamation ineffective under long replay chains.
             if (usesSharedPhysicalBank()) {
-                entry.pendingRelease = true;
-                entry.deferredToTemplateEnd = true;
-                return;
+                if (entry.sharedId)
+                    sharedFreeList->addReg(entry.sharedId);
+                for (auto shared_id : entry.sharedIds)
+                    if (shared_id)
+                        sharedFreeList->addReg(shared_id);
             }
             allocated[phys] = false;
             entry = PhysicalRegister();
@@ -1146,8 +1152,7 @@ class CPU : public BaseCPU
             auto &entry = physical[phys];
             if (entry.users != 0)
                 --entry.users;
-            if (entry.users == 0 && entry.pendingRelease &&
-                !entry.deferredToTemplateEnd) {
+            if (entry.users == 0 && entry.pendingRelease) {
                 if (usesSharedPhysicalBank()) {
                     if (entry.sharedId)
                         sharedFreeList->addReg(entry.sharedId);
@@ -1418,6 +1423,8 @@ class CPU : public BaseCPU
     bool dvrVectorChunkModel;
     bool dvrVectorUnlimitedFU;
     unsigned dvrVectorElementBits;
+    unsigned dvrVectorIssueInterval;
+    Tick dvrVectorNextIssueTick = 0;
     struct DVRTraceSink
     {
         FILE *workload = nullptr;

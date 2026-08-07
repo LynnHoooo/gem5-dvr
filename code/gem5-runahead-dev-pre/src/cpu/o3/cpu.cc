@@ -181,7 +181,8 @@ CPU::CPU(const BaseO3CPUParams &params)
       oracleLookahead(params.oracleLookahead),
       dvrVectorChunkModel(params.dvrVectorChunkModel),
       dvrVectorUnlimitedFU(params.dvrVectorUnlimitedFU),
-      dvrVectorElementBits(params.dvrVectorElementBits)
+      dvrVectorElementBits(params.dvrVectorElementBits),
+      dvrVectorIssueInterval(params.dvrVectorIssueInterval)
 {
     if (dvrVectorElementBits == 0 ||
         DvrVectorBits % dvrVectorElementBits != 0) {
@@ -3646,6 +3647,12 @@ CPU::issueDVRReplayLanes(unsigned slots)
     ++cpuStats.dvrHelperFURequests;
     ++cpuStats.dvrVectorChunkRequests;
     Cycles latency(1);
+    if (!dvrVectorUnlimitedFU &&
+        curTick() < dvrVectorNextIssueTick) {
+        ++cpuStats.dvrHelperFUStalls;
+        ++cpuStats.dvrVectorFUConflictCycles;
+        return 0;
+    }
     if (!dvrVectorUnlimitedFU && !iew.tryIssueDVRHelperFU(op_class, latency)) {
         ++cpuStats.dvrHelperFUStalls;
         ++cpuStats.dvrVectorFUConflictCycles;
@@ -3664,6 +3671,10 @@ CPU::issueDVRReplayLanes(unsigned slots)
 
     const Tick ready_tick = curTick() +
         static_cast<uint64_t>(latency) * clockPeriod();
+    if (!dvrVectorUnlimitedFU) {
+        dvrVectorNextIssueTick = curTick() +
+            uint64_t(std::max(1u, dvrVectorIssueInterval)) * clockPeriod();
+    }
     DVRHelperThread::DVRDynUop dyn_uop;
     dyn_uop.program = seed->program;
     dyn_uop.staticInst = decoded_inst;
@@ -4013,8 +4024,10 @@ CPU::issueDVRHelperCompute()
         ++cpuStats.dvrHelperFURequests;
         ++cpuStats.dvrVectorChunkRequests;
         Cycles latency(1);
-        const bool granted = dvrVectorUnlimitedFU ||
-            iew.tryIssueDVRHelperFU(op_class, latency);
+        const bool interval_ready = dvrVectorUnlimitedFU ||
+            curTick() >= dvrVectorNextIssueTick;
+        const bool granted = interval_ready &&
+            (dvrVectorUnlimitedFU || iew.tryIssueDVRHelperFU(op_class, latency));
         if (!granted) {
             ++cpuStats.dvrHelperFUStalls;
             ++cpuStats.dvrVectorFUConflictCycles;
@@ -4023,6 +4036,10 @@ CPU::issueDVRHelperCompute()
 
         const Tick ready_tick = curTick() +
             static_cast<uint64_t>(latency) * clockPeriod();
+        if (!dvrVectorUnlimitedFU) {
+            dvrVectorNextIssueTick = curTick() +
+                uint64_t(std::max(1u, dvrVectorIssueInterval)) * clockPeriod();
+        }
         dvrHelperThread.issueCompute(ready_tick);
         --slots;
         ++dvrHelperComputeIssuesThisCycle;
@@ -4072,11 +4089,10 @@ CPU::serviceDVRPrefetchQueue()
 {
     if (dvrPrefetchQueue.empty())
         return;
-    if (dvrVectorChunkModel &&
-        !dvrHelperThread.computeComplete(curTick())) {
-        ++cpuStats.dvrVectorComputeWaitCycles;
-        return;
-    }
+    // Source and dependent requests already admitted to the helper LQ carry
+    // their own dependency state.  Do not serialize the whole memory queue
+    // behind the latest vector compute completion; only the lane/uop that
+    // produced a dependent address must wait for its own readiness.
     cpuStats.dvrHelperUopsBecameReady +=
         dvrHelperThread.wakeForMemoryRequest();
     if (!dvrHelperThread.canIssue())

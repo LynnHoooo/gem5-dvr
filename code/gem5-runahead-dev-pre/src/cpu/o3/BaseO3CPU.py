@@ -195,6 +195,8 @@ class BaseO3CPU(BaseCPU):
         "Do not constrain DVR vector chunks by the shared vector FU pool")
     dvrVectorElementBits = Param.Unsigned(64,
         "Element width used to form 512-bit DVR chunks")
+    dvrVectorIssueInterval = Param.Unsigned(1,
+        "Minimum cycles between DVR vector-chunk issues")
     dvrEnableDependentPrefetch = Param.Bool(True,
         "Enable DVR dependent target prefetch generation")
     dvrAllowBoundedFallback = Param.Bool(True,
