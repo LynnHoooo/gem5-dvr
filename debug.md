@@ -4,19 +4,26 @@
 
 ## 当前未解决
 
-### P0 建模状态
+### P0 建模状态（尚未完成）
 
-VRAT shared physical lifetime、16-copy VIR、helper-local 16-entry LQ、独立 8-entry
-fetch/decode buffer 和 helper-owned DynUop 生命周期已经实现并通过当前树编译。shared
-physical name 会在 VIR source retain 归零且 destination 被替换后回收；helper 仍不进入主
-线程 rename/IQ/ROB/commit，这符合论文独立顺序 subthread 的所有权边界。
+当前版本已经有 helper-private VRAT、16-copy VIR 的基础结构、helper-local LQ、独立
+8-entry frontend 和 helper-owned DynUop 生命周期；这些结构可以编译并通过算法 smoke。
+但还不能称为论文级 VRAT/VIR 完成，原因是：
 
-按论文公开描述，普通 DVR helper 建模已经闭合。frontend 现在持有显式 8-entry
-`FetchPending/Ready/Fault` 状态，timing response 更新对应 PC entry，issue 后回收；
-`dvrVectorIssueInterval` 提供 vector chunk 的最小 issue 间隔；每个 dependent request
-携带产生它的 DynUop `readyTick`，只有该 uop 完成后才进入 helper LSU，不同 lane 不再被
-全局 compute completion 串行阻塞。作者未公开的逐周期仲裁细节不可能做到 bit-exact，
-但不再属于已知论文逻辑缺失。
+1. `vectorize()` 对已经 vectorized 的 destination 直接返回，不能为每个 tainted
+   destination 分配新的 16-copy bundle；replay 写回路径也没有统一调用 `rename()`，因此
+   scalar/vector WAW 覆盖不完整。
+2. `VIRCopyState` 有 active/issued/executed/dead-source mask，但没有独立的 ready 和
+   completed mask；source release 仍由 users/pendingRelease 近似驱动，不是严格的
+   dead-source mask 状态机。
+3. 没有 `allocated = live + in_flight + freed` 的统计和 assertion，无法对每个 physical
+   entry 做守恒验收。
+4. 配置默认 `dvrSharedPhysicalBank=True`，会从主线程 `UnifiedFreeList` 借名；这不是完整
+   的 helper-private 默认边界，且共享 physical lifetime 尚未与主线程 squash/reclaim
+   建立完整协议。
+
+因此，当前模型可称为“带显式 helper frontend、VRAT/VIR/LQ 机制近似的 DVR 原型”，不能
+称为完整论文复现。
 
 ### P1：算法和 workload 覆盖
 
@@ -44,6 +51,36 @@ physical name 会在 VIR source retain 归零且 destination 被替换后回收�
 
 3. cache quality 仍需绑定完整的 L1 lookup/fill/eviction/victim/invalidate 事件，区分
    useful、late、evicted、pollution 和 demand coverage。
+
+### 2026-08-07 验证计划第一层实测（基线 commit `40efd61`，dirty worktree，未通过）
+
+运行时 worktree 还包含未提交的 `cpu.cc`、`cpu.hh`、`BaseO3CPU.py` 和
+`table1_se.py` 改动；使用当前 worktree 的 `build/RISCV/gem5.opt`（SHA256
+`c126c4a0940e9bdea633e800a9247957e8039318defd02fe88092991a24f4107`）重跑。
+以下是当前版本结果，历史通过记录不能替代本节。
+
+| Gate | 结果 | 关键证据 | 判定 |
+|---|---|---|---|
+| Stage-16 algorithm smoke | `DVR_STAGE16_ALGORITHM_SMOKE_PASSED` | `dvr_nested_smoke.cc` 单元级控制/flatten 检查通过 | 通过 |
+| LBD/VTT | baseline/full committed 均为 `996495`；matches `35`，fallbacks `4311`；generated/issued/completed `8/1/1`，covered `1`，fault `0` | 指令守恒和 LBD 路径成立，但 coverage 远低于 M1 的 80% | 未通过 M1 |
+| Branch/alternate | helper decoded/issued/completed `2/2/2`，但 divergent branches、alternate complete hits、alternate uops、alternate targets、resumes 均为 `0` | 当前 `dvr_divergent.riscv` 没有形成 lane predicate split | 未通过 M3 |
+| NDM | baseline/nested committed 均为 `1279352`；attempts/inversions/outer-found `1/1/1`；outer invocations `2`；flattened/expected `17948/17948`，failures `0` | 当前 `run_remote_dvr_ndm_e2e.sh` 已从本 worktree 编译并执行，branch inversion、outer scan 与 flatten 守恒已发生 | 控制层通过，M2 未通过 |
+| NDM data plane | helpers generated/issued/completed `4694/6/6`；replay attempts `6`，但 replay targets `0` | helper request 和 response 生命周期已经进入数据面，但 replay 没有产出 dependent target | 未通过 M2 |
+
+结果目录：
+
+```text
+/home/lynnhoo/dvr-repro/results/dvr-lbd-vtt
+/home/lynnhoo/dvr-repro/results/dvr-next-helper-regression/20260807T120758-2729514/branch
+/home/lynnhoo/dvr-repro/results/dvr-ndm-e2e-script-current-20260807/run
+```
+
+脚本路径错误也已确认：`run_remote_dvr_ndm_e2e.sh` 默认指向旧
+`/home/lynnhoo/dvr-repro/source/gem5-runahead-dev-pre` worktree，必须显式传入当前
+`ROOT`、`GEM5` 和 benchmark；`run_remote_dvr_alternate_path.sh` 默认把 benchmark root
+设为 `$ROOT/benchmarks`，而当前专项 ELF 位于仓库顶层 `benchmarks/`。在修正脚本默认路径
+并让 NDM generated request 进入 helper LQ/data port 前，禁止继续运行 Figure 8、GAP5 或
+论文性能消融并把结果称为 DVR reproduction。
 
 ## Alternate-path 当前判断
 

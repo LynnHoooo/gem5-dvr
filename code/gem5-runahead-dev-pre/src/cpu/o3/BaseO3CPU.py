@@ -201,8 +201,8 @@ class BaseO3CPU(BaseCPU):
         "Enable DVR dependent target prefetch generation")
     dvrAllowBoundedFallback = Param.Bool(True,
         "Allow bounded speculative launches without a proven loop bound")
-    dvrSharedPhysicalBank = Param.Bool(True,
-        "Map DVR helper VRAT entries into the O3 physical register file")
+    dvrSharedPhysicalBank = Param.Bool(False,
+        "Borrow O3 physical names for DVR VRAT sensitivity experiments")
     dvrDiscoveryMaxInsts = Param.Unsigned(512,
         "一次 DVR 发现区间允许提交的最大指令数")
     dvrNDMThreshold = Param.Unsigned(64,

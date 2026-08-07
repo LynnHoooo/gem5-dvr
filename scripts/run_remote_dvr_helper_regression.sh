@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 ROOT="${ROOT:-$REPO_ROOT/code/gem5-runahead-dev-pre}"
-BENCH_ROOT="${BENCH_ROOT:-$REPO_ROOT/../gem5-runahead-dev-pre/benchmarks}"
+BENCH_ROOT="${BENCH_ROOT:-$REPO_ROOT/benchmarks}"
 GEM5="${GEM5:-$ROOT/build/RISCV/gem5.opt}"
 CONFIG="${CONFIG:-$ROOT/configs/dvr/table1_se.py}"
 OUT_ROOT="${OUT_ROOT:-/home/lynnhoo/dvr-repro/results/dvr-next-helper-regression}"

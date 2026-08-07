@@ -101,6 +101,7 @@ CPU::DVRPrefetchSenderState::DVRPrefetchSenderState(
     const std::array<RegVal, MaxRelations> &relation_masks,
     const std::array<RegVal, MaxRelations> &relation_patterns,
     std::shared_ptr<const DVRReplayTemplate> replay_template,
+    std::shared_ptr<DVRHelperVectorRegisterFile> helper_regs,
     std::shared_ptr<DVRPredicateGeneration> predicate_generation,
     unsigned lane_id,
     ThreadID thread)
@@ -109,6 +110,7 @@ CPU::DVRPrefetchSenderState::DVRPrefetchSenderState(
       scales(relation_scales), offsets(relation_offsets),
       masks(relation_masks), patterns(relation_patterns),
       replay(std::move(replay_template)),
+      helperRegs(std::move(helper_regs)),
       predicate(std::move(predicate_generation)), lane(lane_id), tid(thread)
 {
 }
@@ -2687,7 +2689,13 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                     dvrNestedContext.reset();
                     ndm_launched = true;
                 }
-                if (!ndm_launched &&
+                // Nested mode is an NDM collection/execution mode.  Letting
+                // ordinary single-loop DVR launches run concurrently fills
+                // the bounded helper queue before two outer invocations can
+                // flatten, so the actual NDM source->replay path never gets
+                // a request.  Users who need the single-loop fallback select
+                // full/discovery mode explicitly.
+                if (dvrMode != "nested" && !ndm_launched &&
                     (helper_allowed || fallback_allowed ||
                      launch_source_fallback ||
                      alternate_continuation_allowed) &&
@@ -2925,19 +2933,8 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
     // the source address and the non-trigger inputs belong to different
     // dynamic iterations.
     replay->initialRegs = finish_regs;
-    replay->helperRegs = std::make_shared<DVRHelperVectorRegisterFile>();
-    if (dvrSharedPhysicalBank)
-        replay->helperRegs->configureSharedPhysicalBank(&regFile, &freeList);
-    replay->helperRegs->initialize(replay->initialRegs);
-    ++cpuStats.dvrHelperVRATPrograms;
-    if (replay->helperRegs->usesSharedPhysicalBank())
-        ++cpuStats.dvrHelperSharedVRATPrograms;
     if (replay->count != 0) {
         replay->triggerDestination = dvrInstructionRecorder[0].destination;
-        if (replay->triggerDestination >= 0 &&
-            replay->triggerDestination <
-                DVRLoopBoundDetector::MaxArchitecturalIntRegs)
-            replay->helperRegs->vectorize(replay->triggerDestination);
         replay->valid = replay->scalarCount > 1 &&
             replay->triggerDestination > 0 &&
             replay->triggerDestination <
@@ -3001,6 +2998,26 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
         ++cpuStats.dvrVIRContinuationContexts;
     }
 
+    // The helper register file is execution state, not discovery metadata.
+    // All source lanes of this launch share one private 16-copy VRAT; it is
+    // released when its outstanding source/dependent requests and VIR uops
+    // retire, instead of accumulating in historical replay templates.
+    auto helper_regs = std::make_shared<DVRHelperVectorRegisterFile>();
+    if (dvrSharedPhysicalBank)
+        helper_regs->configureSharedPhysicalBank(&regFile, &freeList);
+    helper_regs->initialize(replay->initialRegs);
+    if (replay->triggerDestination >= 0 &&
+        replay->triggerDestination <
+            DVRLoopBoundDetector::MaxArchitecturalIntRegs &&
+        !helper_regs->vectorize(replay->triggerDestination)) {
+        ++cpuStats.dvrHelpersSuppressed;
+        return;
+    }
+    assert(helper_regs->conservationValid());
+    ++cpuStats.dvrHelperVRATPrograms;
+    if (helper_regs->usesSharedPhysicalBank())
+        ++cpuStats.dvrHelperSharedVRATPrograms;
+
     // Source stride prefetches are useful even when the committed slice did
     // not contain a replayable load uop.  Keep the helper alive for source
     // lanes; replay->count only controls dependent replay semantics.
@@ -3027,6 +3044,7 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
         prefetch.masks = masks;
         prefetch.patterns = patterns;
         prefetch.replay = replay;
+        prefetch.helperRegs = helper_regs;
         prefetch.predicate = predicate;
         prefetch.lane = lane - 1;
         dvrPrefetchQueue.push_back(prefetch);
@@ -3215,20 +3233,9 @@ CPU::launchDVRNestedPrefetches(
         }
     }
     replay->initialRegs = finish_regs;
-    replay->helperRegs = std::make_shared<DVRHelperVectorRegisterFile>();
-    if (dvrSharedPhysicalBank)
-        replay->helperRegs->configureSharedPhysicalBank(&regFile, &freeList);
-    replay->helperRegs->initialize(replay->initialRegs);
-    ++cpuStats.dvrHelperVRATPrograms;
-    if (replay->helperRegs->usesSharedPhysicalBank())
-        ++cpuStats.dvrHelperSharedVRATPrograms;
     if (replay->count != 0) {
         replay->triggerDestination =
             dvrNestedContext.recorder[0].destination;
-        if (replay->triggerDestination >= 0 &&
-            replay->triggerDestination <
-                DVRLoopBoundDetector::MaxArchitecturalIntRegs)
-            replay->helperRegs->vectorize(replay->triggerDestination);
         replay->valid = replay->scalarCount > 1 &&
             replay->triggerDestination > 0 &&
             replay->triggerDestination <
@@ -3343,6 +3350,19 @@ CPU::launchDVRNestedPrefetches(
     // final stream truncated to 128 scalar-equivalent lanes.
     dvrTraceVector("flatten_batch", curTick(), dvrNestedContext.triggerPC,
                    0, flattened, static_cast<int>(invocations));
+    // A flattened NDM batch is one bounded helper program.  Do not admit a
+    // prefix when the helper queue cannot hold the whole batch: a partial
+    // outer x inner vector would break the recorded flatten invariant and,
+    // worse, let later discoveries bury its source responses behind an
+    // unbounded queue.  This is the same admission discipline as ordinary
+    // DVR stride launches, applied before any helper state is created.
+    const unsigned available = DvrMaxQueuedPrefetches -
+        std::min<unsigned>(dvrPrefetchQueue.size(), DvrMaxQueuedPrefetches);
+    if (flattened == 0 || available < flattened) {
+        ++cpuStats.dvrHelperLaunchCapacityDrops;
+        ++cpuStats.dvrHelpersSuppressed;
+        return;
+    }
     if (replay->count > 1) {
         replay->continuation =
             std::make_shared<DVRVectorInstructionRegister>();
@@ -3351,6 +3371,21 @@ CPU::launchDVRNestedPrefetches(
             replay->scalarCount, replay->continuePastFLR);
         ++cpuStats.dvrVIRContinuationContexts;
     }
+    auto helper_regs = std::make_shared<DVRHelperVectorRegisterFile>();
+    if (dvrSharedPhysicalBank)
+        helper_regs->configureSharedPhysicalBank(&regFile, &freeList);
+    helper_regs->initialize(replay->initialRegs);
+    if (replay->triggerDestination >= 0 &&
+        replay->triggerDestination <
+            DVRLoopBoundDetector::MaxArchitecturalIntRegs &&
+        !helper_regs->vectorize(replay->triggerDestination)) {
+        ++cpuStats.dvrHelpersSuppressed;
+        return;
+    }
+    assert(helper_regs->conservationValid());
+    ++cpuStats.dvrHelperVRATPrograms;
+    if (helper_regs->usesSharedPhysicalBank())
+        ++cpuStats.dvrHelperSharedVRATPrograms;
     startDVRHelper(dvrNestedContext.triggerPC, replay->count,
                    flattened, dvrNestedContext.recorder.resourceCounts(),
                    replay, dvrNestedContext.tid);
@@ -3384,6 +3419,7 @@ CPU::launchDVRNestedPrefetches(
         prefetch.masks = masks;
         prefetch.patterns = patterns;
         prefetch.replay = replay;
+        prefetch.helperRegs = helper_regs;
         prefetch.lane = flat_lane;
         dvrPrefetchQueue.push_back(prefetch);
         dvrQueuedPrefetchAddresses.insert(prefetch.address);
@@ -3573,7 +3609,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
         lane.uopIndex = pc_index;
         const auto &uop = lane.program->uops[lane.uopIndex];
         const unsigned lane_id = lane.lane;
-        const auto &helper_regs = lane.program->helperRegs;
+        const auto &helper_regs = lane.helperRegs;
         const bool source0_ready = uop.source0 < 0 ||
             uop.source0 >= DVRLoopBoundDetector::MaxArchitecturalIntRegs ||
             (helper_regs ? helper_regs->readyAt(uop.source0, lane_id) :
@@ -3592,6 +3628,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
         if (!seed) {
             seed = &lane;
         } else if (lane.program != seed->program ||
+                   lane.helperRegs != seed->helperRegs ||
                    lane.uopIndex != seed->uopIndex ||
                    copy != seed->lane / DVRHelperThread::LanesPerVIRCopy ||
                    lane.program->uops[lane.uopIndex].pc !=
@@ -3684,6 +3721,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
     }
     DVRHelperThread::DVRDynUop dyn_uop;
     dyn_uop.program = seed->program;
+    dyn_uop.helperRegs = seed->helperRegs;
     dyn_uop.staticInst = decoded_inst;
     dyn_uop.uopIndex = seed->uopIndex;
     dyn_uop.opClass = op_class;
@@ -3703,18 +3741,18 @@ CPU::issueDVRReplayLanes(unsigned slots)
             dyn_uop.activeMask[lane->lane / 64] |=
                 uint64_t(1) << (lane->lane % 64);
         const int16_t source0_phys =
-            lane->program->helperRegs && uop.source0 >= 0 ?
-            lane->program->helperRegs->physicalIndex(
+            lane->helperRegs && uop.source0 >= 0 ?
+            lane->helperRegs->physicalIndex(
                 uop.source0, lane->lane) : -1;
         const int16_t source1_phys =
-            lane->program->helperRegs && uop.source1 >= 0 ?
-            lane->program->helperRegs->physicalIndex(
+            lane->helperRegs && uop.source1 >= 0 ?
+            lane->helperRegs->physicalIndex(
                 uop.source1, lane->lane) : -1;
         dyn_uop.source0Physical.push_back(source0_phys);
         dyn_uop.source1Physical.push_back(source1_phys);
-        if (lane->program->helperRegs) {
-            lane->program->helperRegs->retainPhysical(source0_phys);
-            lane->program->helperRegs->retainPhysical(source1_phys);
+        if (lane->helperRegs) {
+            lane->helperRegs->retainPhysical(source0_phys);
+            lane->helperRegs->retainPhysical(source1_phys);
         }
     }
     ++cpuStats.dvrVIRActiveMaskChecks;
@@ -3725,8 +3763,10 @@ CPU::issueDVRReplayLanes(unsigned slots)
         ++cpuStats.dvrVIRActiveMaskFailures;
     auto &copy = dvrHelperThread.virCopies.at(dyn_uop.copy);
     copy.activeMask = dyn_uop.activeMask;
+    copy.readyMask = dyn_uop.activeMask;
     copy.issuedMask = dyn_uop.activeMask;
     copy.executedMask = {};
+    copy.completedMask = {};
     copy.deadSourceMask = {};
     copy.pc = uop.pc;
     copy.uopIndex = seed->uopIndex;
@@ -3759,17 +3799,36 @@ CPU::issueDVRReplayLanes(unsigned slots)
     else
         ++cpuStats.dvrVectorALUChunkIssues;
 
+    // Rename a vector destination exactly once for this dynamic uop.  The
+    // old source names were retained above, so destination==source and WAW
+    // cases preserve the old values until this VIR copy retires.
+    const bool vector_destination = uop.destination > 0 &&
+        uop.destination < DVRLoopBoundDetector::MaxArchitecturalIntRegs &&
+        seed->helperRegs &&
+        ((uop.source0 >= 0 &&
+          seed->helperRegs->isVectorized(uop.source0)) ||
+         (uop.source1 >= 0 &&
+          seed->helperRegs->isVectorized(uop.source1)));
+    if (vector_destination) {
+        if (!seed->helperRegs->renameVector(uop.destination)) {
+            ++cpuStats.dvrVIRSourceValueSemanticFailures;
+            for (Lane *lane : group)
+                lane->active = false;
+        }
+        assert(seed->helperRegs->conservationValid());
+    }
+
     for (Lane *lane : group) {
         const auto &lane_uop = lane->program->uops[lane->uopIndex];
         const RegVal source0 = lane_uop.source0 >= 0 &&
             lane_uop.source0 < DVRLoopBoundDetector::MaxArchitecturalIntRegs ?
-            (lane->program->helperRegs ?
-             lane->program->helperRegs->read(lane_uop.source0, lane->lane) :
+            (lane->helperRegs ?
+             lane->helperRegs->read(lane_uop.source0, lane->lane) :
              lane->regs[lane_uop.source0]) : 0;
         const RegVal source1 = lane_uop.source1 >= 0 &&
             lane_uop.source1 < DVRLoopBoundDetector::MaxArchitecturalIntRegs ?
-            (lane->program->helperRegs ?
-             lane->program->helperRegs->read(lane_uop.source1, lane->lane) :
+            (lane->helperRegs ?
+             lane->helperRegs->read(lane_uop.source1, lane->lane) :
              lane->regs[lane_uop.source1]) : 0;
         RegVal result = 0;
         bool valid = true;
@@ -3850,8 +3909,8 @@ CPU::issueDVRReplayLanes(unsigned slots)
             if (exact_relation != dvrAddressRelations.end() &&
                 exact_relation->second.trained) {
                 const auto &relation = exact_relation->second;
-                const RegVal trigger_value = lane->program->helperRegs ?
-                    lane->program->helperRegs->read(
+                const RegVal trigger_value = lane->helperRegs ?
+                    lane->helperRegs->read(
                         seed->program->triggerDestination, lane->lane) :
                     lane->regs[seed->program->triggerDestination];
                 const bool mask_match =
@@ -3873,16 +3932,16 @@ CPU::issueDVRReplayLanes(unsigned slots)
                 for (unsigned relation = 0; relation < lane->relationCount;
                      ++relation) {
                     if (lane->relationCount > 1 &&
-                        ((lane->program->helperRegs ?
-                          lane->program->helperRegs->read(
+                        ((lane->helperRegs ?
+                          lane->helperRegs->read(
                               seed->program->triggerDestination, lane->lane) :
                           lane->regs[seed->program->triggerDestination]) &
                          lane->masks[relation]) != lane->patterns[relation])
                         continue;
                     const int64_t expected = lane->scales[relation] *
                         static_cast<int64_t>(
-                            lane->program->helperRegs ?
-                            lane->program->helperRegs->read(
+                            lane->helperRegs ?
+                            lane->helperRegs->read(
                                 seed->program->triggerDestination, lane->lane) :
                             lane->regs[seed->program->triggerDestination]) +
                         lane->offsets[relation];
@@ -3892,6 +3951,14 @@ CPU::issueDVRReplayLanes(unsigned slots)
                     }
                 }
             }
+            // An NDM batch flattens independently discovered outer
+            // invocations.  Their training relation may differ even though
+            // the helper has just computed this lane's address through the
+            // recorded dependency chain.  Do not discard that semantic
+            // result merely because one aggregate relation rejects it.
+            // Ordinary DVR keeps the relation filter as a conservative gate.
+            if (!relation_match && lane->nested)
+                relation_match = true;
             if (!relation_match) {
                 lane->active = false;
                 ++cpuStats.dvrPredicateMisses;
@@ -3919,6 +3986,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
                 dependent.masks = lane->masks;
                 dependent.patterns = lane->patterns;
                 dependent.replay = lane->program;
+                dependent.helperRegs = lane->helperRegs;
                 dependent.predicate = lane->predicate;
                 dependent.lane = lane->lane;
                 dvrPrefetchQueue.push_front(dependent);
@@ -3955,17 +4023,10 @@ CPU::issueDVRReplayLanes(unsigned slots)
             // A destination fed by a vectorized source gets the paper's
             // 16-copy VRAT mapping before its first lane result is written.
             // The trigger load is already vectorized during helper launch.
-            const bool vector_source = lane->program->helperRegs &&
-                ((lane_uop.source0 >= 0 &&
-                  lane->program->helperRegs->isVectorized(lane_uop.source0)) ||
-                 (lane_uop.source1 >= 0 &&
-                  lane->program->helperRegs->isVectorized(lane_uop.source1)));
-            if (vector_source)
-                lane->program->helperRegs->vectorize(lane_uop.destination);
             lane->regs[lane_uop.destination] = result;
             lane->readyCycle[lane_uop.destination] = ready_tick;
-            if (lane->program->helperRegs)
-                lane->program->helperRegs->write(
+            if (lane->helperRegs)
+                lane->helperRegs->write(
                     lane_uop.destination, lane->lane, result, ready_tick);
             ++cpuStats.dvrHelperVRATWrites;
         }
@@ -4110,7 +4171,11 @@ CPU::serviceDVRPrefetchQueue()
     // produced a dependent address must wait for its own readiness.
     cpuStats.dvrHelperUopsBecameReady +=
         dvrHelperThread.wakeForMemoryRequest();
-    if (!dvrHelperThread.canIssue())
+    // The request's readyTick is the helper-LSU dependency check.  A source
+    // has readyTick=0; a dependent target receives the completion tick of
+    // its vector producer.  Once that per-request condition holds, unrelated
+    // lanes still present in the helper must not block this memory uop.
+    if (!dvrHelperThread.canIssue(true))
         return;
     if (dvrHelperIssuesThisCycle >= DvrHelperIssueWidth) {
         ++cpuStats.dvrResourceConflicts;
@@ -4240,6 +4305,7 @@ CPU::serviceDVRPrefetchQueue()
         prefetch.source, prefetch.nested, prefetch.oracle,
         prefetch.relationCount, prefetch.scales,
         prefetch.offsets, prefetch.masks, prefetch.patterns, prefetch.replay,
+        prefetch.helperRegs,
         prefetch.predicate, prefetch.lane, prefetch.tid);
     sender_state->helperLoadId = helper_load_id;
     sender_state->issueTick = curTick();

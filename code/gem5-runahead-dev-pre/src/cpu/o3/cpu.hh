@@ -1242,6 +1242,62 @@ class CPU : public BaseCPU
             return true;
         }
 
+        // Allocate a fresh vector destination for every dynamic WAW.  Copy
+        // the old mapping first so inactive SIMT lanes retain their value;
+        // issued readers keep the old physical names through users[].
+        bool renameVector(unsigned arch)
+        {
+            if (arch >= NumArchitecturalRegs)
+                return false;
+            if (!vrat[arch].vectorized)
+                return vectorize(arch);
+
+            const auto old_bundle = vrat[arch].vector;
+            const auto new_bundle = allocateVectorBundle();
+            if (new_bundle[0] < 0)
+                return false;
+            for (unsigned copy = 0; copy < VectorCopies; ++copy) {
+                auto &dst = physical[new_bundle[copy]];
+                const auto &src = physical[old_bundle[copy]];
+                for (unsigned lane = 0; lane < LanesPerVectorCopy; ++lane) {
+                    writePhysical(new_bundle[copy], lane,
+                        readPhysical(old_bundle[copy], lane));
+                    dst.ready[lane] = src.ready[lane];
+                    if (src.valid[lane / 64] &
+                        (uint64_t(1) << (lane % 64))) {
+                        dst.valid[lane / 64] |=
+                            uint64_t(1) << (lane % 64);
+                    }
+                }
+                vrat[arch].vector[copy] = new_bundle[copy];
+                release(old_bundle[copy]);
+            }
+            return true;
+        }
+
+        bool conservationValid() const
+        {
+            for (unsigned phys = 0; phys < NumPhysicalRegs; ++phys) {
+                if (allocated[phys] != physical[phys].allocated)
+                    return false;
+                if (!allocated[phys] &&
+                    (physical[phys].users != 0 ||
+                     physical[phys].pendingRelease))
+                    return false;
+            }
+            for (const auto &mapping : vrat) {
+                if (mapping.vectorized) {
+                    for (const auto phys : mapping.vector)
+                        if (phys < 0 || !allocated[phys])
+                            return false;
+                } else if (mapping.scalar >= 0 &&
+                           !allocated[mapping.scalar]) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         bool isVectorized(unsigned arch) const
         {
             return arch < NumArchitecturalRegs && vrat[arch].vectorized;
@@ -1321,7 +1377,6 @@ class CPU : public BaseCPU
         std::array<DVRInstructionRecorder::Uop,
                    DVRInstructionRecorder::MaxUops> uops = {};
         DVRLoopBoundDetector::RegisterSnapshot initialRegs = {};
-        std::shared_ptr<DVRHelperVectorRegisterFile> helperRegs;
         std::shared_ptr<DVRVectorInstructionRegister> continuation;
         bool valid = false;
     };
@@ -1353,6 +1408,10 @@ class CPU : public BaseCPU
         std::array<RegVal, MaxRelations> masks;
         std::array<RegVal, MaxRelations> patterns;
         std::shared_ptr<const DVRReplayTemplate> replay;
+        // This belongs to one launched helper execution, rather than to the
+        // immutable discovery template.  Retaining it in a template made
+        // old discoveries consume the private physical bank indefinitely.
+        std::shared_ptr<DVRHelperVectorRegisterFile> helperRegs;
         std::shared_ptr<DVRPredicateGeneration> predicate;
         unsigned lane;
         ThreadID tid;
@@ -1368,6 +1427,7 @@ class CPU : public BaseCPU
             const std::array<RegVal, MaxRelations> &relation_masks,
             const std::array<RegVal, MaxRelations> &relation_patterns,
             std::shared_ptr<const DVRReplayTemplate> replay_template,
+            std::shared_ptr<DVRHelperVectorRegisterFile> helper_regs,
             std::shared_ptr<DVRPredicateGeneration> predicate_generation,
             unsigned lane_id,
             ThreadID thread);
@@ -1457,6 +1517,7 @@ class CPU : public BaseCPU
         std::array<RegVal, DVRPrefetchSenderState::MaxRelations> masks = {};
         std::array<RegVal, DVRPrefetchSenderState::MaxRelations> patterns = {};
         std::shared_ptr<const DVRReplayTemplate> replay;
+        std::shared_ptr<DVRHelperVectorRegisterFile> helperRegs;
         std::shared_ptr<DVRPredicateGeneration> predicate;
         unsigned lane = 0;
     };
@@ -1503,6 +1564,7 @@ class CPU : public BaseCPU
             enum class State { Decoded, Ready, Issued, WaitingMemory,
                                Completed };
             std::shared_ptr<const DVRReplayTemplate> program;
+            std::shared_ptr<DVRHelperVectorRegisterFile> helperRegs;
             StaticInstPtr staticInst;
             unsigned uopIndex = 0;
             OpClass opClass = SimdAluOp;
@@ -1531,8 +1593,10 @@ class CPU : public BaseCPU
         struct VIRCopyState
         {
             std::array<uint64_t, 2> activeMask = {};
+            std::array<uint64_t, 2> readyMask = {};
             std::array<uint64_t, 2> issuedMask = {};
             std::array<uint64_t, 2> executedMask = {};
+            std::array<uint64_t, 2> completedMask = {};
             std::array<uint64_t, 2> deadSourceMask = {};
             Addr pc = 0;
             unsigned uopIndex = 0;
@@ -1571,6 +1635,7 @@ class CPU : public BaseCPU
             };
             static constexpr unsigned ReconvergenceEntries = 8;
             std::shared_ptr<const DVRReplayTemplate> program;
+            std::shared_ptr<DVRHelperVectorRegisterFile> helperRegs;
             std::array<RegVal, DVRLoopBoundDetector::MaxArchitecturalIntRegs>
                 regs = {};
             std::array<Tick, DVRLoopBoundDetector::MaxArchitecturalIntRegs>
@@ -1822,13 +1887,14 @@ class CPU : public BaseCPU
         {
             became_ready = 0;
             if (!sender.replay || sender.replay->count <= 1 ||
-                !sender.replay->helperRegs ||
+                !sender.helperRegs ||
                 sender.replay->triggerDestination < 0 ||
                 sender.replay->triggerDestination >=
                     DVRLoopBoundDetector::MaxArchitecturalIntRegs)
                 return false;
             ReplayLaneContext lane_context;
             lane_context.program = sender.replay;
+            lane_context.helperRegs = sender.helperRegs;
             lane_context.regs = sender.replay->initialRegs;
             lane_context.regs[0] = 0;
             lane_context.regs[sender.replay->triggerDestination] = source_value;
@@ -1844,7 +1910,7 @@ class CPU : public BaseCPU
             lane_context.lanePC = sender.replay->count > 1 ?
                 sender.replay->uops[1].pc : 0;
             lane_context.nested = sender.nested;
-            sender.replay->helperRegs->write(
+            sender.helperRegs->write(
                 sender.replay->triggerDestination, sender.lane,
                 source_value, 0);
             replayLanes.push_back(std::move(lane_context));
@@ -1868,6 +1934,7 @@ class CPU : public BaseCPU
                     copy.executed = true;
                     for (unsigned word = 0; word < 2; ++word) {
                         copy.executedMask[word] |= it->activeMask[word];
+                        copy.completedMask[word] |= it->activeMask[word];
                         copy.issuedMask[word] &= ~it->activeMask[word];
                     }
                     if (copy.inFlight != 0)
@@ -1877,11 +1944,12 @@ class CPU : public BaseCPU
                          it->destination == it->source1);
                     copy.deadSourceMask = copy.deadSource ?
                         it->activeMask : std::array<uint64_t, 2>{};
-                    if (it->program && it->program->helperRegs) {
+                    if (it->helperRegs) {
                         for (const auto phys : it->source0Physical)
-                            it->program->helperRegs->releasePhysical(phys);
+                            it->helperRegs->releasePhysical(phys);
                         for (const auto phys : it->source1Physical)
-                            it->program->helperRegs->releasePhysical(phys);
+                            it->helperRegs->releasePhysical(phys);
+                        assert(it->helperRegs->conservationValid());
                     }
                     ++retired;
                     it = virBuffer.erase(it);
@@ -2051,14 +2119,15 @@ class CPU : public BaseCPU
 
         unsigned wakeForMemoryRequest()
         {
-            if (computePending())
-                return 0;
             unsigned became_ready = 0;
-            if (state == State::Idle || state == State::Draining ||
-                (state == State::Running && readyUops == 0 &&
-                 fetchRemaining == 0 && decodeRemaining == 0)) {
+            if (state == State::Idle || state == State::Draining)
                 state = State::Running;
-                readyUops = std::max(readyUops, 1u);
+            // The queue front has already passed its per-request readyTick.
+            // Give that memory uop one issue credit even while unrelated
+            // lanes still have frontend work; otherwise a dependent load can
+            // remain behind fetchRemaining until program exit.
+            if (readyUops == 0) {
+                readyUops = 1;
                 became_ready = 1;
             }
             // External source responses can create replay loads after the

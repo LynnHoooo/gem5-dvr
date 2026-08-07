@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${ROOT:-$HOME/dvr-repro/source/gem5-runahead-dev-pre}"
-BENCH="${BENCH:-$ROOT/benchmarks/dvr_ndm.riscv}"
-SOURCE="${SOURCE:-$ROOT/benchmarks/dvr_ndm.c}"
-OUT_ROOT="${OUT_ROOT:-$HOME/dvr-repro/results/dvr-ndm-e2e}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+ROOT="${ROOT:-$REPO_ROOT/code/gem5-runahead-dev-pre}"
+BENCH="${BENCH:-$REPO_ROOT/benchmarks/dvr_ndm.riscv}"
+SOURCE="${SOURCE:-$REPO_ROOT/benchmarks/dvr_ndm.c}"
+OUT_ROOT="${OUT_ROOT:-/home/lynnhoo/dvr-repro/results/dvr-ndm-e2e}"
 GEM5="${GEM5:-$ROOT/build/RISCV/gem5.opt}"
 
 read_stat() {
@@ -24,7 +26,8 @@ if [[ ! -x "$BENCH" ]]; then
     compiler="${CC:-}"
     if [[ -z "$compiler" ]]; then
         for candidate in riscv64-unknown-linux-gnu-gcc \
-                        riscv64-linux-gnu-gcc riscv64-unknown-elf-gcc; do
+                        riscv64-linux-gnu-gcc riscv64-unknown-elf-gcc \
+                        /home/lynnhoo/buckyball/result/bin/riscv64-unknown-linux-gnu-gcc; do
             if command -v "$candidate" >/dev/null 2>&1; then
                 compiler="$candidate"
                 break

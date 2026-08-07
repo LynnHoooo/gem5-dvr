@@ -19,3 +19,5 @@ tmp/
 # Local environment and generated files
 *.log
 *.tmp
+*.riscv
+benchmarks/*_trace/
