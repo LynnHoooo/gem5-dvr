@@ -134,7 +134,32 @@ M5：论文配置下至少三个 workload 趋势一致；差距超过 20% 时必
 
 M6：冻结参数后迁移到统一平台，DVR 和待比较设计共享全部 core/cache/DRAM 参数及输入。
 
-## 6. 结果归档与判定
+## 6. Camel/BFS 统一消融实测（2026-08-07）
+
+已使用 `/home/lynnhoo/gem-test/gem5-leap/leap-bench` 的 Camel 与 GAP BFS，在同一
+gem5 配置和 ROI 下完成 Baseline、VR、Offload、Discovery、Multiple/NDM、Oracle 六组。
+合并证据目录：
+
+```text
+/home/lynnhoo/dvr-repro/results/final/20260807T165300-combined-fixed
+```
+
+当前实测结果不能直接宣称论文 Figure 8 趋势已复现：Offload 的 IPC 提升伴随真实
+translation faults；Discovery/Multiple 产生 helper/dependent activity，但 Multiple 在这两个
+输入上没有 IPC 提升，部分 BFS/Camel DVR 行的 committed 数量也未与 baseline 守恒。
+这些行在 `correctness.csv` 中保留为 `observe`，没有被改写成通过。
+
+Camel 资源敏感性目录：
+
+```text
+/home/lynnhoo/dvr-repro/results/final/20260807T165000-resource
+```
+
+已覆盖 MaxUops 8/16/32/64、vector FU constrained/unlimited、element width 32/64 和
+max lanes 32/64/128；VIR copies 与 helper frontend width 当前没有参数入口，NDM 外层上限
+由实现固定为 16，因此只记录为未暴露/固定配置。
+
+## 7. 结果归档与判定
 
 每次运行目录必须包含：
 
