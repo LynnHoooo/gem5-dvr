@@ -274,6 +274,11 @@ class DVRInstructionRecorder
         // helper lanes; untainted control is replayed on its observed path.
         bool tainted = false;
         bool alternatePath = false;
+        // For a cached suffix, the PC at which the lane resumes after the
+        // suffix's terminal uop.  This is distinct from the branch's
+        // reconvergence key because the latter may be unresolved in a
+        // single-path discovery.
+        Addr alternateResumePC = 0;
 
         /**
          * 计算支持的标量地址生成操作。

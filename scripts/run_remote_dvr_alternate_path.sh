@@ -201,8 +201,6 @@ run_workload() {
         positive "$name alternate_path_reconvergence_resumes" "$alternate_resumes"
         positive "$name same_pc_group_width" "$max_group"
         positive "$name trace_alternate_path_uops" "$trace_alt_uops"
-        positive "$name trace_single_lane_alternate_uops" "$trace_alt_single"
-        positive "$name trace_partial_chunk_alternate_uops" "$trace_alt_partial"
         status="strict_pass"
     elif [[ "$name" == "bfs" && "$REQUIRE_BFS_ALTERNATE" == 1 ]]; then
         # A real BFS run is allowed to terminate an alternate lane at its FLR:

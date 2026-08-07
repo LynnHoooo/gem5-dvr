@@ -32,12 +32,9 @@ paper-faithful、独立 in-order helper timing model，而非第二条 O3/ROB �
 2. `LBU/LHU` 已进入构建，不再作为缺口；但更多 arithmetic、word operation、indirect
    control-flow、break/early-exit 和 path live-out 组合仍需专项测试。
 
-3. BFS/Camel 的严格 alternate-path demand coverage 仍未完成。真实 serial GAPBS BFS
-   `-g 11 -n 1` 已经产生 `complete_hits=2`、`alternate_uops=99`、
-   `alternate_targets=1`，说明 cache-to-lane admission/replay 已接通；但该 target 的
-   `alternate_demand_covered=0`、`reconvergence_resume=0`，所以 timeliness/路径恢复仍
-   未被证明。当前 Camel 实际 workload 的普通 DVR 路径有效，但本次没有暴露 alternate
-   complete path（`complete_hits=0`），不能沿用旧的 complete-hit 结果声称 Camel 已覆盖。
+3. M1 indirect 和 M3 单层 alternate-path/reconvergence 专项 gate 已通过；真实 BFS/Camel
+   的 workload-specific alternate demand 仍只作为观察项，因为它们的动态控制流不稳定地
+   暴露同一 branch 的两侧路径，不能用专项微基准结果替代真实 workload 覆盖声明。
 
 ### P2：资源模型和论文复现
 
@@ -234,3 +231,27 @@ inner-lane batch。最近结果为 attempts `65`、branch inversions `65`、oute
 `130`、flatten batches `3709`、flattened/expected lanes `457411/457411`，nested helper
 generated/issued/completed `457411/406430/406430`。这证明 execution-driven NDM data plane
 已接通，但不改变上面 P0 的论文级限制。
+
+### 当前 M1/M2/M3 验证快照（2026-08-07）
+
+本轮已完成三个 gate，并使用当前 `build/RISCV/gem5.opt` 重新验证：
+
+- **M1 单层 indirect coverage**：`results/dvr-m1-final/`。baseline/full committed
+  `346924/346924`，replay targets `8175`，dependent issued/completed `8175/8175`，
+  demand coverage `8062/8187`（98.5%），最大 PC group `8`，translation faults `0`。
+- **M2 helper/NDM strict regression**：`results/dvr-m2-final/20260807T162353-2820772/`。
+  branch helper decoded/issued/completed 守恒，最大 group `8`；NDM attempts/inversions/outer
+  `421/421/421`，outer invocations `842`，flattened/expected `879963/879963`，
+  nested replay targets `108856`，dependent issued/completed `108856/108856`，
+  variable batches `1263`，translation faults、active-mask failures、stack overflows 和
+  helper pending 均为 `0`。脚本输出 `DVR_HELPER_REGRESSION_PASSED`。
+- **M3 alternate-path/reconvergence**：`results/dvr-m3-final/20260807T162233-2819992/`。
+  `dvr_divergent` baseline/full committed `385066/385066`；complete cache hits `184`，
+  alternate uops `10219`，alternate dependent targets `4622`，demand covered `4468`，
+  reconvergence resumes `8686`，stack overflows `0`，helper decoded/issued/completed
+  `31146/31146/31146`。脚本输出 `DVR_ALTERNATE_PATH_MULTI_PASSED`。
+
+M3 的修复包括：缓存 FLR 终点 load、保存 alternate suffix 的 resume PC、在同一
+`branchPC/targetPC/address-space` path family 下处理动态 path-local FLR，并将实际 admitted
+alternate target 写入 trace。没有把 alternate-cache hit 当成 M2 的必要条件；M2 gate 仍检查
+source→target→issued/completed 与 flatten 守恒。

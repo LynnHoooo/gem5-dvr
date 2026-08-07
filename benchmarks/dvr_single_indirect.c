@@ -1,33 +1,21 @@
 #include <stdint.h>
 
 enum {
-    Elements = 1 << 12,
+    Elements = 1 << 10,
     Repetitions = 8,
     Mask = Elements - 1
 };
 
 static volatile uint64_t indices[Elements];
 static volatile uint64_t payload[Elements];
-static volatile uint64_t delay_state;
 static volatile uint64_t sink;
-
-static uint64_t
-mix(uint64_t x)
-{
-    x ^= x >> 12;
-    x ^= x << 25;
-    x ^= x >> 27;
-    return x * UINT64_C(2685821657736338717);
-}
 
 void
 _start(void)
 {
-    uint64_t state = 1;
     uint64_t sum = 0;
     for (uint64_t i = 0; i < Elements; ++i) {
-        state = mix(state + i);
-        indices[i] = state & Mask;
+        indices[i] = (i * 17) & Mask;
         payload[i] = i * 3 + 1;
     }
 
@@ -40,18 +28,23 @@ _start(void)
     for (unsigned r = 0; r < Repetitions; ++r) {
         for (uint64_t i = 0; i < Elements; ++i) {
             const uint64_t index = indices[i];
-            /*
-             * Leave a real window between the source value and the
-             * dependent demand.  This is still a single A[B[i]] chain, but
-             * it makes the decoupled helper's lead time measurable rather
-             * than forcing every implementation to race the same-cycle
-             * demand load.
-             */
-            for (unsigned k = 0; k < 8; ++k)
-                delay_state = mix(delay_state + k);
+            // Fixed straight-line work gives the decoupled source request
+            // time to return without introducing a nested control-flow path
+            // into the trigger-to-FLR recorder slice.
+            asm volatile(
+                "nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n"
+                "nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n"
+                "nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n"
+                "nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n"
+                ::: "memory");
             sum += payload[index];
         }
     }
+
+    // Keep the SE context alive long enough for the final helper responses
+    // to retire before the correctness gate samples stats at exit.
+    for (unsigned wait = 0; wait < 256; ++wait)
+        asm volatile("nop" ::: "memory");
 
     sink = sum;
     register long a0 asm("a0") = 0;

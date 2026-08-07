@@ -3600,12 +3600,32 @@ CPU::issueDVRReplayLanes(unsigned slots)
             if (frame.alternatePath)
                 ++cpuStats.dvrReconvergenceResumeSuccesses;
         }
-        const unsigned pc_index = findPC(lane.program, lane.lanePC);
+        unsigned pc_index = findPC(lane.program, lane.lanePC);
         if (pc_index == std::numeric_limits<unsigned>::max()) {
             lane.active = false;
             ++cpuStats.dvrVIRExternalPathLanes;
             continue;
         }
+        // Remove stateless unsupported instructions from the executable
+        // dependency slice before they consume VIR/FU bandwidth.  Typical
+        // examples are architectural NOPs between the source and FLR.
+        while (pc_index < lane.program->count) {
+            const auto &candidate = lane.program->uops[pc_index];
+            if (candidate.semantic !=
+                    DVRInstructionRecorder::Uop::Semantic::Unsupported ||
+                candidate.control || candidate.intDestinations != 0) {
+                break;
+            }
+            ++lane.helperUops;
+            if (lane.helperUops >= dvrHelperMaxUops ||
+                pc_index + 1 >= lane.program->count) {
+                lane.active = false;
+                break;
+            }
+            lane.lanePC = lane.program->uops[++pc_index].pc;
+        }
+        if (!lane.active)
+            continue;
         lane.uopIndex = pc_index;
         const auto &uop = lane.program->uops[lane.uopIndex];
         const unsigned lane_id = lane.lane;
@@ -3951,14 +3971,17 @@ CPU::issueDVRReplayLanes(unsigned slots)
                     }
                 }
             }
-            // An NDM batch flattens independently discovered outer
-            // invocations.  Their training relation may differ even though
-            // the helper has just computed this lane's address through the
-            // recorded dependency chain.  Do not discard that semantic
-            // result merely because one aggregate relation rejects it.
-            // Ordinary DVR keeps the relation filter as a conservative gate.
-            if (!relation_match && lane->nested)
-                relation_match = true;
+            // A valid recorded replay has computed this address through the
+            // actual trigger-to-FLR dependency chain.  The aggregate affine
+            // relation is only a legacy fallback/predicate aid; it can differ
+            // across NDM invocations and can also alias across ordinary
+            // discovery generations.  It must not veto the semantic replay.
+            if (!relation_match && lane->program && lane->program->valid) {
+                relation_match = exact_relation == dvrAddressRelations.end() ||
+                    !exact_relation->second.trained ||
+                    (result >= exact_relation->second.minAddress &&
+                     result <= exact_relation->second.maxAddress);
+            }
             if (!relation_match) {
                 lane->active = false;
                 ++cpuStats.dvrPredicateMisses;
@@ -3966,6 +3989,11 @@ CPU::issueDVRReplayLanes(unsigned slots)
             }
             if (!dvrEnableDependentPrefetch) {
                 lane->active = false;
+                continue;
+            }
+            if (result < 4096 || result >= (Addr(1) << 47)) {
+                lane->active = false;
+                ++cpuStats.dvrPredicateMisses;
                 continue;
             }
             const Addr line = dvrPrefetchLine(result);
@@ -3999,6 +4027,13 @@ CPU::issueDVRReplayLanes(unsigned slots)
                 if (lane_uop.alternatePath || executingAlternatePath(*lane)) {
                     ++cpuStats.dvrAlternatePathDependentTargets;
                     dvrAlternateDependentLines.insert(line);
+                    // Trace only admitted alternate-path work.  This keeps
+                    // the compact trace count aligned with the strict
+                    // alternate-uop accounting instead of counting every
+                    // lane in a shared VIR issue group.
+                    dvrTraceVector("alternate_path_uop", curTick(),
+                        lane_uop.pc, 0, 1,
+                        static_cast<int>(lane->lane));
                     dvrTraceDependency("alternate_replay_target", curTick(),
                         lane->triggerPC, lane_uop.pc, result,
                         lane->predicate ? 1 : 0, lane->lane);
@@ -4014,6 +4049,9 @@ CPU::issueDVRReplayLanes(unsigned slots)
             } else {
                 ++cpuStats.dvrPrefetchesDeduplicated;
             }
+            if (lane_uop.alternatePath &&
+                lane_uop.alternateResumePC != 0)
+                ++cpuStats.dvrReconvergenceResumeSuccesses;
             lane->active = false;
             continue;
         }
@@ -4034,10 +4072,18 @@ CPU::issueDVRReplayLanes(unsigned slots)
         ++lane->helperUops;
         // A cached direct JAL/C.J must use its validated target rather than
         // incorrectly falling through into a different suffix.
-        lane->lanePC = lane_uop.control && !lane_uop.conditional &&
+        if (lane_uop.alternatePath && lane_uop.alternateResumePC != 0) {
+            lane->lanePC = lane_uop.alternateResumePC;
+            if (lane->reconvergenceDepth != 0) {
+                lane->reconvergenceDepth = 0;
+                ++cpuStats.dvrReconvergenceResumeSuccesses;
+            }
+        } else {
+            lane->lanePC = lane_uop.control && !lane_uop.conditional &&
             lane_uop.branchTargetPC != 0 ? lane_uop.branchTargetPC :
             (lane->uopIndex + 1 < lane->program->count ?
              lane->program->uops[lane->uopIndex + 1].pc : 0);
+        }
         if (lane->lanePC == 0 || lane->helperUops >= dvrHelperMaxUops)
             lane->active = false;
         else
@@ -4985,6 +5031,23 @@ void
 CPU::recordDVRAlternatePaths(const DVRInstructionRecorder &recorder,
                              ContextID address_space_id)
 {
+    // A recorder initially fills reconvergencePC with the first committed
+    // successor after a branch.  That is useful as a path extraction bound,
+    // but it is not a stable join key: the successor is the taken target in
+    // one discovery and the fall-through PC in another.  Treat such an
+    // immediate successor as an unresolved join (zero) for cache identity;
+    // a real FLR/CFG join remains part of the key.
+    const auto cache_reconvergence =
+        [](const DVRInstructionRecorder::Uop &uop) {
+            const auto near = [](Addr lhs, Addr rhs) {
+                return lhs != 0 && rhs != 0 &&
+                    (lhs >= rhs ? lhs - rhs : rhs - lhs) <= 4;
+            };
+            if (near(uop.reconvergencePC, uop.branchTargetPC) ||
+                near(uop.reconvergencePC, uop.fallthroughPC))
+                return Addr(0);
+            return uop.reconvergencePC;
+        };
     for (unsigned branch = 0; branch < recorder.size(); ++branch) {
         const auto &op = recorder[branch];
         if (!op.conditional || !op.tainted)
@@ -5005,6 +5068,15 @@ CPU::recordDVRAlternatePaths(const DVRInstructionRecorder &recorder,
             }
         }
         path.complete = end < recorder.size() && end > branch + 1;
+        // Include a boundary FLR in the cached suffix.  Without the load,
+        // an alternate branch can replay arithmetic but cannot emit a target.
+        unsigned path_end = end;
+        Addr alternate_resume = 0;
+        if (path.complete && recorder[end].load) {
+            path_end = end + 1;
+            if (path_end < recorder.size())
+                alternate_resume = recorder[path_end].pc;
+        }
         uint32_t defined = 0;
         uint32_t live_out = 0;
         if (path.complete) {
@@ -5015,7 +5087,7 @@ CPU::recordDVRAlternatePaths(const DVRInstructionRecorder &recorder,
             const auto captured_pc = [&](Addr pc) {
                 if (pc == reconvergence)
                     return true;
-                for (unsigned candidate = branch + 1; candidate < end;
+                for (unsigned candidate = branch + 1; candidate < path_end;
                      ++candidate) {
                     if (recorder[candidate].pc == pc)
                         return true;
@@ -5026,7 +5098,7 @@ CPU::recordDVRAlternatePaths(const DVRInstructionRecorder &recorder,
                 }
                 return false;
             };
-            for (unsigned index = branch + 1; index < end; ++index) {
+            for (unsigned index = branch + 1; index < path_end; ++index) {
                 const auto &path_uop = recorder[index];
                 // A cached alternate path may contain another direct
                 // conditional branch.  The SIMT VIR/reconvergence stack can
@@ -5055,7 +5127,7 @@ CPU::recordDVRAlternatePaths(const DVRInstructionRecorder &recorder,
                     bool writes_live_value = false;
                     if (path_uop.intDestinations != 0) {
                         for (unsigned later = index + 1;
-                             later < end; ++later) {
+                             later < path_end; ++later) {
                             if (path_uop.intDestinations &
                                 recorder[later].intSources) {
                                 writes_live_value = true;
@@ -5136,13 +5208,21 @@ CPU::recordDVRAlternatePaths(const DVRInstructionRecorder &recorder,
                 cached_uop.alternatePath = true;
                 path.uops.push_back(cached_uop);
             }
+            if (path.complete && !path.uops.empty())
+                path.uops.back().alternateResumePC = alternate_resume;
             if (path.uops.empty())
                 path.complete = false;
         }
 
-        DVRAlternatePathKey key{op.pc, target, reconvergence,
+        DVRAlternatePathKey key{op.pc, target, cache_reconvergence(op),
                                 address_space_id};
         path.codeVersion = 0;
+        // Keep the full cache key in the compact dependency trace.  The
+        // vector trace only has room for branch/target, while reconvergence
+        // and address-space identity are part of the correctness key.
+        dvrTraceDependency("alternate_path_record_key", curTick(),
+            op.pc, target, cache_reconvergence(op),
+            static_cast<int>(address_space_id));
         dvrTraceVector(path.complete ? "alternate_path_record_complete" :
                        "alternate_path_record_incomplete", curTick(),
                        op.pc, target, path.uops.size(),
@@ -5159,6 +5239,17 @@ CPU::augmentDVRAlternatePaths(
     DVRInstructionRecorder &recorder, ContextID address_space_id,
     const DVRLoopBoundDetector::RegisterSnapshot &initial_regs)
 {
+    const auto cache_reconvergence =
+        [](const DVRInstructionRecorder::Uop &uop) {
+            const auto near = [](Addr lhs, Addr rhs) {
+                return lhs != 0 && rhs != 0 &&
+                    (lhs >= rhs ? lhs - rhs : rhs - lhs) <= 4;
+            };
+            if (near(uop.reconvergencePC, uop.branchTargetPC) ||
+                near(uop.reconvergencePC, uop.fallthroughPC))
+                return Addr(0);
+            return uop.reconvergencePC;
+        };
     bool admitted_complete_path = false;
     struct BranchOccurrence
     {
@@ -5204,10 +5295,36 @@ CPU::augmentDVRAlternatePaths(
 
         ++cpuStats.dvrAlternatePathLookups;
         const DVRAlternatePathKey key{op.pc, alternate_target,
-                                      op.reconvergencePC, address_space_id};
-        const auto found = dvrAlternatePathCache.find(key);
-        if (found == dvrAlternatePathCache.end())
+                                      cache_reconvergence(op),
+                                      address_space_id};
+        auto found = dvrAlternatePathCache.find(key);
+        // A single-path discovery may terminate at its path-local FLR
+        // rather than a shared CFG join.  Preserve branch, target and
+        // address-space identity, but allow a complete candidate with the
+        // same path family to supply the missing suffix.  The candidate's
+        // own reconvergence metadata remains attached to its uops and is
+        // validated by the replay lane before resuming.
+        if (found == dvrAlternatePathCache.end()) {
+            for (auto candidate = dvrAlternatePathCache.begin();
+                 candidate != dvrAlternatePathCache.end(); ++candidate) {
+                if (candidate->first.branchPC == op.pc &&
+                    candidate->first.targetPC == alternate_target &&
+                    candidate->first.addressSpaceID == address_space_id &&
+                    candidate->second.complete) {
+                    found = candidate;
+                    break;
+                }
+            }
+        }
+        if (found == dvrAlternatePathCache.end()) {
+            dvrTraceDependency("alternate_path_lookup_miss", curTick(),
+                op.pc, alternate_target, op.reconvergencePC,
+                static_cast<int>(address_space_id));
             continue;
+        }
+        dvrTraceDependency("alternate_path_lookup_hit", curTick(),
+            op.pc, alternate_target, op.reconvergencePC,
+            static_cast<int>(address_space_id));
         ++cpuStats.dvrAlternatePathHits;
         const auto &path = found->second;
         if (!path.complete) {

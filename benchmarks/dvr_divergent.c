@@ -6,19 +6,13 @@
  * large base-address jumps repeatedly destroyed the stride detector's
  * confidence and could leave Discovery with no committed start.
  *
- * The source values alternate parity while changing within each parity class.
- * This gives one stable trigger and two data-dependent FLR PCs:
- *
- *   indices[i] -> even_payload[indices[i]]
- *              -> odd_payload[indices[i]]
- *
- * Each FLR also sees at least two distinct values, so both affine relations
- * can train rather than merely being observed once.
+ * The branch changes the index, then both paths join before the dependent
+ * load.  This is the minimal single-entry/single-exit shape needed to train
+ * an alternate path and resume at one real reconvergence/FLR PC.
  */
 enum { Elements = 4096, Repetitions = 6, Mask = Elements - 1 };
 static volatile uint64_t indices[Elements];
-static volatile uint64_t even_payload[Elements];
-static volatile uint64_t odd_payload[Elements];
+static volatile uint64_t payload[Elements];
 static volatile uint64_t sink;
 
 /* Prevent GCC from replacing the conditional branch with a select. */
@@ -28,18 +22,18 @@ _start(void)
 {
     for (uint64_t i = 0; i < Elements; ++i) {
         indices[i] = (i * 17) & Mask;
-        even_payload[i] = i * 3 + 1;
-        odd_payload[i] = i * 5 + 7;
+        payload[i] = i * 7 + 11;
     }
 
     for (unsigned r = 0; r < Repetitions; ++r) {
         for (uint64_t i = 0; i < Elements; ++i) {
             const uint64_t index = indices[i];
-            uint64_t value;
+            uint64_t selected = index;
             if (index & 1)
-                value = odd_payload[index];
+                selected = (index + 3) & Mask;
             else
-                value = even_payload[index];
+                selected = (index + 5) & Mask;
+            uint64_t value = payload[selected];
 
             /*
              * A fixed-address volatile store keeps the selected load live
