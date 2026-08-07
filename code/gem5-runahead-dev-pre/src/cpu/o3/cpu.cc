@@ -3903,6 +3903,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
                 dependent.address = static_cast<Addr>(result);
                 dependent.pc = lane_uop.pc;
                 dependent.tid = lane->tid;
+                dependent.readyTick = ready_tick;
                 dependent.source = false;
                 dependent.nested = lane->nested;
                 dependent.relationCount = lane->relationCount;
@@ -4088,6 +4089,13 @@ void
 CPU::serviceDVRPrefetchQueue()
 {
     if (dvrPrefetchQueue.empty())
+        return;
+
+    // Each dependent request carries the completion time of the helper
+    // DynUop that produced its address.  Source requests have readyTick=0
+    // and can use the LSU immediately; unrelated lanes are not serialized
+    // by another lane's vector computation.
+    if (dvrPrefetchQueue.front().readyTick > curTick())
         return;
     // Source and dependent requests already admitted to the helper LQ carry
     // their own dependency state.  Do not serialize the whole memory queue

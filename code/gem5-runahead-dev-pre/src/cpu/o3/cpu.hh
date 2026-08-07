@@ -1445,6 +1445,9 @@ class CPU : public BaseCPU
         Addr address;
         Addr pc;
         ThreadID tid;
+        // A dependent address becomes visible to the helper LSU only after
+        // the vector DynUop producing it completes.
+        Tick readyTick = 0;
         bool source;
         bool oracle = false;
         bool nested = false;

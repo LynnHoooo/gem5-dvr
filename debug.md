@@ -11,11 +11,12 @@ fetch/decode buffer 和 helper-owned DynUop 生命周期已经实现并通过当
 physical name 会在 VIR source retain 归零且 destination 被替换后回收；helper 仍不进入主
 线程 rename/IQ/ROB/commit，这符合论文独立顺序 subthread 的所有权边界。
 
-剩余的论文级细化不是结构缺失，而是：frontend per-entry 状态守恒、更多 vector FU
-latency/throughput 组合，以及将复杂控制流和 NDM 完全统一到同一 helper context。当前
-`dvrVectorIssueInterval` 已提供 vector chunk 的最小 issue 间隔；helper memory queue 也
-不再被全局 compute completion 串行阻塞，已入队请求按自身 LSQ/response 状态推进。后续
-计划已记录在仓库根目录的 `debug.md`。
+剩余的论文级细化不是普通 DVR 数据路径缺失，而是：frontend per-entry fault/retry 的
+更细粒度守恒、更多 vector FU latency/throughput 组合，以及将复杂控制流和 NDM 完全统一
+到同一 helper context。当前 `dvrVectorIssueInterval` 已提供 vector chunk 的最小 issue
+间隔；每个 dependent request 携带产生它的 DynUop `readyTick`，只有该 uop 完成后才进入
+helper LSU，不同 lane 不再被全局 compute completion 串行阻塞。后续计划已记录在仓库根
+目录的 `debug.md`。
 
 ### P1：算法和 workload 覆盖
 
