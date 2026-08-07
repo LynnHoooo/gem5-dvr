@@ -4,26 +4,24 @@
 
 ## 当前未解决
 
-### P0 建模状态（尚未完成）
+### P0 建模状态
 
-当前版本已经有 helper-private VRAT、16-copy VIR 的基础结构、helper-local LQ、独立
-8-entry frontend 和 helper-owned DynUop 生命周期；这些结构可以编译并通过算法 smoke。
-但还不能称为论文级 VRAT/VIR 完成，原因是：
+本轮已关闭先前列出的 VRAT/VIR 执行数据面缺口：
 
-1. `vectorize()` 对已经 vectorized 的 destination 直接返回，不能为每个 tainted
-   destination 分配新的 16-copy bundle；replay 写回路径也没有统一调用 `rename()`，因此
-   scalar/vector WAW 覆盖不完整。
-2. `VIRCopyState` 有 active/issued/executed/dead-source mask，但没有独立的 ready 和
-   completed mask；source release 仍由 users/pendingRelease 近似驱动，不是严格的
-   dead-source mask 状态机。
-3. 没有 `allocated = live + in_flight + freed` 的统计和 assertion，无法对每个 physical
-   entry 做守恒验收。
-4. 配置默认 `dvrSharedPhysicalBank=True`，会从主线程 `UnifiedFreeList` 借名；这不是完整
-   的 helper-private 默认边界，且共享 physical lifetime 尚未与主线程 squash/reclaim
-   建立完整协议。
+1. 每个 vector destination/WAW 现在经 `renameVector()` 获取新的 16-copy bundle；已
+   issue 的 source physical name 会保留到对应 DynUop retire。
+2. `VIRCopyState` 已有独立 `readyMask` 与 `completedMask`；DynUop 完成时写入
+   completed mask，并按 captured physical source name 释放。
+3. `conservationValid()` 在 rename 与 retire 处断言 VRAT mapping 与 physical allocation
+   一致，捕获 released mapping、悬空 user 和 pending-release 状态。
+4. helper-private physical bank 现在是默认；`--dvr-shared-physical-bank` 仅作为显式
+   sensitivity option。更重要的是 VRAT 已从长期 replay template 移至每次 helper launch
+   的 execution context，历史 discovery 不会永久耗尽 private bank。
+5. helper LSU 以每个 request 的 `readyTick` 作为 source/dependent 依赖门槛，不再因无关
+   lane 的 frontend/replay 工作阻塞已 ready 的 dependent request。
 
-因此，当前模型可称为“带显式 helper frontend、VRAT/VIR/LQ 机制近似的 DVR 原型”，不能
-称为完整论文复现。
+这并不意味着 bit-exact Sniper reproduction：论文未公开所有仲裁细节，当前仍是
+paper-faithful、独立 in-order helper timing model，而非第二条 O3/ROB 线程。
 
 ### P1：算法和 workload 覆盖
 
@@ -52,12 +50,29 @@
 3. cache quality 仍需绑定完整的 L1 lookup/fill/eviction/victim/invalidate 事件，区分
    useful、late、evicted、pollution 和 demand coverage。
 
-### 2026-08-07 验证计划第一层实测（基线 commit `40efd61`，dirty worktree，未通过）
+### 2026-08-07 M2 Nested data-plane 验收（当前 `bea09ec`）
 
-运行时 worktree 还包含未提交的 `cpu.cc`、`cpu.hh`、`BaseO3CPU.py` 和
-`table1_se.py` 改动；使用当前 worktree 的 `build/RISCV/gem5.opt`（SHA256
-`c126c4a0940e9bdea633e800a9247957e8039318defd02fe88092991a24f4107`）重跑。
-以下是当前版本结果，历史通过记录不能替代本节。
+在 `dvr_nested.riscv`、`--dvr-mode=nested --dvr-vector-chunks` 上，完整链已验证：
+
+```text
+flattened/expected lanes       877706 / 877706
+flatten invariant failures     0
+source responses completed     774935
+nested replay attempts         774935
+nested dependent targets       395215
+dependent issued/completed     108887 / 108887
+helper DynUop D/I/C            1037394 / 1037394 / 1037394
+```
+
+因此 M2 的“branch inversion -> outer invocation collection -> flatten -> source response
+-> persistent replay -> dependent target -> cache request completion”已通过。target 数量大于
+发射数量是有限 helper queue、deduplication、fault/drop 与主线程优先仲裁的预期结果；关键
+守恒是 issued 等于 completed，且 flattened 等于 expected。
+
+variable-inner-bound 回归同样通过：`dvrNestedVariableLaneBatches=1287`、target
+generated `23358`、dependent issued/completed `4972/4972`、flatten failures `0`。
+
+以下是本轮之前的历史失败记录，仅用于说明已修复的根因，不再代表当前状态。
 
 | Gate | 结果 | 关键证据 | 判定 |
 |---|---|---|---|
