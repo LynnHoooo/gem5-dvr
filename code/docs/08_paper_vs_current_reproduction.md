@@ -210,3 +210,36 @@ cd /home/lynnhoo/dvr-repro/source/gem5-dvr/code/gem5-runahead-dev-pre
 export PYTHON_CONFIG=/tmp/python36-config
 python3 -m SCons build/RISCV/gem5.opt -j32
 ```
+
+## 10. L1D cache miss 对照表
+
+下面的表格使用同一个 `MAX_KEY=65536` Camel binary，只改变 L1D 容量。Baseline 和当前 launch-gate DVR 均重新运行，PC 统计来自 `cache_pc_system_cpu_dcache.csv`。
+
+### 16 KiB L1D
+
+| PC | 类型 | Baseline misses | DVR misses | Miss reduction | Miss rate 变化 |
+|---|---|---:|---:|---:|---:|
+| `0x103a4` | source | 15,371 | 772 | 94.98% | 23.4539% → 1.1780% |
+| `0x103aa` | dependent (`*array2[i]`) | 61,907 | 8,565 | 86.16% | 94.4626% → 13.0692% |
+
+### 32 KiB L1D
+
+| PC | 类型 | Baseline misses | DVR misses | Miss reduction | Miss rate 变化 |
+|---|---|---:|---:|---:|---:|
+| `0x103a4` | source | 15,394 | 21 | 99.86% | 23.4890% → 0.0320% |
+| `0x103aa` | dependent (`*array2[i]`) | 58,428 | 1,613 | 97.24% | 89.1541% → 2.4612% |
+
+### 表格口径
+
+- `Baseline misses` 和 `DVR misses` 是该 PC 的主线程 L1D demand miss，不是 helper miss。
+- `Miss reduction = (Baseline misses - DVR misses) / Baseline misses`。
+- `Miss rate` 使用该 PC 的 demand miss 数除以该 PC 的 demand access 数。
+- source/dependent 的 helper 事件另见 `pc_pipeline_summary.csv` 和 `stats.txt`；不能把 `dvr_dependent_misses` 直接替代主线程 demand miss。
+
+本次 sweep 原始文件：
+
+```text
+/home/lynnhoo/dvr-repro/results/camel-hot-pc-cache-sweep-launchgate-20260808/camel_hot_pc_cache_sweep.csv
+```
+
+该表比之前的旧 DVR 表更能反映当前实现：旧表中 32 KiB dependent miss 为 27,632；launch-gate 修复后下降到 1,613，说明 bounded vector launch 已解决主要的 dependent target overfetch/L1 eviction 问题。
