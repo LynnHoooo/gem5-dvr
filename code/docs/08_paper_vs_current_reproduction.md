@@ -217,21 +217,23 @@ python3 -m SCons build/RISCV/gem5.opt -j32
 
 ### 16 KiB L1D
 
-| PC | 类型 | Baseline misses | DVR misses | Miss reduction | Miss rate 变化 |
-|---|---|---:|---:|---:|---:|
-| `0x103a4` | source | 15,371 | 772 | 94.98% | 23.4539% → 1.1780% |
-| `0x103aa` | dependent (`*array2[i]`) | 61,907 | 8,565 | 86.16% | 94.4626% → 13.0692% |
+| PC | 类型 | Demand accesses | 占全部 ROI 访问 | Baseline misses | DVR misses | Miss reduction | Miss rate 变化 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `0x103a4` | source | 65,537 | 49.9889% | 15,371 | 772 | 94.98% | 23.4539% → 1.1780% |
+| `0x103aa` | dependent (`*array2[i]`) | 65,536 | 49.9882% | 61,907 | 8,565 | 86.16% | 94.4626% → 13.0692% |
 
 ### 32 KiB L1D
 
-| PC | 类型 | Baseline misses | DVR misses | Miss reduction | Miss rate 变化 |
-|---|---|---:|---:|---:|---:|
-| `0x103a4` | source | 15,394 | 21 | 99.86% | 23.4890% → 0.0320% |
-| `0x103aa` | dependent (`*array2[i]`) | 58,428 | 1,613 | 97.24% | 89.1541% → 2.4612% |
+| PC | 类型 | Demand accesses | 占全部 ROI 访问 | Baseline misses | DVR misses | Miss reduction | Miss rate 变化 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `0x103a4` | source | 65,537 | 49.9889% | 15,394 | 21 | 99.86% | 23.4890% → 0.0320% |
+| `0x103aa` | dependent (`*array2[i]`) | 65,536 | 49.9882% | 58,428 | 1,613 | 97.24% | 89.1541% → 2.4612% |
 
 ### 表格口径
 
 - `Baseline misses` 和 `DVR misses` 是该 PC 的主线程 L1D demand miss，不是 helper miss。
+- `Demand accesses` 是该 PC 的主线程 demand access 次数；本次 Camel ROI 总 demand access 为 `131,103`，因此 source 和 dependent 各约占一半访问指令。
+- `占全部 ROI 访问` 的分母是 `system.cpu.dcache.architecturalDemandAccesses=131,103`，不是所有 committed instructions。
 - `Miss reduction = (Baseline misses - DVR misses) / Baseline misses`。
 - `Miss rate` 使用该 PC 的 demand miss 数除以该 PC 的 demand access 数。
 - source/dependent 的 helper 事件另见 `pc_pipeline_summary.csv` 和 `stats.txt`；不能把 `dvr_dependent_misses` 直接替代主线程 demand miss。
