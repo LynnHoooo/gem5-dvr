@@ -47,6 +47,7 @@
 #include <list>
 #include <map>
 #include <queue>
+#include <unordered_map>
 #include <vector>
 
 #include "arch/generic/mmu.hh"
@@ -782,6 +783,21 @@ class LSQ
     bool reserveDVRHelperLoadEntry(ThreadID tid);
     void releaseDVRHelperLoadEntry(ThreadID tid);
 
+    /** Native LSQ-owned lifecycle for a non-architectural helper load. */
+    enum class DVRHelperLoadState : uint8_t
+    {
+        Allocated,
+        Translated,
+        WaitingResponse,
+        Writeback
+    };
+    bool allocateDVRHelperLoad(uint64_t token, ThreadID tid,
+                               Addr virtual_address, Addr pc);
+    void translateDVRHelperLoad(uint64_t token, Addr physical_address);
+    void issueDVRHelperLoad(uint64_t token);
+    void writebackDVRHelperLoad(uint64_t token);
+    void completeDVRHelperLoad(uint64_t token);
+
     /** Returns the number of free entries in the SQ for a specific thread. */
     unsigned numFreeStoreEntries(ThreadID tid);
 
@@ -962,6 +978,15 @@ class LSQ
 
     /** Per-thread LQ capacity occupied by non-architectural helper loads. */
     std::vector<unsigned> dvrHelperReservedLoads;
+    struct DVRHelperLoadRecord
+    {
+        ThreadID tid;
+        Addr virtualAddress;
+        Addr physicalAddress;
+        Addr pc;
+        DVRHelperLoadState state;
+    };
+    std::unordered_map<uint64_t, DVRHelperLoadRecord> dvrHelperLoads;
 
     /** Number of Threads. */
     ThreadID numThreads;

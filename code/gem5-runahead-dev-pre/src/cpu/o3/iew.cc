@@ -898,6 +898,38 @@ IEW::releaseDVRHelperLoadEntry(ThreadID tid)
     ldstQueue.releaseDVRHelperLoadEntry(tid);
 }
 
+bool
+IEW::allocateDVRHelperLoad(uint64_t token, ThreadID tid,
+                           Addr virtual_address, Addr pc)
+{
+    return ldstQueue.allocateDVRHelperLoad(
+        token, tid, virtual_address, pc);
+}
+
+void
+IEW::translateDVRHelperLoad(uint64_t token, Addr physical_address)
+{
+    ldstQueue.translateDVRHelperLoad(token, physical_address);
+}
+
+void
+IEW::issueDVRHelperLoad(uint64_t token)
+{
+    ldstQueue.issueDVRHelperLoad(token);
+}
+
+void
+IEW::writebackDVRHelperLoad(uint64_t token)
+{
+    ldstQueue.writebackDVRHelperLoad(token);
+}
+
+void
+IEW::completeDVRHelperLoad(uint64_t token)
+{
+    ldstQueue.completeDVRHelperLoad(token);
+}
+
 void
 IEW::activateStage()
 {

@@ -4394,7 +4394,9 @@ CPU::serviceDVRPrefetchQueue()
         ++cpuStats.dvrHelperVIRCapacityStalls;
         return;
     }
-    if (!iew.reserveDVRHelperLoadEntry(prefetch.tid)) {
+    const uint64_t helper_load_id = dvrNextHelperLoadId++;
+    if (!iew.allocateDVRHelperLoad(
+            helper_load_id, prefetch.tid, prefetch.address, prefetch.pc)) {
         ++cpuStats.dvrPrefetchesSuppressedMainThread;
         return;
     }
@@ -4410,9 +4412,9 @@ CPU::serviceDVRPrefetchQueue()
         // suffix repeatedly.
         ++cpuStats.dvrPrefetchesDropped;
         retireDVRPredicateLane(prefetch.predicate, prefetch.lane, false);
+        iew.completeDVRHelperLoad(helper_load_id);
         return;
     }
-    const uint64_t helper_load_id = dvrNextHelperLoadId++;
     dvrHelperLoadEntries.emplace(helper_load_id, DVRHelperLoadEntry{
         prefetch.address, 0, prefetch.pc, prefetch.lane, prefetch.tid,
         prefetch.source, prefetch.nested, DVRHelperLoadState::Allocated,
@@ -4433,7 +4435,7 @@ CPU::serviceDVRPrefetchQueue()
             ++cpuStats.dvrHelperLoadEntryRetries;
         else if (state == DVRHelperLoadState::Dropped)
             ++cpuStats.dvrHelperLoadEntryDropped;
-        iew.releaseDVRHelperLoadEntry(entry->second.tid);
+        iew.completeDVRHelperLoad(helper_load_id);
         dvrHelperLoadEntries.erase(entry);
         cpuStats.dvrHelperLoadEntryPending = dvrHelperLoadEntries.size();
     };
@@ -4483,6 +4485,7 @@ CPU::serviceDVRPrefetchQueue()
                 prefetch.predicate, prefetch.lane, false);
         return;
     }
+    iew.translateDVRHelperLoad(helper_load_id, req->getPaddr());
 
     /*
      * A source helper must return the loaded bytes for trigger-to-FLR replay.
@@ -4548,6 +4551,7 @@ CPU::serviceDVRPrefetchQueue()
         entry->second.issueTick = curTick();
         entry->second.state = DVRHelperLoadState::WaitingResponse;
     }
+    iew.issueDVRHelperLoad(helper_load_id);
     ++cpuStats.dvrPrefetchesIssued;
     ++dvrHelperLoadQueueOccupancy;
     ++dvrHelperIssuesThisCycle;
@@ -4581,6 +4585,7 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
     assert(state);
     auto helper_entry = dvrHelperLoadEntries.find(state->helperLoadId);
     if (helper_entry != dvrHelperLoadEntries.end()) {
+        iew.writebackDVRHelperLoad(state->helperLoadId);
         helper_entry->second.state = DVRHelperLoadState::Writeback;
         helper_entry->second.responseTick = curTick();
         ++cpuStats.dvrHelperLoadEntryWritebacks;
@@ -4878,7 +4883,7 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
     if (helper_entry != dvrHelperLoadEntries.end()) {
         helper_entry->second.state = DVRHelperLoadState::Completed;
         ++cpuStats.dvrHelperLoadEntriesCompleted;
-        iew.releaseDVRHelperLoadEntry(helper_entry->second.tid);
+        iew.completeDVRHelperLoad(state->helperLoadId);
         dvrHelperLoadEntries.erase(helper_entry);
         cpuStats.dvrHelperLoadEntryPending = dvrHelperLoadEntries.size();
     }
