@@ -557,8 +557,10 @@ InstructionQueue::tryIssueDVRHelperEntry(
             DVRHelperEntry{op_class, source_ready_tick}).first;
     } else {
         assert(entry->second.opClass == op_class);
-        entry->second.sourceReadyTick = std::max(
-            entry->second.sourceReadyTick, source_ready_tick);
+        // The helper register scoreboard is authoritative.  In particular a
+        // load consumer first arrives with MaxTick and LSQ writeback later
+        // lowers it to the real completion tick.
+        entry->second.sourceReadyTick = source_ready_tick;
     }
     admitted = true;
     if (now < entry->second.sourceReadyTick) {

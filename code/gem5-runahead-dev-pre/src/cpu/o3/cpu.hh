@@ -1433,6 +1433,7 @@ class CPU : public BaseCPU
         int8_t continuationDestination = -1;
         unsigned continuationHelperUops = 0;
         unsigned continuationDepth = 0;
+        bool continuationQueued = false;
 
         DVRPrefetchSenderState(bool is_source, bool is_nested,
             bool is_oracle,
@@ -1948,7 +1949,8 @@ class CPU : public BaseCPU
 
         bool enqueueReplayContinuation(
             const DVRPrefetchSenderState &sender, RegVal loaded_value,
-            Tick ready_tick, unsigned &became_ready)
+            Tick ready_tick, unsigned &became_ready,
+            bool install_value = true)
         {
             became_ready = 0;
             if (!sender.continuation || !sender.replay ||
@@ -1970,10 +1972,14 @@ class CPU : public BaseCPU
                     sender.helperRegs->readyAt(reg, sender.lane);
             }
             lane_context.regs[0] = 0;
+            const RegVal destination_value = install_value ? loaded_value :
+                sender.helperRegs->read(
+                    sender.continuationDestination, sender.lane);
             sender.helperRegs->write(
                 sender.continuationDestination, sender.lane,
-                loaded_value, ready_tick);
-            lane_context.regs[sender.continuationDestination] = loaded_value;
+                destination_value, ready_tick);
+            lane_context.regs[sender.continuationDestination] =
+                destination_value;
             lane_context.readyCycle[sender.continuationDestination] =
                 ready_tick;
             lane_context.predicate = sender.predicate;

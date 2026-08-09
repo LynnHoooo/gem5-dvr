@@ -4552,6 +4552,13 @@ CPU::serviceDVRPrefetchQueue()
         entry->second.state = DVRHelperLoadState::WaitingResponse;
     }
     iew.issueDVRHelperLoad(helper_load_id);
+    if (sender_state->continuation) {
+        unsigned became_ready = 0;
+        sender_state->continuationQueued =
+            dvrHelperThread.enqueueReplayContinuation(
+                *sender_state, 0, MaxTick, became_ready, false);
+        cpuStats.dvrHelperUopsBecameReady += became_ready;
+    }
     ++cpuStats.dvrPrefetchesIssued;
     ++dvrHelperLoadQueueOccupancy;
     ++dvrHelperIssuesThisCycle;
@@ -4857,9 +4864,18 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
         }
 
         unsigned became_ready = 0;
-        if (dvrHelperThread.enqueueReplayContinuation(
-                *state, value, curTick(), became_ready)) {
+        bool resumed = false;
+        if (state->continuationQueued && state->helperRegs) {
+            state->helperRegs->write(
+                state->continuationDestination, state->lane,
+                value, curTick());
+            resumed = true;
+        } else {
+            resumed = dvrHelperThread.enqueueReplayContinuation(
+                *state, value, curTick(), became_ready);
             cpuStats.dvrHelperUopsBecameReady += became_ready;
+        }
+        if (resumed) {
             ++cpuStats.dvrVIRContinuationResumes;
             dvrTraceDependency(
                 "dependent_value_resume", curTick(),
