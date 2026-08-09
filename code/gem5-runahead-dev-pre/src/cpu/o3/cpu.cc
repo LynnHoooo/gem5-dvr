@@ -1335,11 +1335,14 @@ CPU::tick()
     dvrMainALUIssuesThisCycle = 0;
     dvrMainLSUIssuesThisCycle = 0;
     if (dvrVectorChunkModel) {
+        std::vector<uint64_t> retired_iq_tokens;
         const unsigned retired =
-            dvrHelperThread.retireCompletedVIR(curTick());
+            dvrHelperThread.retireCompletedVIR(
+                curTick(), retired_iq_tokens);
         cpuStats.dvrHelperDynUopsCompleted += retired;
-        for (unsigned i = 0; i < retired; ++i)
-            iew.releaseDVRHelperIQEntry();
+        assert(retired == retired_iq_tokens.size());
+        for (const uint64_t token : retired_iq_tokens)
+            iew.completeDVRHelperIQ(token);
     }
 
 //    activity = false;
@@ -3809,17 +3812,12 @@ CPU::issueDVRReplayLanes(unsigned slots)
         ++cpuStats.dvrVectorFUConflictCycles;
         return 0;
     }
-    // Helper compute uops retain a slot in the real O3 IQ for their entire
-    // FU lifetime.  Rename/dispatch therefore observes the reduced native
-    // capacity, while architectural instructions remain strictly preferred
-    // because this reservation occurs after IEW has ticked for the cycle.
-    if (!iew.reserveDVRHelperIQEntry()) {
-        ++cpuStats.dvrHelperFUStalls;
-        ++cpuStats.dvrResourceConflicts;
-        return 0;
-    }
-    if (!dvrVectorUnlimitedFU && !iew.tryIssueDVRHelperFU(op_class, latency)) {
-        iew.releaseDVRHelperIQEntry();
+    // Give this helper uop a real queue identity. Admission and FU selection
+    // are owned atomically by InstructionQueue after the main IEW tick, so
+    // main-thread ready instructions retain strict priority.
+    const uint64_t iq_token = dvrNextHelperIQToken++;
+    if (!iew.tryIssueDVRHelperIQ(
+            iq_token, op_class, latency, !dvrVectorUnlimitedFU)) {
         ++cpuStats.dvrHelperFUStalls;
         ++cpuStats.dvrVectorFUConflictCycles;
         return 0;
@@ -3853,6 +3851,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
     dyn_uop.pc = uop.pc;
     dyn_uop.copy = seed->lane / DVRHelperThread::LanesPerVIRCopy;
     dyn_uop.issueCycle = curTick();
+    dyn_uop.iqToken = iq_token;
     dyn_uop.state = DVRHelperThread::DVRDynUop::State::Ready;
     dyn_uop.lanes.reserve(group.size());
     dyn_uop.source0Physical.reserve(group.size());

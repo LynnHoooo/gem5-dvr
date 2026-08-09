@@ -539,6 +539,42 @@ InstructionQueue::releaseDVRHelperEntry()
     ++freeEntries;
 }
 
+bool
+InstructionQueue::tryIssueDVRHelperEntry(
+    uint64_t token, OpClass op_class, Cycles &latency, bool use_fu)
+{
+    assert(token != 0);
+    assert(dvrHelperEntries.find(token) == dvrHelperEntries.end());
+    if (freeEntries == 0)
+        return false;
+
+    int fu_idx = FUPool::NoFreeFU;
+    if (use_fu) {
+        fu_idx = fuPool->getUnit(op_class);
+        if (fu_idx == FUPool::NoFreeFU || fu_idx == FUPool::NoCapableFU)
+            return false;
+        latency = fuPool->getOpLatency(op_class);
+    } else {
+        latency = Cycles(1);
+    }
+
+    --freeEntries;
+    ++dvrHelperReservedEntries;
+    dvrHelperEntries.emplace(token, op_class);
+    if (use_fu)
+        fuPool->freeUnitNextCycle(fu_idx);
+    return true;
+}
+
+void
+InstructionQueue::releaseDVRHelperEntry(uint64_t token)
+{
+    const auto entry = dvrHelperEntries.find(token);
+    assert(entry != dvrHelperEntries.end());
+    dvrHelperEntries.erase(entry);
+    releaseDVRHelperEntry();
+}
+
 // Might want to do something more complex if it knows how many instructions
 // will be issued this cycle.
 bool

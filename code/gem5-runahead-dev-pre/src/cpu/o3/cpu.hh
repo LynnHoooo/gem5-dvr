@@ -765,6 +765,7 @@ class CPU : public BaseCPU
         statistics::Scalar dvrVectorLatencyCycles;
         statistics::Scalar dvrVectorComputeWaitCycles;
         statistics::Scalar dvrVectorActiveLanes;
+        statistics::Scalar dvrVRStallLaunches;
         statistics::Formula dvrVectorUtilization;
         statistics::Scalar dvrHelperALUOps;
         statistics::Scalar dvrHelperShiftOps;
@@ -840,6 +841,7 @@ class CPU : public BaseCPU
         statistics::Scalar dvrPredicateMisses;
         statistics::Scalar dvrSourcePrefetchesIssued;
         statistics::Scalar dvrSourcePrefetchesCompleted;
+        statistics::Scalar dvrSourcePrefetchesDeduplicatedCompleted;
         statistics::Scalar dvrPrefetchQueuePeak;
         statistics::Scalar dvrPrefetchesSuppressedMainThread;
         statistics::Scalar dvrPrefetchesRejectedBackpressure;
@@ -874,15 +876,18 @@ class CPU : public BaseCPU
         statistics::Scalar dvrDependentDemandLoads;
         statistics::Scalar dvrDependentDemandCovered;
         statistics::Scalar dvrDependentDemandLate;
+        statistics::Scalar dvrDependentWindowStalls;
         statistics::Scalar dvrHelperLaunchAttempts;
         statistics::Scalar dvrHelperLaunchAdmitted;
         statistics::Scalar dvrHelperLaunchCapacityDrops;
         statistics::Scalar dvrHelperLaunchZeroLanes;
         statistics::Scalar dvrPrefetchesDeduplicated;
+        statistics::Scalar dvrUnmappedPrefetchesSkipped;
         statistics::Scalar oraclePrefetchesGenerated;
         statistics::Scalar oraclePrefetchesIssued;
         statistics::Scalar oraclePrefetchesCompleted;
         statistics::Scalar oracleDemandCovered;
+        statistics::Scalar oracleUnmappedSkipped;
     } cpuStats;
 
   public:
@@ -911,6 +916,8 @@ class CPU : public BaseCPU
     void observeDVRLoad(const DynInstPtr &inst, Addr address);
     /** IEW dispatch 阶段观察指令并启动/推进 DVR Discovery。 */
     void observeDVRDispatch(const DynInstPtr &inst);
+    /** Classic VR trigger at a real full-window, head-load stall. */
+    void launchDVRVectorRunaheadOnStall(ThreadID tid);
 
     /**
      * Private vector register file for one helper program.  It is deliberately
@@ -1418,6 +1425,14 @@ class CPU : public BaseCPU
         // Helper-local identity, independent of the main DynInst/ROB.
         uint64_t helperLoadId = 0;
         Tick issueTick = 0;
+        // A value-bearing dependent load can suspend a replay lane and
+        // resume it when the loaded bytes return.
+        bool continuation = false;
+        unsigned continuationLoadUopIndex = 0;
+        unsigned continuationNextUopIndex = 0;
+        int8_t continuationDestination = -1;
+        unsigned continuationHelperUops = 0;
+        unsigned continuationDepth = 0;
 
         DVRPrefetchSenderState(bool is_source, bool is_nested,
             bool is_oracle,
@@ -1520,6 +1535,12 @@ class CPU : public BaseCPU
         std::shared_ptr<DVRHelperVectorRegisterFile> helperRegs;
         std::shared_ptr<DVRPredicateGeneration> predicate;
         unsigned lane = 0;
+        bool continuation = false;
+        unsigned continuationLoadUopIndex = 0;
+        unsigned continuationNextUopIndex = 0;
+        int8_t continuationDestination = -1;
+        unsigned continuationHelperUops = 0;
+        unsigned continuationDepth = 0;
     };
 
     /**
@@ -1583,6 +1604,7 @@ class CPU : public BaseCPU
             unsigned chunksRemaining = 1;
             Tick issueCycle = 0;
             Tick completeCycle = 0;
+            uint64_t iqToken = 0;
             State state = State::Decoded;
         };
         // Paper DVR holds sixteen independent 512-bit copies in the VIR.
@@ -1655,6 +1677,7 @@ class CPU : public BaseCPU
                 reconvergenceStack = {};
             unsigned reconvergenceDepth = 0;
             unsigned helperUops = 0;
+            unsigned chainDepth = 0;
             bool nested = false;
             bool active = true;
         };
@@ -1922,7 +1945,62 @@ class CPU : public BaseCPU
             return true;
         }
 
-        unsigned retireCompletedVIR(Tick now)
+        bool enqueueReplayContinuation(
+            const DVRPrefetchSenderState &sender, RegVal loaded_value,
+            Tick ready_tick, unsigned &became_ready)
+        {
+            became_ready = 0;
+            if (!sender.continuation || !sender.replay ||
+                !sender.helperRegs ||
+                sender.continuationDestination <= 0 ||
+                sender.continuationDestination >=
+                    DVRLoopBoundDetector::MaxArchitecturalIntRegs ||
+                sender.continuationNextUopIndex >= sender.replay->count)
+                return false;
+
+            ReplayLaneContext lane_context;
+            lane_context.program = sender.replay;
+            lane_context.helperRegs = sender.helperRegs;
+            for (unsigned reg = 0;
+                 reg < DVRLoopBoundDetector::MaxArchitecturalIntRegs; ++reg) {
+                lane_context.regs[reg] =
+                    sender.helperRegs->read(reg, sender.lane);
+                lane_context.readyCycle[reg] =
+                    sender.helperRegs->readyAt(reg, sender.lane);
+            }
+            lane_context.regs[0] = 0;
+            sender.helperRegs->write(
+                sender.continuationDestination, sender.lane,
+                loaded_value, ready_tick);
+            lane_context.regs[sender.continuationDestination] = loaded_value;
+            lane_context.readyCycle[sender.continuationDestination] =
+                ready_tick;
+            lane_context.predicate = sender.predicate;
+            lane_context.scales = sender.scales;
+            lane_context.offsets = sender.offsets;
+            lane_context.masks = sender.masks;
+            lane_context.patterns = sender.patterns;
+            lane_context.relationCount = sender.relationCount;
+            lane_context.lane = sender.lane;
+            lane_context.tid = sender.tid;
+            lane_context.triggerPC = sender.replay->triggerPC;
+            lane_context.uopIndex = sender.continuationNextUopIndex;
+            lane_context.lanePC =
+                sender.replay->uops[sender.continuationNextUopIndex].pc;
+            lane_context.helperUops = sender.continuationHelperUops;
+            lane_context.chainDepth = sender.continuationDepth;
+            lane_context.nested = sender.nested;
+            replayLanes.push_back(std::move(lane_context));
+            became_ready = readyUops == 0 ? 1 : 0;
+            if (became_ready != 0) {
+                readyUops = 1;
+                state = State::Running;
+            }
+            return true;
+        }
+
+        unsigned retireCompletedVIR(
+            Tick now, std::vector<uint64_t> &retired_iq_tokens)
         {
             unsigned retired = 0;
             for (auto it = virBuffer.begin(); it != virBuffer.end();) {
@@ -1951,6 +2029,8 @@ class CPU : public BaseCPU
                             it->helperRegs->releasePhysical(phys);
                         assert(it->helperRegs->conservationValid());
                     }
+                    assert(it->iqToken != 0);
+                    retired_iq_tokens.push_back(it->iqToken);
                     ++retired;
                     it = virBuffer.erase(it);
                 } else {
@@ -2261,6 +2341,13 @@ class CPU : public BaseCPU
     uint64_t dvrHelperLoadEntryPeakValue = 0;
     std::unordered_map<uint64_t, DVRHelperLoadEntry> dvrHelperLoadEntries;
     std::deque<DVRPrefetchAddress> dvrPrefetchQueue;
+    // A source vector is a bounded look-ahead window, not a permission to
+    // re-issue the same byte address on every later discovery generation.
+    // Retain a bounded completion history so overlapping 128-lane windows
+    // collapse to one source request until the main thread consumes it.
+    static constexpr unsigned DvrCompletedSourceAddressCapacity = 4096;
+    std::unordered_set<Addr> dvrCompletedSourceAddresses;
+    std::deque<Addr> dvrCompletedSourceAddressOrder;
     // Source values are lane-specific even when they share a cache line, so
     // source requests are deduplicated by byte address.  Dependent loads only
     // need one request per cache line.
@@ -2311,6 +2398,7 @@ class CPU : public BaseCPU
     std::unordered_map<Addr, Tick> dvrCompletedPrefetchLines;
     std::unordered_set<Addr> dvrDependentLoadPCs;
     std::unordered_map<Addr, unsigned> dvrDependentOutstandingLines;
+    static constexpr size_t DvrDependentTargetWindowCapacity = 128;
     std::unordered_set<Addr> dvrDependentCompletedLines;
     std::unordered_set<Addr> dvrAlternateDependentLines;
     struct DVRAlternatePathKey
@@ -2353,6 +2441,7 @@ class CPU : public BaseCPU
     uint64_t dvrPrefetchQueuePeak = 0;
     uint64_t dvrNextPredicateGeneration = 1;
     uint64_t dvrNextHelperId = 1;
+    uint64_t dvrNextHelperIQToken = 1;
     std::shared_ptr<DVRPredicateGeneration> dvrActivePredicateGeneration;
     Addr dvrCurrentTriggerPC = 0;
     Addr dvrCurrentTriggerAddress = 0;
@@ -2371,6 +2460,7 @@ class CPU : public BaseCPU
         int64_t stride = 0;
     } dvrPendingNestedCandidate;
     DVRPendingNestedCandidate dvrCommittedNestedCandidate;
+    DVRPendingNestedCandidate dvrLastStrideCandidate;
 
     /**
      * Child discovery owns every mutable mechanism state.  In particular it
@@ -2499,6 +2589,7 @@ class CPU : public BaseCPU
     Addr dvrPrefetchLine(Addr address) const;
     void accountDVRDemand(Addr address);
     void updateDVRPrefetchQueuePeak();
+    bool dependentDVRWindowFull() const;
     unsigned dvrPrefetchBytes(const DVRPrefetchAddress &prefetch) const;
     void retireDVRPredicateLane(
         const std::shared_ptr<DVRPredicateGeneration> &generation,

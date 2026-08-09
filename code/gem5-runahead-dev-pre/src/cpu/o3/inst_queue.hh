@@ -179,6 +179,13 @@ class InstructionQueue
     bool reserveDVRHelperEntry();
     void releaseDVRHelperEntry();
 
+    /** Atomically admit and select a helper uop through the native IQ/FU
+     * owner.  The token gives every non-architectural helper uop an explicit
+     * queue identity which must be released at modeled completion. */
+    bool tryIssueDVRHelperEntry(uint64_t token, OpClass op_class,
+                                Cycles &latency, bool use_fu = true);
+    void releaseDVRHelperEntry(uint64_t token);
+
     /** Returns whether or not the IQ is full. */
     bool isFull();
 
@@ -435,6 +442,9 @@ class InstructionQueue
 
     /** IQ slots currently owned by non-architectural DVR helper uops. */
     unsigned dvrHelperReservedEntries = 0;
+
+    /** Live helper identities occupying native IQ capacity. */
+    std::map<uint64_t, OpClass> dvrHelperEntries;
 
     /** The number of entries in the instruction queue. */
     unsigned numEntries;

@@ -853,6 +853,20 @@ IEW::tryIssueDVRHelperFU(OpClass op_class, Cycles &latency)
 }
 
 bool
+IEW::tryIssueDVRHelperIQ(
+    uint64_t token, OpClass op_class, Cycles &latency, bool use_fu)
+{
+    return instQueue.tryIssueDVRHelperEntry(
+        token, op_class, latency, use_fu);
+}
+
+void
+IEW::completeDVRHelperIQ(uint64_t token)
+{
+    instQueue.releaseDVRHelperEntry(token);
+}
+
+bool
 IEW::reserveDVRHelperIQEntry()
 {
     return instQueue.reserveDVRHelperEntry();
