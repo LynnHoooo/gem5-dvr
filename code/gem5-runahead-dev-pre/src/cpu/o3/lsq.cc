@@ -86,6 +86,7 @@ LSQ::LSQ(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params)
       numThreads(params.numThreads)
 {
     assert(numThreads > 0 && numThreads <= MaxThreads);
+    dvrHelperReservedLoads.resize(numThreads, 0);
 
     //**********************************************
     //************ Handle SMT Parameters ***********
@@ -536,7 +537,7 @@ LSQ::numFreeLoadEntries()
     while (threads != end) {
         ThreadID tid = *threads++;
 
-        total += thread[tid].numFreeLoadEntries();
+        total += numFreeLoadEntries(tid);
     }
 
     return total;
@@ -562,7 +563,25 @@ LSQ::numFreeStoreEntries()
 unsigned
 LSQ::numFreeLoadEntries(ThreadID tid)
 {
-        return thread[tid].numFreeLoadEntries();
+    const unsigned native_free = thread[tid].numFreeLoadEntries();
+    return native_free > dvrHelperReservedLoads[tid] ?
+        native_free - dvrHelperReservedLoads[tid] : 0;
+}
+
+bool
+LSQ::reserveDVRHelperLoadEntry(ThreadID tid)
+{
+    if (numFreeLoadEntries(tid) == 0)
+        return false;
+    ++dvrHelperReservedLoads[tid];
+    return true;
+}
+
+void
+LSQ::releaseDVRHelperLoadEntry(ThreadID tid)
+{
+    assert(dvrHelperReservedLoads[tid] != 0);
+    --dvrHelperReservedLoads[tid];
 }
 
 unsigned

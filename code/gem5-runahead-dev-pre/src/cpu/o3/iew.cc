@@ -853,9 +853,33 @@ IEW::tryIssueDVRHelperFU(OpClass op_class, Cycles &latency)
 }
 
 bool
+IEW::reserveDVRHelperIQEntry()
+{
+    return instQueue.reserveDVRHelperEntry();
+}
+
+void
+IEW::releaseDVRHelperIQEntry()
+{
+    instQueue.releaseDVRHelperEntry();
+}
+
+bool
 IEW::hasFreeDVRHelperLoadEntry(ThreadID tid)
 {
     return ldstQueue.numFreeLoadEntries(tid) > 0;
+}
+
+bool
+IEW::reserveDVRHelperLoadEntry(ThreadID tid)
+{
+    return ldstQueue.reserveDVRHelperLoadEntry(tid);
+}
+
+void
+IEW::releaseDVRHelperLoadEntry(ThreadID tid)
+{
+    ldstQueue.releaseDVRHelperLoadEntry(tid);
 }
 
 void

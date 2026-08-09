@@ -777,6 +777,11 @@ class LSQ
     /** Returns the number of free entries in the LQ for a specific thread. */
     unsigned numFreeLoadEntries(ThreadID tid);
 
+    /** Reserve/release an architectural LQ capacity slot for a DVR helper
+     * request.  Requests retain the slot until response, fault, or retry. */
+    bool reserveDVRHelperLoadEntry(ThreadID tid);
+    void releaseDVRHelperLoadEntry(ThreadID tid);
+
     /** Returns the number of free entries in the SQ for a specific thread. */
     unsigned numFreeStoreEntries(ThreadID tid);
 
@@ -954,6 +959,9 @@ class LSQ
 
     /** The LSQ units for individual threads. */
     std::vector<LSQUnit> thread;
+
+    /** Per-thread LQ capacity occupied by non-architectural helper loads. */
+    std::vector<unsigned> dvrHelperReservedLoads;
 
     /** Number of Threads. */
     ThreadID numThreads;

@@ -215,8 +215,16 @@ class IEW
     /** Reserve a native O3 FU for one DVR helper compute uop. */
     bool tryIssueDVRHelperFU(OpClass op_class, Cycles &latency);
 
+    /** Reserve/release native IQ capacity for a helper compute uop. */
+    bool reserveDVRHelperIQEntry();
+    void releaseDVRHelperIQEntry();
+
     /** True only while the architectural LSQ retains a demand-load slot. */
     bool hasFreeDVRHelperLoadEntry(ThreadID tid);
+
+    /** Reserve/release native LQ capacity for a helper memory uop. */
+    bool reserveDVRHelperLoadEntry(ThreadID tid);
+    void releaseDVRHelperLoadEntry(ThreadID tid);
 
     /** Tells CPU that the IEW stage is active and running. */
     void activateStage();

@@ -517,7 +517,26 @@ InstructionQueue::numFreeEntries()
 unsigned
 InstructionQueue::numFreeEntries(ThreadID tid)
 {
-    return maxEntries[tid] - count[tid];
+    return std::min(freeEntries, maxEntries[tid] - count[tid]);
+}
+
+bool
+InstructionQueue::reserveDVRHelperEntry()
+{
+    if (freeEntries == 0)
+        return false;
+    --freeEntries;
+    ++dvrHelperReservedEntries;
+    return true;
+}
+
+void
+InstructionQueue::releaseDVRHelperEntry()
+{
+    assert(dvrHelperReservedEntries != 0);
+    assert(freeEntries < numEntries);
+    --dvrHelperReservedEntries;
+    ++freeEntries;
 }
 
 // Might want to do something more complex if it knows how many instructions
@@ -600,7 +619,8 @@ InstructionQueue::insert(const DynInstPtr &new_inst)
 
     count[new_inst->threadNumber]++;
 
-    assert(freeEntries == (numEntries - countInsts()));
+    assert(freeEntries ==
+           (numEntries - countInsts() - dvrHelperReservedEntries));
 }
 
 void
@@ -646,7 +666,8 @@ InstructionQueue::insertNonSpec(const DynInstPtr &new_inst)
 
     count[new_inst->threadNumber]++;
 
-    assert(freeEntries == (numEntries - countInsts()));
+    assert(freeEntries ==
+           (numEntries - countInsts() - dvrHelperReservedEntries));
 }
 
 void
@@ -958,7 +979,8 @@ InstructionQueue::commit(const InstSeqNum &inst, ThreadID tid)
         instList[tid].pop_front();
     }
 
-    assert(freeEntries == (numEntries - countInsts()));
+    assert(freeEntries ==
+           (numEntries - countInsts() - dvrHelperReservedEntries));
 }
 
 int
