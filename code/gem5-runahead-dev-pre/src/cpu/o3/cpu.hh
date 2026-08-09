@@ -857,6 +857,12 @@ class CPU : public BaseCPU
         statistics::Scalar dvrReplayAttempts;
         statistics::Scalar dvrReplayTargetsGenerated;
         statistics::Scalar dvrReplayFallbacks;
+        statistics::Scalar dvrReplayReferenceChecks;
+        statistics::Scalar dvrReplayReferenceMatches;
+        statistics::Scalar dvrReplayReferenceMismatches;
+        statistics::Scalar dvrReplayReferenceRangeExtrapolations;
+        statistics::Scalar dvrReplayReferencePredicateMismatches;
+        statistics::Scalar dvrReplayReferenceUnavailable;
         statistics::Scalar dvrAlternatePathLookups;
         statistics::Scalar dvrAlternatePathHits;
         statistics::Scalar dvrAlternatePathCompleteHits;
