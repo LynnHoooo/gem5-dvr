@@ -314,3 +314,27 @@ dvrHelpersSuppressed              26,301
 4. `dvrDependentDemandLate=138` 和 `dvrHelpersSuppressed=26,301` 表明多级链上的 replay 时序和 helper admission 仍是主要瓶颈。
 
 因此，Kangaroo 诊断已经证明它是合适的下一 benchmark，但当前不应直接把它加入论文最终 speedup 表。下一步应先修复第二级 dependent 的真实 value propagation，再跑 `NARRAYS=8` 和完整 `KANG_SIZE=2`。
+
+### 11.5 多级 value continuation 修复与验证
+
+修复前，helper 在发出第一级 dependent load 后立即结束 lane；该请求使用预取命令，返回值不会写回 helper 寄存器，也不会继续执行后续 hash/uop。因此 `0x10826` 没有任何 helper traffic。
+
+当前修复为 value-bearing continuation：中间 dependent load 使用正常读请求，sender state 保存目标寄存器、下一 uop、helper 上下文和 chain depth；响应返回后按 `LB/LH/LW/LWU/LD` 语义扩展数据，写回 lane 寄存器，并从下一 uop 恢复 replay。链尾 load 仍作为普通 cache-only prefetch，不修改架构状态。
+
+同一短诊断的结果如下：
+
+| 模式 | IPC | L1D demand misses | simTicks |
+|---|---:|---:|---:|
+| Baseline | 1.177970 | 263,246 | 1,727,452,750 |
+| 修复前 DVR | 1.090586 | 227,550 | 1,866,835,000 |
+| continuation DVR | 1.207129 | 212,538 | 1,686,601,000 |
+
+| PC | 语义 | Baseline misses | 修复前 DVR | continuation DVR | 相对 baseline 降幅 | helper hits/misses |
+|---|---|---:|---:|---:|---:|---:|
+| `0x107d4` | source | 14,839 | 5,192 | 8,538 | 42.46% | 89,022 / 29,901（source） |
+| `0x107fe` | dependent level 1 | 125,524 | 90,921 | 98,037 | 21.90% | 63,732 / 31,941 |
+| `0x10826` | dependent level 2 | 116,435 | 124,588 | 99,240 | **14.77%** | **57,015 / 22,959** |
+
+核心验收项已经通过：`0x10826` 从 helper traffic 为零变为 79,974 次 helper cache access，且 demand miss 比 baseline 少 17,195、比修复前少 25,348。总 demand miss 比 baseline 下降 19.26%，IPC 提升 2.47%；这说明多级 dependent value propagation 已经真正闭合，而不是只统计了地址生成。
+
+代价是 L1D `no_mshrs` blocked cycles 从 baseline 的 0 增至 120,812，LSQ cache-blocked 次数从 126 增至 11,590；一级 source/target 的收益也比修复前下降。因此下一阶段不是再次修改地址计算，而是对已正确的 continuation 数据流做有界在途窗口、链深优先级和 MSHR 水位控制，然后再扩大到完整 Kangaroo。
