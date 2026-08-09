@@ -338,3 +338,20 @@ dvrHelpersSuppressed              26,301
 核心验收项已经通过：`0x10826` 从 helper traffic 为零变为 79,974 次 helper cache access，且 demand miss 比 baseline 少 17,195、比修复前少 25,348。总 demand miss 比 baseline 下降 19.26%，IPC 提升 2.47%；这说明多级 dependent value propagation 已经真正闭合，而不是只统计了地址生成。
 
 代价是 L1D `no_mshrs` blocked cycles 从 baseline 的 0 增至 120,812，LSQ cache-blocked 次数从 126 增至 11,590；一级 source/target 的收益也比修复前下降。因此下一阶段不是再次修改地址计算，而是对已正确的 continuation 数据流做有界在途窗口、链深优先级和 MSHR 水位控制，然后再扩大到完整 Kangaroo。
+
+## 12. Kangaroo full-chain ROI 消融（可运行缩小数据集）
+
+论文默认 `KANG_SIZE=2` 在 gem5 SE 启动时因宿主机内存不足退出（约 718 MB 后触发 `freePages() <= 0`）。因此先使用 `KANG_SIZE=0`，但保留完整的 `NARRAYS=8`、`NHASH=7`、源码原始 `MAX_ITERATIONS`（该规模实际打印 2 次 iteration）。binary 包含源码中的 `m5_reset_stats`/`m5_dump_stats`；每组统一截断在 50M 指令，因此这是完整依赖链形状的 ROI 截断诊断，不是论文 500M 自然结束结果。
+
+| Mode | IPC | L1D demand misses | simTicks | helper generated/issued | useful/late | fill accuracy | coverage | pollution | no-MSHR cycles |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Baseline | 0.630423 | 44,560 | 19,827,942,750 | 0 / 0 | 0 / 0 | NaN | 0 | 0 | 0 |
+| VR | 0.630821 | 42,785 | 19,815,445,000 | 2,048 / 1,883 | 186 / 11 | 0.7125 | 0.00914 | 190 | 3,472 |
+| Offload | 0.631922 | 37,610 | 19,780,912,250 | 43,364 / 12,036 | 890 / 61 | 0.6613 | 0.03517 | 305 | 15,153 |
+| Discovery | 0.630423 | 44,560 | 19,827,942,750 | 0 / 0 | 0 / 0 | NaN | 0 | 0 | 0 |
+| Full DVR | 0.630423 | 44,560 | 19,827,942,750 | 0 / 0 | 0 / 0 | NaN | 0 | 0 | 0 |
+| Nested DVR | 0.630423 | 44,560 | 19,827,942,750 | 0 / 0 | 0 / 0 | NaN | 0 | 0 | 0 |
+
+在 50M 截止点，Discovery/Full/Nested 已分别记录 90/90/90 次 discovery，Nested 记录 64 次 nested start，但尚未产生 helper 请求；因此它们与 baseline 完全相同不是机制结论，而是窗口在 helper admission 前结束。VR 相对 baseline IPC 仅 +0.063%，Offload +0.238%；Offload 的 miss 下降（15.61%）伴随 MSHR blocked cycles 从 0 增至 15,153，说明 cache 流量和资源竞争抵消了大部分收益。
+
+该结果支持两点：一是完整 7-level 链的控制路径能够被发现，二是当前 helper 仍主要通过自建 load-entry/队列接入，尚未进入原生 gem5 LSQ/IQ；因此 Full/Nested 的数据面和论文 Figure 8 趋势还不能在该窗口宣称完成。下一步应在 checkpoint/fast-forward 后运行 traversal ROI，再把 helper load 真实分配到 LSQ entry，并重新测 useful/late、MSHR、带宽和 pollution。
