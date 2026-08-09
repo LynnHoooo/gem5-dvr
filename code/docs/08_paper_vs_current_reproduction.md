@@ -245,3 +245,72 @@ python3 -m SCons build/RISCV/gem5.opt -j32
 ```
 
 该表比之前的旧 DVR 表更能反映当前实现：旧表中 32 KiB dependent miss 为 27,632；launch-gate 修复后下降到 1,613，说明 bounded vector launch 已解决主要的 dependent target overfetch/L1 eviction 问题。
+
+## 11. Kangaroo 3-array 多级 dependent 诊断
+
+### 11.1 测试范围
+
+本次先运行 Kangaroo 的短诊断版本，而不是论文完整规模：
+
+```text
+NARRAYS=3
+NHASH=2
+NSWPF=0
+KANG_SIZE=0       # 131072 keys
+MAX_ITERATIONS=2  # 仅用于快速诊断
+```
+
+`NSWPF=0` 用于关闭 Kangaroo 自带的软件预取。另需注意：`BENCH_HPC_KANGAROO` 会在 3-array/2-hash 组合下自动插入自定义 PFREG 指令；当前 gem5 RISC-V 不支持该 opcode，因此本次诊断没有定义这个宏，避免把 benchmark 私有硬件指令误判为 DVR 问题。
+
+主要链路由反汇编确认：
+
+```text
+0x107d4: array1[i]                         # source
+0x107fe: array2[hash(array1[i])]           # dependent level 1
+0x10826: array3[hash(array2[...])]         # dependent level 2
+```
+
+### 11.2 Overall 结果
+
+| 模式 | IPC | L1D demand misses | simTicks |
+|---|---:|---:|---:|
+| Baseline | 1.177970 | 263,246 | 1,727,452,750 |
+| DVR nested | 1.090586 | 227,550 | 1,866,835,000 |
+
+相对 baseline，DVR 使 L1D demand miss 下降 **13.56%**，但 IPC 下降 **7.42%**，模拟周期增加约 **8.08%**。这说明多级链上当前 helper 资源和 replay 开销大于 cache miss 节省带来的收益。
+
+### 11.3 PC-level 结果
+
+| PC | 语义 | Demand accesses | Baseline misses | DVR misses | Miss reduction | Miss rate 变化 |
+|---|---|---:|---:|---:|---:|---:|
+| `0x107d4` | source `array1[i]` | 262,152 | 14,839 | 5,192 | 65.01% | 5.6605% → 1.9805% |
+| `0x107fe` | dependent level 1 `array2[hash(...)]` | 262,147/262,150 | 125,524 | 90,921 | 27.57% | 47.8831% → 34.6828% |
+| `0x10826` | dependent level 2 `array3[hash(...)]` | 261,955 | 116,435 | 124,588 | **-7.00%** | 44.4485% → 47.5608% |
+
+### 11.4 DVR 机制统计
+
+```text
+dvrStrideCandidates              261,898
+dvrDiscoveryStarts                30,280
+dvrNestedStarts                   30,307
+dvrNestedProgramsBuilt               103
+dvrNestedCompletions                 105
+dvrNestedTimeouts                     18
+dvrDependentPrefetchesGenerated  139,346
+dvrDependentPrefetchesIssued     139,346
+dvrDependentPrefetchesCompleted  139,346
+dvrReplayTargetsGenerated        139,346
+dvrDependentDemandLoads          526,873
+dvrDependentDemandCovered        139,328
+dvrDependentDemandLate               138
+dvrHelpersSuppressed              26,301
+```
+
+关键发现：
+
+1. source 和第一级 dependent 已经可以产生大量有效 helper traffic；
+2. 第一级 dependent miss 下降，但第二级 dependent miss 上升，说明当前 source response → 下一层 hash/load 的连续数据流还没有完全闭合；
+3. `dvrNestedProgramsBuilt=103`，但 `dvrNestedFlattenBatches/OuterInstances/FlattenedLanes` 仍为 0，当前结果主要来自普通 recorded-uop replay，而不是完整 NDM flatten；
+4. `dvrDependentDemandLate=138` 和 `dvrHelpersSuppressed=26,301` 表明多级链上的 replay 时序和 helper admission 仍是主要瓶颈。
+
+因此，Kangaroo 诊断已经证明它是合适的下一 benchmark，但当前不应直接把它加入论文最终 speedup 表。下一步应先修复第二级 dependent 的真实 value propagation，再跑 `NARRAYS=8` 和完整 `KANG_SIZE=2`。
