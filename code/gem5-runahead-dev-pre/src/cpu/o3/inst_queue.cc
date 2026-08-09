@@ -541,12 +541,30 @@ InstructionQueue::releaseDVRHelperEntry()
 
 bool
 InstructionQueue::tryIssueDVRHelperEntry(
-    uint64_t token, OpClass op_class, Cycles &latency, bool use_fu)
+    uint64_t token, OpClass op_class, Tick source_ready_tick, Tick now,
+    Cycles &latency, bool use_fu, bool &admitted, bool &dependency_wait)
 {
     assert(token != 0);
-    assert(dvrHelperEntries.find(token) == dvrHelperEntries.end());
-    if (freeEntries == 0)
+    admitted = false;
+    dependency_wait = false;
+    auto entry = dvrHelperEntries.find(token);
+    if (entry == dvrHelperEntries.end()) {
+        if (freeEntries == 0)
+            return false;
+        --freeEntries;
+        ++dvrHelperReservedEntries;
+        entry = dvrHelperEntries.emplace(token,
+            DVRHelperEntry{op_class, source_ready_tick}).first;
+    } else {
+        assert(entry->second.opClass == op_class);
+        entry->second.sourceReadyTick = std::max(
+            entry->second.sourceReadyTick, source_ready_tick);
+    }
+    admitted = true;
+    if (now < entry->second.sourceReadyTick) {
+        dependency_wait = true;
         return false;
+    }
 
     int fu_idx = FUPool::NoFreeFU;
     if (use_fu) {
@@ -558,9 +576,6 @@ InstructionQueue::tryIssueDVRHelperEntry(
         latency = Cycles(1);
     }
 
-    --freeEntries;
-    ++dvrHelperReservedEntries;
-    dvrHelperEntries.emplace(token, op_class);
     if (use_fu)
         fuPool->freeUnitNextCycle(fu_idx);
     return true;

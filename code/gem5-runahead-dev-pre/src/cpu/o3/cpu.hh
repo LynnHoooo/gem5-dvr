@@ -1678,6 +1678,7 @@ class CPU : public BaseCPU
             unsigned reconvergenceDepth = 0;
             unsigned helperUops = 0;
             unsigned chainDepth = 0;
+            uint64_t pendingIQToken = 0;
             bool nested = false;
             bool active = true;
         };

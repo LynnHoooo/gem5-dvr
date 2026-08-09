@@ -183,7 +183,8 @@ class InstructionQueue
      * owner.  The token gives every non-architectural helper uop an explicit
      * queue identity which must be released at modeled completion. */
     bool tryIssueDVRHelperEntry(uint64_t token, OpClass op_class,
-                                Cycles &latency, bool use_fu = true);
+        Tick source_ready_tick, Tick now, Cycles &latency, bool use_fu,
+        bool &admitted, bool &dependency_wait);
     void releaseDVRHelperEntry(uint64_t token);
 
     /** Returns whether or not the IQ is full. */
@@ -444,7 +445,12 @@ class InstructionQueue
     unsigned dvrHelperReservedEntries = 0;
 
     /** Live helper identities occupying native IQ capacity. */
-    std::map<uint64_t, OpClass> dvrHelperEntries;
+    struct DVRHelperEntry
+    {
+        OpClass opClass;
+        Tick sourceReadyTick;
+    };
+    std::map<uint64_t, DVRHelperEntry> dvrHelperEntries;
 
     /** The number of entries in the instruction queue. */
     unsigned numEntries;

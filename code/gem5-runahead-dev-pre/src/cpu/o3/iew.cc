@@ -854,10 +854,12 @@ IEW::tryIssueDVRHelperFU(OpClass op_class, Cycles &latency)
 
 bool
 IEW::tryIssueDVRHelperIQ(
-    uint64_t token, OpClass op_class, Cycles &latency, bool use_fu)
+    uint64_t token, OpClass op_class, Tick source_ready_tick, Tick now,
+    Cycles &latency, bool use_fu, bool &admitted, bool &dependency_wait)
 {
     return instQueue.tryIssueDVRHelperEntry(
-        token, op_class, latency, use_fu);
+        token, op_class, source_ready_tick, now, latency, use_fu,
+        admitted, dependency_wait);
 }
 
 void

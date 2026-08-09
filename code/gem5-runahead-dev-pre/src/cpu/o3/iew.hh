@@ -217,7 +217,8 @@ class IEW
 
     /** Admit/select an identified non-architectural helper through IQ. */
     bool tryIssueDVRHelperIQ(uint64_t token, OpClass op_class,
-                             Cycles &latency, bool use_fu = true);
+        Tick source_ready_tick, Tick now, Cycles &latency, bool use_fu,
+        bool &admitted, bool &dependency_wait);
     void completeDVRHelperIQ(uint64_t token);
 
     /** Reserve/release native IQ capacity for a helper compute uop. */

@@ -3722,19 +3722,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
         if (!lane.active)
             continue;
         lane.uopIndex = pc_index;
-        const auto &uop = lane.program->uops[lane.uopIndex];
         const unsigned lane_id = lane.lane;
-        const auto &helper_regs = lane.helperRegs;
-        const bool source0_ready = uop.source0 < 0 ||
-            uop.source0 >= DVRLoopBoundDetector::MaxArchitecturalIntRegs ||
-            (helper_regs ? helper_regs->readyAt(uop.source0, lane_id) :
-             lane.readyCycle[uop.source0]) <= curTick();
-        const bool source1_ready = uop.source1 < 0 ||
-            uop.source1 >= DVRLoopBoundDetector::MaxArchitecturalIntRegs ||
-            (helper_regs ? helper_regs->readyAt(uop.source1, lane_id) :
-             lane.readyCycle[uop.source1]) <= curTick();
-        if (!source0_ready || !source1_ready)
-            continue;
         const unsigned copy = lane_id /
             DVRHelperThread::LanesPerVIRCopy;
         if (copy >= DVRHelperThread::VIRCopies ||
@@ -3745,6 +3733,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
         } else if (lane.program != seed->program ||
                    lane.helperRegs != seed->helperRegs ||
                    lane.uopIndex != seed->uopIndex ||
+                   lane.pendingIQToken != seed->pendingIQToken ||
                    copy != seed->lane / DVRHelperThread::LanesPerVIRCopy ||
                    lane.program->uops[lane.uopIndex].pc !=
                        seed->program->uops[seed->uopIndex].pc) {
@@ -3815,12 +3804,42 @@ CPU::issueDVRReplayLanes(unsigned slots)
     // Give this helper uop a real queue identity. Admission and FU selection
     // are owned atomically by InstructionQueue after the main IEW tick, so
     // main-thread ready instructions retain strict priority.
-    const uint64_t iq_token = dvrNextHelperIQToken++;
+    const bool new_iq_entry = seed->pendingIQToken == 0;
+    const uint64_t iq_token = new_iq_entry ?
+        dvrNextHelperIQToken++ : seed->pendingIQToken;
+    Tick source_ready_tick = 0;
+    for (Lane *lane : group) {
+        const auto readyAt = [&](int8_t source) {
+            if (source < 0 || source >=
+                    DVRLoopBoundDetector::MaxArchitecturalIntRegs)
+                return Tick(0);
+            return lane->helperRegs ?
+                lane->helperRegs->readyAt(source, lane->lane) :
+                lane->readyCycle[source];
+        };
+        source_ready_tick = std::max(source_ready_tick,
+            std::max(readyAt(uop.source0), readyAt(uop.source1)));
+        if (new_iq_entry)
+            lane->pendingIQToken = iq_token;
+    }
+    bool admitted = false;
+    bool dependency_wait = false;
     if (!iew.tryIssueDVRHelperIQ(
-            iq_token, op_class, latency, !dvrVectorUnlimitedFU)) {
+            iq_token, op_class, source_ready_tick, curTick(), latency,
+            !dvrVectorUnlimitedFU, admitted, dependency_wait)) {
+        if (!admitted) {
+            for (Lane *lane : group)
+                if (lane->pendingIQToken == iq_token)
+                    lane->pendingIQToken = 0;
+        }
         ++cpuStats.dvrHelperFUStalls;
-        ++cpuStats.dvrVectorFUConflictCycles;
+        if (!dependency_wait)
+            ++cpuStats.dvrVectorFUConflictCycles;
         return 0;
+    }
+    for (Lane *lane : group) {
+        assert(lane->pendingIQToken == iq_token);
+        lane->pendingIQToken = 0;
     }
 
     // This is the helper's actual same-PC vector issue group.  Keep the
