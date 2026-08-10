@@ -76,6 +76,25 @@ all memory instructions = commit.loads + commit.stores = 8,222
 /home/lynnhoo/dvr-repro/results/camel-cache-stress-512b-baseline/cache_pc_system_cpu_dcache.csv
 ```
 
+### 与此前 65,536-key 截图的差异
+
+此前截图来自另一组大输入运行：
+
+```text
+/home/lynnhoo/dvr-repro/results/camel-hot-pc-cache-sweep-launchgate-20260808/
+```
+
+该运行每个关键 PC 约执行 65,536 次访存，而本报告的 frozen Camel 使用 `MAX_KEY=4096`，每个关键 PC 约 4,096 次访存。因此两者不能直接横向比较。
+
+截图中的数值按原始 CSV 可复核：
+
+| 配置 | 关键 PC misses | 全部主线程访存 | 关键 PC misses / 全部访存 | 两 PC miss concentration |
+|---|---:|---:|---:|---:|
+| 16 KiB Baseline（65,536-key） | 15,371 + 61,907 = 77,278 | 131,103 | **58.96%** | **99.98%** |
+| 32 KiB Baseline（65,536-key） | 15,394 + 58,428 = 73,822 | 131,103 | **56.31%** | **99.98%** |
+
+截图里 source 的 `23.45%`、dependent 的 `94.46%` 是**各自 PC 内部的 miss rate**；`49.9889%` 是该 PC 占全部 ROI 访存的访问比例；它们都不是“关键 PC misses / 全部访存指令”。所以截图显示的是“大输入下 dependent PC 的局部 miss 很高”，而 13.12% 是“小输入、32 KiB frozen run 下两个关键 PC miss 占全部访存”的比例，二者统计对象和输入规模都不同。
+
 计算方式：
 
 ```text
