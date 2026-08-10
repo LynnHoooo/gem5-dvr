@@ -167,6 +167,10 @@ def parse_args():
         "--l1d-size", default="32KiB",
         help="L1 data-cache capacity; all other Table-1 parameters remain fixed",
     )
+    parser.add_argument(
+        "--mem-size", default="512MiB",
+        help="Physical memory size for large workloads (default: 512MiB)",
+    )
     parser.add_argument("--dvr", action="store_true")
     parser.add_argument("--pre", action="store_true",
                         help="Enable the original Precise Runahead Execution")
@@ -251,7 +255,7 @@ def main():
         clock="1GHz", voltage_domain=VoltageDomain(voltage="1.0V")
     )
     system.mem_mode = "timing"
-    system.mem_ranges = [AddrRange("512MiB")]
+    system.mem_ranges = [AddrRange(args.mem_size)]
     system.cache_line_size = 64
 
     system.cpu = DerivO3CPU(
