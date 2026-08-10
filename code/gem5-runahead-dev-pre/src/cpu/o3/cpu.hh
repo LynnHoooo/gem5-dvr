@@ -131,6 +131,7 @@ class ThreadContext;
  */
 class CPU : public BaseCPU
 {
+    friend class Fetch;
   public:
     typedef std::list<DynInstPtr>::iterator ListIt;
     ~CPU() override;
@@ -2665,6 +2666,7 @@ class CPU : public BaseCPU
         StaticInstPtr captured;
     };
     void completeDVRInstructionFetch(PacketPtr pkt);
+    bool isDVRInstructionFetch(PacketPtr pkt) const;
     void retryDVRInstructionFetch();
     bool requestDVRInstructionFetch(ThreadID tid, Addr pc,
                                     const StaticInstPtr &captured);

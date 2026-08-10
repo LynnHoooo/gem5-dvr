@@ -360,6 +360,7 @@ class Fetch
     InstDecoder *decoder[MaxThreads];
 
     RequestPort &getInstPort() { return icachePort; }
+    bool submitDVRInstructionFetch(PacketPtr pkt);
 
   private:
     DynInstPtr buildInst(ThreadID tid, StaticInstPtr staticInst,
@@ -522,6 +523,7 @@ class Fetch
 
     /** Instruction port. Note that it has to appear after the fetch stage. */
     IcachePort icachePort;
+    PacketPtr dvrRetryPkt = nullptr;
 
     /** Set to true if a pipelined I-cache request should be issued. */
     bool issuePipelinedIfetch[MaxThreads];

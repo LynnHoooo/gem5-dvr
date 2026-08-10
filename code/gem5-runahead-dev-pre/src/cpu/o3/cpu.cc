@@ -460,6 +460,13 @@ CPU::DVRInstructionFetchPort::recvTimingResp(PacketPtr pkt)
     return true;
 }
 
+bool
+CPU::isDVRInstructionFetch(PacketPtr pkt) const
+{
+    return pkt && dynamic_cast<DVRInstructionFetchState *>(
+        pkt->senderState) != nullptr;
+}
+
 void
 CPU::DVRInstructionFetchPort::recvReqRetry()
 {
@@ -478,9 +485,6 @@ bool
 CPU::requestDVRInstructionFetch(ThreadID tid, Addr pc,
                                 const StaticInstPtr &captured)
 {
-    if (!dvrInstructionPort.isConnected())
-        return false;
-
     // A helper lane may revisit the same PC while its cache request is in
     // flight.  Keep one request per PC and let the lane retry after fill.
     if (dvrInstructionFetchPending.count(pc) != 0)
@@ -516,10 +520,7 @@ CPU::requestDVRInstructionFetch(ThreadID tid, Addr pc,
     pkt->senderState = state;
     dvrInstructionFetchPending.insert(pc);
     ++cpuStats.dvrHelperInstructionTimingRequests;
-    if (!dvrInstructionPort.sendTimingReq(pkt)) {
-        dvrInstructionRetryPkt = pkt;
-    }
-    return true;
+    return fetch.submitDVRInstructionFetch(pkt);
 }
 
 void

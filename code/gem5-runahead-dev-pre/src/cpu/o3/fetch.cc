@@ -377,17 +377,32 @@ Fetch::processCacheCompletion(PacketPtr pkt)
     switchToActive();
 
     // Only switch to IcacheAccessComplete if we're not stalled as well.
-    if (checkStall(tid)) {
+    if (checkStall(tid))
         fetchStatus[tid] = Blocked;
-    } else {
+    else
         fetchStatus[tid] = IcacheAccessComplete;
-    }
 
     pkt->req->setAccessLatency();
     cpu->ppInstAccessComplete->notify(pkt);
     // Reset the mem req to NULL.
     delete pkt;
     memReq[tid] = NULL;
+}
+
+bool
+Fetch::submitDVRInstructionFetch(PacketPtr pkt)
+{
+    assert(pkt != nullptr);
+    if (dvrRetryPkt != nullptr)
+        return false;
+    if (retryPkt != nullptr) {
+        dvrRetryPkt = pkt;
+        return true;
+    }
+    if (icachePort.sendTimingReq(pkt))
+        return true;
+    dvrRetryPkt = pkt;
+    return true;
 }
 
 void
@@ -529,6 +544,9 @@ Fetch::lookupAndUpdateNextPC(const DynInstPtr &inst, PCStateBase &next_pc)
         DPRINTF(Fetch, "[tid:%i] [sn:%llu] Branch at PC %#x "
                 "predicted to be taken to %s\n",
                 tid, inst->seqNum, inst->pcState().instAddr(), next_pc);
+    } else if (dvrRetryPkt != nullptr) {
+        if (icachePort.sendTimingReq(dvrRetryPkt))
+            dvrRetryPkt = nullptr;
     } else {
         DPRINTF(Fetch, "[tid:%i] [sn:%llu] Branch at PC %#x "
                 "predicted to be not taken\n",
@@ -1609,7 +1627,10 @@ Fetch::IcachePort::recvTimingResp(PacketPtr pkt)
     // We shouldn't ever get a cacheable block in Modified state
     assert(pkt->req->isUncacheable() ||
            !(pkt->cacheResponding() && !pkt->hasSharers()));
-    fetch->processCacheCompletion(pkt);
+    if (fetch->cpu->isDVRInstructionFetch(pkt))
+        fetch->cpu->completeDVRInstructionFetch(pkt);
+    else
+        fetch->processCacheCompletion(pkt);
 
     return true;
 }
