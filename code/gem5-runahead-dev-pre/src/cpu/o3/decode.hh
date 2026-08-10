@@ -70,6 +70,7 @@ class CPU;
 class Decode
 {
   public:
+    uint64_t dvrDecodeDemand() const { return stats.decodedInsts.value(); }
     /** Overall decode stage status. Used to determine if the CPU can
      * deschedule itself due to a lack of activity.
      */

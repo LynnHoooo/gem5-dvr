@@ -79,6 +79,7 @@ class CPU;
 class Fetch
 {
   public:
+    uint64_t dvrFetchDemand() const { return fetchStats.insts.value(); }
     /**
      * IcachePort class for instruction fetch.
      */

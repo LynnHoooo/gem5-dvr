@@ -1451,14 +1451,21 @@ CPU::tick()
     // fetch/decode/issue resources, while its own ready queue is visible to
     // the residual issue arbitration below.
     const unsigned ready_uops_before = dvrHelperThread.readyUops;
-    // The O3 stages have already run.  Their issue count is used as the
-    // conservative demand proxy for the shared front-end budget: main-thread
-    // work gets first claim, and only the residual fetch/decode width is
-    // offered to the independent helper.
+    // Use actual stage demand, not issue count, for shared frontend
+    // arbitration.  Main fetch/decode consume their grants first; helper
+    // receives only the residual width.
+    const uint64_t fetch_total = fetch.dvrFetchDemand();
+    const uint64_t decode_total = decode.dvrDecodeDemand();
+    const unsigned main_fetch_demand = fetch_total >=
+        dvrLastMainFetchDemand ? fetch_total - dvrLastMainFetchDemand : 0;
+    const unsigned main_decode_demand = decode_total >=
+        dvrLastMainDecodeDemand ? decode_total - dvrLastMainDecodeDemand : 0;
+    dvrLastMainFetchDemand = fetch_total;
+    dvrLastMainDecodeDemand = decode_total;
     const unsigned main_fetch_claim = std::min(
-        dvrFetchWidth, dvrMainIssuesThisCycle);
+        dvrFetchWidth, main_fetch_demand);
     const unsigned main_decode_claim = std::min(
-        dvrDecodeWidth, dvrMainIssuesThisCycle);
+        dvrDecodeWidth, main_decode_demand);
     const unsigned helper_fetch_width = dvrFetchWidth - main_fetch_claim;
     const unsigned helper_decode_width = dvrDecodeWidth - main_decode_claim;
     if (dvrHelperThread.fetchRemaining != 0 && helper_fetch_width == 0)
@@ -1489,6 +1496,12 @@ CPU::tick()
             dvrHelperThread.frontendTid, frontend_uop.pc,
             frontend_uop.staticInst, fetch_fault, cache_hit);
         if (frontend_decoded) {
+            if (fetch_fault) {
+                dvrHelperThread.retireFrontend(frontend_uop.pc);
+                if (dvrHelperThread.readyUops != 0)
+                    --dvrHelperThread.readyUops;
+                continue;
+            }
             dvrHelperThread.frontendDecoded(
                 frontend_uop.pc, fetch_fault, curTick());
             // The eight entries model the helper fetch/decode staging
@@ -3937,6 +3950,12 @@ CPU::issueDVRReplayLanes(unsigned slots)
     const StaticInstPtr decoded_inst = fetchDecodeDVRUop(
         seed->tid, uop.pc, uop.staticInst, instruction_fetch_fault,
         decoded_cache_hit);
+    if (instruction_fetch_fault) {
+        for (auto *lane : group)
+            lane->active = false;
+        ++cpuStats.dvrHelperDecodeFallbacks;
+        return 0;
+    }
     if (!decoded_inst) {
         // The independent instruction-cache request is still outstanding.
         // Do not consume a FU slot or remove the lanes; they will become

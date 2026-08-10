@@ -2414,6 +2414,8 @@ class CPU : public BaseCPU
     unsigned dvrMainIssuesThisCycle = 0;
     unsigned dvrMainALUIssuesThisCycle = 0;
     unsigned dvrMainLSUIssuesThisCycle = 0;
+    uint64_t dvrLastMainFetchDemand = 0;
+    uint64_t dvrLastMainDecodeDemand = 0;
     unsigned dvrIssueWidth = 1;
     unsigned dvrFetchWidth = 1;
     unsigned dvrDecodeWidth = 1;
