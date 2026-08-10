@@ -52,6 +52,30 @@ Camel 的关键依赖链为：
 
 因此这两个 PC 不是“很少的采样点”，而是 Camel 访存指令的主要组成部分。它们合计约占全部主线程访存指令的 99.6%。
 
+### 关键 PC miss 占全部访存指令的比例
+
+如果要判断 Camel 是否具有“高频 cache miss”，分母必须是**全部主线程访存指令**，而不是全局 miss 数，也不是两个 PC 各自 miss rate 的简单相加。本次 run 的分母是：
+
+```text
+all memory instructions = commit.loads + commit.stores = 8,222
+```
+
+| 运行 | 两个关键 PC misses | 全部主线程访存指令 | 关键 PC misses / 全部访存指令 |
+|---|---:|---:|---:|
+| Baseline | 970 + 109 = 1,079 | 8,222 | **13.12%** |
+| DVR（仅主线程 demand） | 150 + 33 = 183 | 8,222 | **2.23%** |
+
+因此，当前 32 KiB L1D 的 Camel **并不是 95% 以上的访存指令都 miss**；它的全局 baseline demand miss rate 也只有 13.33%。当前配置能证明的是：两个关键 PC 占全部访存约 99.6%，并且贡献了 98.45% 的 baseline L1D misses；加入 DVR 后，这些主线程 miss 降至 2.23% 的全部访存指令。
+
+如果实验目标明确要求“关键 PC miss / 全部访存指令 ≥95%”，需要把它作为单独的 **cache-stress 诊断配置**，例如显著缩小 L1D 或扩大/随机化工作集；这不应替代论文 Table 1 的 32 KiB 论文基线。当前已补跑 512 B L1D（8-way、单 set）压力配置，关键 PC miss 比例为 4,604/8,222 = **56.00%**；连同既有 4/8/16/32 KiB sweep 也仍未达到 95%，所以不能把当前 Camel 结果标成“95% 高频 miss”。若必须达到 95%，下一步应增加可控的工作集/随机化输入或提供 stress-only 的低关联度 cache 配置，并单独报告其非论文性质。
+
+512 B stress run 的原始结果：
+
+```text
+/home/lynnhoo/dvr-repro/results/camel-cache-stress-512b-baseline/stats.txt
+/home/lynnhoo/dvr-repro/results/camel-cache-stress-512b-baseline/cache_pc_system_cpu_dcache.csv
+```
+
 计算方式：
 
 ```text
