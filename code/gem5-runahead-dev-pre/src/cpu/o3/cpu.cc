@@ -3160,29 +3160,7 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
 
     auto replay = std::make_shared<DVRReplayTemplate>();
     replay->triggerPC = pc;
-    /*
-     * Keep the complete captured stream in the replay template.  The FLR is
-     * still the discovery marker and the first dependent target, but a
-     * control-flow instruction after the FLR must remain visible to VIR: the
-     * paper explicitly continues divergent lanes to the next stride PC when
-     * an intervening branch separates FLR and LCR.  The eight-uop front-end
-     * window is refilled while this template remains resident.
-     */
     replay->count = dvrInstructionRecorder.size();
-    replay->scalarCount = 0;
-    for (unsigned index = 1; index < replay->count; ++index) {
-        if (dvrInstructionRecorder[index].load)
-            replay->scalarCount = index + 1;
-    }
-    const Addr lcr_pc = dvrLoopBoundDetector.branchPC();
-    for (unsigned index = replay->scalarCount; index < replay->count;
-         ++index) {
-        if (dvrInstructionRecorder[index].conditional &&
-            dvrInstructionRecorder[index].pc != lcr_pc) {
-            replay->continuePastFLR = true;
-            break;
-        }
-    }
     // Source lanes begin at the next committed trigger occurrence.  The
     // replay register image must come from that same occurrence, otherwise
     // the source address and the non-trigger inputs belong to different
@@ -3190,7 +3168,79 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
     replay->initialRegs = finish_regs;
     if (replay->count != 0) {
         replay->triggerDestination = dvrInstructionRecorder[0].destination;
-        replay->valid = replay->scalarCount > 1 &&
+        for (unsigned index = 0; index < replay->count; ++index)
+            replay->uops[index] = dvrInstructionRecorder[index];
+
+        // A discovery window can contain adjacent, independent load chains.
+        // Do not replay every load between trigger and FLR: that makes an
+        // unrelated load's scalar live-in look vectorized and can fabricate
+        // an address.  Compact the template to the backward register slice
+        // from the committed FLR to this trigger destination.
+        int final_load = -1;
+        for (int index = static_cast<int>(replay->count) - 1;
+             index > 0; --index) {
+            const auto &uop = replay->uops[index];
+            if (uop.load && uop.tainted &&
+                uop.pc == dvrCommittedFinalLoadPC) {
+                final_load = index;
+                break;
+            }
+        }
+        if (final_load < 0) {
+            for (int index = static_cast<int>(replay->count) - 1;
+                 index > 0; --index) {
+                const auto &uop = replay->uops[index];
+                if (uop.load && uop.tainted) {
+                    final_load = index;
+                    break;
+                }
+            }
+        }
+
+        bool trigger_feeds_flr = false;
+        if (final_load > 0 && replay->triggerDestination > 0) {
+            std::array<bool, DVRInstructionRecorder::MaxUops> keep = {};
+            keep[final_load] = true;
+            uint32_t needed = replay->uops[final_load].intSources;
+            for (int index = final_load - 1; index > 0; --index) {
+                const auto &uop = replay->uops[index];
+                // Control needed for a tainted lane split, and uops spliced
+                // from a cache entry already validated as complete, are part
+                // of the executable slice even when they do not define the
+                // final load's address directly.  Their sources are added
+                // below so the compact template keeps their true live-ins.
+                const bool control_required =
+                    uop.conditional && uop.tainted;
+                const bool alternate_required = uop.alternatePath;
+                if ((uop.intDestinations & needed) == 0 &&
+                    !control_required && !alternate_required)
+                    continue;
+                keep[index] = true;
+                if (uop.intDestinations &
+                    (uint32_t(1) << replay->triggerDestination))
+                    trigger_feeds_flr = true;
+                needed = (needed & ~uop.intDestinations) | uop.intSources;
+            }
+            if (needed & (uint32_t(1) << replay->triggerDestination))
+                trigger_feeds_flr = true;
+
+            std::array<DVRInstructionRecorder::Uop,
+                       DVRInstructionRecorder::MaxUops> sliced = {};
+            unsigned sliced_count = 0;
+            sliced[sliced_count++] = replay->uops[0];
+            for (int index = 1; index <= final_load; ++index) {
+                if (keep[index])
+                    sliced[sliced_count++] = replay->uops[index];
+            }
+            replay->uops = sliced;
+            replay->count = sliced_count;
+            replay->scalarCount = sliced_count;
+        } else {
+            replay->count = 0;
+            replay->scalarCount = 0;
+        }
+        replay->continuePastFLR = false;
+        replay->valid = replay->scalarCount > 1 && trigger_feeds_flr &&
             replay->triggerDestination > 0 &&
             replay->triggerDestination <
                 DVRLoopBoundDetector::MaxArchitecturalIntRegs;
@@ -3202,13 +3252,8 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
         }
         // Replay starts from the architectural image captured at the next
         // trigger occurrence (finish_regs), not from the discovery-start
-        // image.  Therefore a loop-carried/live-in register changing across
-        // discovery is expected and must not invalidate the template.  The
-        // old start-vs-finish comparison rejected every Camel template and
-        // silently disabled dependent replay.  Keep the validation focused
-        // on representable register IDs and unsupported semantics below.
-        for (unsigned index = 0; index < replay->count; ++index)
-            replay->uops[index] = dvrInstructionRecorder[index];
+        // image.  Keep validation focused on the compact, representable
+        // trigger-to-FLR data slice.
         for (unsigned index = 0; index < replay->scalarCount; ++index) {
             if (index == 0)
                 continue;
