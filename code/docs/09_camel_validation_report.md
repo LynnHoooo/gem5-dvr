@@ -132,6 +132,8 @@ all memory instructions = commit.loads + commit.stores = 8,222
 /home/lynnhoo/dvr-repro/results/camel-large-current-32k-dvr
 ```
 
+32 KiB Baseline 已使用相同输入和配置重复运行一次；两次 `cache_pc_system_cpu_dcache.csv` 完全相同，关键计数均为 `131,103` demand accesses、`73,836` demand misses、source `15,394` misses、dependent `58,428` misses。因此同一配置下 baseline 是确定的，16 KiB/32 KiB 的差异来自 cache 容量，而不是 benchmark 随机波动。
+
 计算方式：
 
 ```text
