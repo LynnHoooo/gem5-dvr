@@ -550,7 +550,7 @@ CPU::completeDVRInstructionFetch(PacketPtr pkt)
             ++cpuStats.dvrHelperUopsBecameReady;
         ++cpuStats.dvrHelperInstructionsDecoded;
     } else {
-        dvrHelperThread.decodedUopCache[state->pc] = state->captured;
+        dvrInstructionDecodeFaults.insert(state->pc);
         dvrHelperThread.frontendDecoded(state->pc, true, curTick());
         if (dvrHelperThread.completeTimingFrontend(state->pc))
             ++cpuStats.dvrHelperUopsBecameReady;
@@ -5392,6 +5392,11 @@ CPU::fetchDecodeDVRUop(ThreadID tid, Addr pc,
 {
     fetch_fault = false;
     cache_hit = false;
+    if (dvrInstructionDecodeFaults.count(pc) != 0) {
+        fetch_fault = true;
+        ++cpuStats.dvrHelperDecodeFallbacks;
+        return nullptr;
+    }
     auto cached = dvrHelperThread.decodedUopCache.find(pc);
     if (cached != dvrHelperThread.decodedUopCache.end()) {
         cache_hit = true;

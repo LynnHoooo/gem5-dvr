@@ -2473,6 +2473,7 @@ class CPU : public BaseCPU
     std::unordered_set<Addr> dvrQueuedPrefetchAddresses;
     std::unordered_set<Addr> dvrOutstandingPrefetchAddresses;
     std::unordered_set<Addr> dvrInstructionFetchPending;
+    std::unordered_set<Addr> dvrInstructionDecodeFaults;
     PacketPtr dvrInstructionRetryPkt = nullptr;
     std::unordered_set<Addr> dvrQueuedDependentLines;
     struct DVRAddressRelation
