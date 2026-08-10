@@ -2751,17 +2751,17 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                                       dvrInstructionRecorder.size() > 1 &&
                                       committed_flr != 0 &&
                                       !dvrInstructionRecorder.overflow();
-                // Preserve the paper's bounded fallback when no loop bound
-                // can be proved.  It is distinct from an exact inference:
-                // no NDM/precise-loop admission is granted, but the helper
-                // can still issue up to 128 speculative future strides.
-                const bool fallback_allowed =
-                    dvrAllowBoundedFallback && dvrMode != "discovery" &&
-                    !inference.matched &&
-                    inference.fallback && inference.lanes != 0 &&
-                    dvrInstructionRecorder.size() > 1 &&
-                    committed_flr != 0 &&
-                    !dvrInstructionRecorder.overflow();
+                // A page-table hit is not a loop-bound proof.  In Camel, an
+                // unbounded 128-lane fallback crossed the end of array2 into
+                // the adjacent array1 object.  Those 32-bit array elements
+                // were then consumed as 64-bit pointers, producing false
+                // dependent addresses such as 0x00000001_00000000.  A DVR
+                // helper that reads a source value and replays an FLR must
+                // therefore have a proven trip bound; otherwise neither the
+                // source value nor its dependent address is semantically
+                // valid.  Keep the legacy parameter for compatibility, but
+                // do not admit data-bearing helper replay from fallback.
+                const bool fallback_allowed = false;
                 // A complete opposite-path entry is independently safe to
                 // replay: it has a single entry/exit, a known reconvergence,
                 // and validated live-ins.  Do not discard it solely because
