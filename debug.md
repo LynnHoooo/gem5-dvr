@@ -24,6 +24,10 @@
 6. shared name 的分配、dead-source/WAW 释放、失败回滚和模板析构已统一计数，并增加
    allocated/freed/live/peak 与 free-list admission-stall 统计。Camel drain 后 scalar 与
    vector live names 均为 0，排除了 shared-name 泄漏和双重归还。
+7. helper memory pipeline 已按论文的三阶段边界闭合：8-entry frontend buffer；VIR
+   source-ready admission；helper scalar LSQ entry 的 allocate/translate/issue/
+   writeback/complete/retry 生命周期。instruction timing miss 不再制造没有 Packet owner
+   的 pending slot；response 以真实 tick 写 VRAT 并重新唤醒后续 VIR group。
 
 这并不意味着 bit-exact Sniper reproduction：论文未公开所有仲裁细节，当前仍是
 paper-faithful、独立 in-order helper timing model，而非第二条 O3/ROB 线程。
@@ -49,6 +53,30 @@ paper-faithful、独立 in-order helper timing model，而非第二条 O3/ROB �
 因此当前 `dvrVRATScalarAllocationFailures=9559` 是主线程与 helper 竞争 256-entry scalar
 physical bank 时出现的真实资源背压，不是泄漏。private 模式因绕过共享资源而 IPC 更高，
 只能作为理想化上界，不能作为论文默认配置。
+
+### 2026-08-10 helper Stage 1-3 验收
+
+固定 Camel `MAX_KEY=65536`、32 KiB L1D、full/vector-chunk，结果位于：
+
+```text
+/home/lynnhoo/dvr-repro/results/camel-stage123-20260810-final/
+```
+
+关键守恒与流水线证据：
+
+```text
+frontend buffer peak                         8
+helper VIR DynUop decoded/issued/completed   31962 / 31962 / 31962
+source response VIR admissions/rejects       62586 / 0
+helper LSQ allocated/completed/pending       1044366 / 123475 / 0
+helper LSQ ownership failures                0
+dependent generated/issued/completed         61018 / 60889 / 60889
+```
+
+`allocated` 大于 `completed` 是因为同一个 bounded helper request 在 data-port/MSHR
+背压时会经历 `920762` 次 retry；retry 不丢失 lane，最终 request 仍进入 completed 或
+明确 fault/drop。该结果证明 helper 的 frontend、VIR readiness、共享 LSQ reservation
+和真实 cache response 已连接起来，同时没有把 helper load entry 永久留在主线程 LSQ。
 
 ### P1：算法和 workload 覆盖
 

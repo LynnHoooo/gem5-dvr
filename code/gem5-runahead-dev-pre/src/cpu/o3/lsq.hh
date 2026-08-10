@@ -797,6 +797,7 @@ class LSQ
     void issueDVRHelperLoad(uint64_t token);
     void writebackDVRHelperLoad(uint64_t token);
     void completeDVRHelperLoad(uint64_t token);
+    unsigned numDVRHelperLoads() const { return dvrHelperLoads.size(); }
 
     /** Returns the number of free entries in the SQ for a specific thread. */
     unsigned numFreeStoreEntries(ThreadID tid);

@@ -902,6 +902,12 @@ IEW::completeDVRHelperLoad(uint64_t token)
     ldstQueue.completeDVRHelperLoad(token);
 }
 
+unsigned
+IEW::numDVRHelperLoads() const
+{
+    return ldstQueue.numDVRHelperLoads();
+}
+
 void
 IEW::activateStage()
 {

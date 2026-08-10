@@ -738,6 +738,8 @@ class CPU : public BaseCPU
         statistics::Scalar dvrHelperInstructionTimingRetries;
         statistics::Scalar dvrHelperFetchBlockedByMain;
         statistics::Scalar dvrHelperDecodeBlockedByMain;
+        statistics::Scalar dvrHelperFrontendBufferFullCycles;
+        statistics::Scalar dvrHelperFrontendBufferPeak;
         statistics::Scalar dvrHelperVIRCapacityStalls;
         statistics::Scalar dvrHelperVRATPrograms;
         statistics::Scalar dvrHelperSharedVRATPrograms;
@@ -780,6 +782,10 @@ class CPU : public BaseCPU
         statistics::Scalar dvrHelperLoadEntryPending;
         statistics::Scalar dvrHelperLoadEntryWakeups;
         statistics::Scalar dvrHelperLoadEntryPeak;
+        statistics::Scalar dvrHelperLoadOwnershipChecks;
+        statistics::Scalar dvrHelperLoadOwnershipFailures;
+        statistics::Scalar dvrSourceResponseVIRAdmissions;
+        statistics::Scalar dvrSourceResponseVIRRejects;
         statistics::Scalar dvrMainIssueSlotsUsed;
         statistics::Scalar dvrMainALUSlotsUsed;
         statistics::Scalar dvrMainLSUSlotsUsed;
@@ -1861,6 +1867,11 @@ class CPU : public BaseCPU
             if (state == State::Idle || state == State::Draining)
                 return 0;
 
+            // The paper's frontend buffer permits several independent
+            // instruction fetches to be outstanding.  A miss retains its
+            // own slot and cannot be consumed before response, but it does
+            // not freeze later PCs while capacity remains.
+
             unsigned fetched = 0;
             if (fetchRemaining != 0) {
                 const unsigned buffer_space =
@@ -1895,6 +1906,11 @@ class CPU : public BaseCPU
         {
             if (frontendBuffer.size() >= FrontEndBufferCapacity)
                 return;
+            for (const auto &entry : frontendBuffer) {
+                if (entry.pc == pc &&
+                    entry.state == FrontendEntry::State::FetchPending)
+                    return;
+            }
             frontendBuffer.push_back(FrontendEntry{
                 pc, FrontendEntry::State::FetchPending, now, 0});
         }
@@ -1925,6 +1941,16 @@ class CPU : public BaseCPU
                 }
             }
             return false;
+        }
+
+        bool completeTimingFrontend(Addr pc)
+        {
+            if (!retireFrontend(pc))
+                return false;
+            ++readyUops;
+            if (state != State::Draining)
+                state = State::Running;
+            return true;
         }
 
         void retireDecodedLoad(Addr pc)
@@ -1961,6 +1987,7 @@ class CPU : public BaseCPU
 
         bool enqueueReplayLane(const DVRPrefetchSenderState &sender,
                                RegVal source_value,
+                               Tick ready_tick,
                                unsigned &became_ready)
         {
             became_ready = 0;
@@ -1990,7 +2017,9 @@ class CPU : public BaseCPU
             lane_context.nested = sender.nested;
             sender.helperRegs->write(
                 sender.replay->triggerDestination, sender.lane,
-                source_value, 0);
+                source_value, ready_tick);
+            lane_context.readyCycle[sender.replay->triggerDestination] =
+                ready_tick;
             replayLanes.push_back(std::move(lane_context));
             became_ready = readyUops == 0 ? 1 : 0;
             if (became_ready != 0) {
@@ -2312,6 +2341,16 @@ class CPU : public BaseCPU
         unsigned refillComputeReady()
         {
             refillIssueQueue();
+            // Each source response contributes a ready replay lane.  After
+            // one VIR group consumes the arbitration credit, another active
+            // lane must be able to wake the VIR even though no captured
+            // frontend uops remain.
+            if (!replayLanes.empty() && readyUops == 0 &&
+                fetchRemaining == 0 && decodeRemaining == 0) {
+                state = State::Running;
+                readyUops = 1;
+                return 1;
+            }
             if (!computePending() || readyUops != 0 ||
                 fetchRemaining != 0 || decodeRemaining != 0)
                 return 0;
@@ -2416,6 +2455,7 @@ class CPU : public BaseCPU
     };
     uint64_t dvrNextHelperLoadId = 1;
     uint64_t dvrHelperLoadEntryPeakValue = 0;
+    uint64_t dvrHelperFrontendBufferPeakValue = 0;
     std::unordered_map<uint64_t, DVRHelperLoadEntry> dvrHelperLoadEntries;
     std::deque<DVRPrefetchAddress> dvrPrefetchQueue;
     // A source vector is a bounded look-ahead window, not a permission to

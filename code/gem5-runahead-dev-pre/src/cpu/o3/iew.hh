@@ -227,6 +227,7 @@ class IEW
     void issueDVRHelperLoad(uint64_t token);
     void writebackDVRHelperLoad(uint64_t token);
     void completeDVRHelperLoad(uint64_t token);
+    unsigned numDVRHelperLoads() const;
 
     /** Tells CPU that the IEW stage is active and running. */
     void activateStage();

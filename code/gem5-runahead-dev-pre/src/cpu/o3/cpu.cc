@@ -486,7 +486,7 @@ CPU::requestDVRInstructionFetch(ThreadID tid, Addr pc,
     if (dvrInstructionFetchPending.count(pc) != 0)
         return true;
     if (dvrInstructionRetryPkt != nullptr)
-        return true;
+        return false;
     if (tid >= threadContexts.size() || !threadContexts[tid])
         return false;
 
@@ -546,12 +546,14 @@ CPU::completeDVRInstructionFetch(PacketPtr pkt)
     if (decoded) {
         dvrHelperThread.decodedUopCache[state->pc] = decoded;
         dvrHelperThread.frontendDecoded(state->pc, false, curTick());
-        dvrHelperThread.retireFrontend(state->pc);
+        if (dvrHelperThread.completeTimingFrontend(state->pc))
+            ++cpuStats.dvrHelperUopsBecameReady;
         ++cpuStats.dvrHelperInstructionsDecoded;
     } else {
         dvrHelperThread.decodedUopCache[state->pc] = state->captured;
         dvrHelperThread.frontendDecoded(state->pc, true, curTick());
-        dvrHelperThread.retireFrontend(state->pc);
+        if (dvrHelperThread.completeTimingFrontend(state->pc))
+            ++cpuStats.dvrHelperUopsBecameReady;
         ++cpuStats.dvrHelperDecodeFallbacks;
     }
     ++cpuStats.dvrHelperInstructionTimingResponses;
@@ -889,6 +891,11 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Helper fetch cycles denied by main-thread priority"),
       ADD_STAT(dvrHelperDecodeBlockedByMain, statistics::units::Cycle::get(),
                "Helper decode cycles denied by main-thread priority"),
+      ADD_STAT(dvrHelperFrontendBufferFullCycles,
+               statistics::units::Cycle::get(),
+               "Cycles with all eight helper frontend entries occupied"),
+      ADD_STAT(dvrHelperFrontendBufferPeak, statistics::units::Count::get(),
+               "Peak occupancy of the eight-entry helper frontend buffer"),
       ADD_STAT(dvrHelperVIRCapacityStalls, statistics::units::Count::get(),
                "Helper uops blocked by the finite VIR capacity"),
       ADD_STAT(dvrHelperVRATPrograms, statistics::units::Count::get(),
@@ -979,6 +986,17 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Helper replay wakeups from load responses"),
       ADD_STAT(dvrHelperLoadEntryPeak, statistics::units::Count::get(),
                "Peak helper load queue entries in flight"),
+      ADD_STAT(dvrHelperLoadOwnershipChecks, statistics::units::Count::get(),
+               "Checks that CPU helper entries equal shared LSQ reservations"),
+      ADD_STAT(dvrHelperLoadOwnershipFailures,
+               statistics::units::Count::get(),
+               "CPU/LSQ helper load ownership mismatches"),
+      ADD_STAT(dvrSourceResponseVIRAdmissions,
+               statistics::units::Count::get(),
+               "Source responses admitted to lane-ready VIR replay"),
+      ADD_STAT(dvrSourceResponseVIRRejects,
+               statistics::units::Count::get(),
+               "Source responses terminated because VIR replay admission failed"),
       ADD_STAT(dvrMainIssueSlotsUsed, statistics::units::Count::get(),
                "Demand instructions executed before DVR arbitration"),
       ADD_STAT(dvrMainALUSlotsUsed, statistics::units::Count::get(),
@@ -1478,6 +1496,22 @@ CPU::tick()
             // (or the shared LSQ for a load); execution latency must not keep
             // the frontend slot occupied.
             dvrHelperThread.retireFrontend(frontend_uop.pc);
+        } else {
+            // advanceFrontend counted this slot as a decode attempt, but a
+            // timing I-cache miss has not decoded anything yet.  Return the
+            // credit and leave the FetchPending entry at the head of the
+            // bounded helper buffer; the response callback will complete it.
+            const unsigned unissued =
+                dvrHelperThread.lastFetched - fetched - 1;
+            dvrHelperThread.fetchRemaining += unissued;
+            const unsigned revoke = std::min(
+                dvrHelperThread.lastDecoded, unissued + 1);
+            dvrHelperThread.lastDecoded -= revoke;
+            dvrHelperThread.readyUops -= std::min(
+                dvrHelperThread.readyUops, revoke);
+            dvrHelperThread.lastFetched = fetched + 1;
+            dvrHelperThread.state = DVRHelperThread::State::Fetch;
+            break;
         }
         dvrHelperThread.helperPC = frontend_uop.pc;
         // Timing misses are accounted by request/response handlers.  A
@@ -1499,6 +1533,14 @@ CPU::tick()
         ++cpuStats.dvrHelperReadyOccupancySamples;
         cpuStats.dvrHelperReadyUopCycles += dvrHelperThread.readyUops;
     }
+    dvrHelperFrontendBufferPeakValue = std::max<uint64_t>(
+        dvrHelperFrontendBufferPeakValue,
+        dvrHelperThread.frontendBuffer.size());
+    cpuStats.dvrHelperFrontendBufferPeak =
+        dvrHelperFrontendBufferPeakValue;
+    if (dvrHelperThread.frontendBuffer.size() ==
+        DVRHelperThread::FrontEndBufferCapacity)
+        ++cpuStats.dvrHelperFrontendBufferFullCycles;
 
     const unsigned helper_compute = issueDVRHelperCompute();
     if (helper_compute != 0)
@@ -1519,6 +1561,13 @@ CPU::tick()
     // A DVR helper probes the port only after IEW has issued this cycle's
     // demand accesses, and is discarded rather than retried on contention.
     serviceDVRPrefetchQueue();
+
+    ++cpuStats.dvrHelperLoadOwnershipChecks;
+    if (iew.numDVRHelperLoads() != dvrHelperLoadEntries.size()) {
+        ++cpuStats.dvrHelperLoadOwnershipFailures;
+        panic("DVR helper load ownership mismatch: CPU=%zu LSQ=%u\n",
+              dvrHelperLoadEntries.size(), iew.numDVRHelperLoads());
+    }
 
     commit.tick();
 
@@ -3873,6 +3922,16 @@ CPU::issueDVRReplayLanes(unsigned slots)
         return 0;
 
     const auto &uop = seed->program->uops[seed->uopIndex];
+    // VIR issue has its own PC cursor, but instruction bytes still enter the
+    // same bounded helper frontend buffer.  This entry is required so a
+    // timing I-cache response can complete the fetch/decode slot and wake
+    // this VIR group.
+    if (dvrHelperThread.frontendBuffer.size() >=
+        DVRHelperThread::FrontEndBufferCapacity) {
+        ++cpuStats.dvrHelperVIRCapacityStalls;
+        return 0;
+    }
+    dvrHelperThread.frontendFetched(uop.pc, curTick());
     bool decoded_cache_hit = false;
     bool instruction_fetch_fault = false;
     const StaticInstPtr decoded_inst = fetchDecodeDVRUop(
@@ -4840,11 +4899,15 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
                 ++cpuStats.dvrNestedReplayAttempts;
             unsigned became_ready = 0;
             helper_replay_enqueued = dvrHelperThread.enqueueReplayLane(
-                *state, value, became_ready);
+                *state, value, curTick(), became_ready);
             cpuStats.dvrHelperUopsBecameReady += became_ready;
             ++cpuStats.dvrVIRContinuationResumes;
+            if (helper_replay_enqueued)
+                ++cpuStats.dvrSourceResponseVIRAdmissions;
+            else
+                ++cpuStats.dvrSourceResponseVIRRejects;
         }
-        if (!helper_replay_enqueued && state->replay &&
+        if (!dvrVectorChunkModel && !helper_replay_enqueued && state->replay &&
             state->replay->count > 1 &&
             state->replay->triggerDestination > 0 &&
             state->replay->triggerDestination <
@@ -4896,7 +4959,7 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
                     response.maxPCGroupLanes;
         }
         bool matched = helper_replay_enqueued;
-        if (!matched)
+        if (!dvrVectorChunkModel && !matched)
             matched = dvrEnableDependentPrefetch &&
                 replayDVRSource(*state, value);
         // Once a recorded replay template exists, an invalid or rejected
