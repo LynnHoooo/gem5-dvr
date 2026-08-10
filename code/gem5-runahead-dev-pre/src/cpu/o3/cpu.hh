@@ -987,6 +987,12 @@ class CPU : public BaseCPU
             // register file.  The local value array remains as metadata for
             // private-bank mode and for per-lane ready/valid state.
             PhysRegIdPtr sharedId = nullptr;
+            // One shared VecElem name is used only as the capacity/ownership
+            // token for one 512-bit vector copy.  The eight lane values live
+            // in values[] below.  Charging one shared name per lane made a
+            // single 128-lane architectural destination consume all 128
+            // vector physical names (16 copies * 8 elements), whereas DVR's
+            // hardware model charges 16 vector physical registers.
             std::array<PhysRegIdPtr, LanesPerVectorCopy> sharedIds = {};
             unsigned users = 0;
             bool pendingRelease = false;
@@ -1107,12 +1113,8 @@ class CPU : public BaseCPU
             if (usesSharedPhysicalBank()) {
                 if (!entry.vector && entry.sharedId)
                     return sharedRegFile->getReg(entry.sharedId);
-                if (entry.vector) {
-                    const auto shared_id = entry.sharedIds[lane %
-                        LanesPerVectorCopy];
-                    if (shared_id)
-                        return sharedRegFile->getReg(shared_id);
-                }
+                // Vector lane data is helper-private speculative state.  The
+                // shared name is an allocation token, not scalar lane storage.
             }
             return entry.values[lane];
         }
@@ -1126,12 +1128,7 @@ class CPU : public BaseCPU
             if (usesSharedPhysicalBank()) {
                 if (!entry.vector && entry.sharedId)
                     sharedRegFile->setReg(entry.sharedId, value);
-                if (entry.vector) {
-                    const auto shared_id = entry.sharedIds[lane %
-                        LanesPerVectorCopy];
-                    if (shared_id)
-                        sharedRegFile->setReg(shared_id, value);
-                }
+                // See readPhysical(): vector values remain in values[].
             }
             entry.values[lane] = value;
         }
@@ -1172,17 +1169,17 @@ class CPU : public BaseCPU
                     std::array<PhysRegIdPtr, LanesPerVectorCopy> shared_ids = {};
                     if (usesSharedPhysicalBank()) {
                         bool enough = true;
-                        for (unsigned element = 0;
-                             element < LanesPerVectorCopy; ++element) {
-                            if (!sharedFreeList->hasFreeRegs(VecElemClass)) {
-                                if (sharedStats)
-                                    ++sharedStats->dvrSharedFreeListAdmissionStalls;
-                                enough = false;
-                                break;
-                            }
-                            shared_ids[element] =
+                        // Each local entry represents one 512-bit vector
+                        // physical register (eight 64-bit lanes), so reserve
+                        // one shared vector-name token per entry, not eight.
+                        if (!sharedFreeList->hasFreeRegs(VecElemClass)) {
+                            if (sharedStats)
+                                ++sharedStats->dvrSharedFreeListAdmissionStalls;
+                            enough = false;
+                        } else {
+                            shared_ids[0] =
                                 sharedFreeList->getReg(VecElemClass);
-                            allocateSharedName(shared_ids[element]);
+                            allocateSharedName(shared_ids[0]);
                         }
                         if (!enough) {
                             PhysicalRegister partial;
