@@ -150,6 +150,11 @@ def parse_args():
     parser.add_argument("--options", default="")
     parser.add_argument("--maxinsts", type=int, default=0)
     parser.add_argument(
+        "--roi", action="store_true",
+        help=("Treat m5_work_begin/end as ROI markers: reset stats after "
+              "workbegin and stop after workend"),
+    )
+    parser.add_argument(
         "--restore-checkpoint", default="",
         help="Restore this SE checkpoint before starting the measured run",
     )
@@ -238,6 +243,10 @@ def parse_args():
 def main():
     args = parse_args()
     system = System()
+    if args.roi:
+        # Make the guest work annotations visible to the Python driver.  The
+        # first simulate() returns at workbegin and the second at workend.
+        system.exit_on_work_items = True
     system.clk_domain = SrcClockDomain(
         clock="1GHz", voltage_domain=VoltageDomain(voltage="1.0V")
     )
@@ -347,6 +356,21 @@ def main():
         # state.  Only the post-restore interval belongs to the ROI.
         m5.stats.reset()
     event = m5.simulate()
+    if args.roi:
+        if event.getCause() != "workbegin":
+            raise RuntimeError(
+                "ROI run did not reach m5_work_begin (cause: %s)" %
+                event.getCause()
+            )
+        print("ROI begin reached; resetting stats")
+        m5.stats.reset()
+        event = m5.simulate()
+        if event.getCause() != "workend":
+            raise RuntimeError(
+                "ROI run did not reach m5_work_end (cause: %s)" %
+                event.getCause()
+            )
+        print("ROI end reached")
     print("Exiting @ tick {} because {}".format(m5.curTick(), event.getCause()))
     if args.take_checkpoint:
         m5.checkpoint(args.take_checkpoint)
