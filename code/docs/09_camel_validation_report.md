@@ -166,6 +166,29 @@ all memory instructions = commit.loads + commit.stores = 8,222
 /home/lynnhoo/dvr-repro/results/camel-large-ablation-32k-current/summary.csv
 ```
 
+## ROI marker 版本
+
+为接近论文的 500M-instruction ROI，新增了独立的 `camel_roi.c` 变体和 `table1_se.py --roi` 驱动：
+
+- 初始化在 `m5_work_begin()` 之前执行，不计入 ROI；
+- kernel 在 ROI 内重复执行；
+- gem5 在 `workbegin` 后 reset stats，在 `workend` 后结束模拟；
+- `scripts/build_camel_roi.sh` 默认使用 `MAX_KEY=65536`、`ROI_REPEATS=73`。
+
+ROI smoke（`ROI_REPEATS=2`）已经验证 `ROI begin reached`、`ROI end reached`，并得到约 12.6M 条 ROI 指令。当前 73 次重复的长 Baseline 已启动，目标约 500M ROI 指令：
+
+```text
+/home/lynnhoo/dvr-repro/results/camel-roi-500m-baseline/
+```
+
+构建命令：
+
+```bash
+MAX_KEY=65536 ROI_REPEATS=73 \
+  OUT=/home/lynnhoo/dvr-repro/results/camel-roi-500m-baseline/build \
+  /home/lynnhoo/dvr-repro/source/gem5-dvr/scripts/build_camel_roi.sh
+```
+
 计算方式：
 
 ```text
