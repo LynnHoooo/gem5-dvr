@@ -134,6 +134,38 @@ all memory instructions = commit.loads + commit.stores = 8,222
 
 32 KiB Baseline 已使用相同输入和配置重复运行一次；两次 `cache_pc_system_cpu_dcache.csv` 完全相同，关键计数均为 `131,103` demand accesses、`73,836` demand misses、source `15,394` misses、dependent `58,428` misses。因此同一配置下 baseline 是确定的，16 KiB/32 KiB 的差异来自 cache 容量，而不是 benchmark 随机波动。
 
+## 65,536-key 大输入六组消融（32 KiB L1D）
+
+结果目录：
+
+```text
+/home/lynnhoo/dvr-repro/results/camel-large-ablation-32k-current/
+```
+
+所有模式使用同一个大输入和 32 KiB L1D。`PC misses / 全部访存` 的分母固定为 Baseline 的 131,103 条主线程 demand accesses；DVR 的 helper accesses 不放入这个分母。
+
+| 模式 | IPC | source misses | dependent misses | 关键 PC misses / 全部访存 | helper/source issued | helper/dependent issued | resource conflicts |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Baseline | 1.0179 | 15,394 | 58,428 | 56.31% | 0 | 0 | 0 |
+| VR-like | 1.0179 | 15,394 | 58,428 | 56.31% | 0 | 0 | 0 |
+| Offload | 1.2531 | 1 | 58,611 | 44.71% | 3,405,312 | 0 | 48,628 |
+| Discovery | 1.0179 | 15,394 | 58,428 | 56.31% | 0 | 0 | 0 |
+| Full DVR | 1.7043 | 42 | 6,274 | 4.82% | 122,703 | 60,463 | 63,308 |
+| Nested DVR | 1.7044 | 40 | 6,275 | 4.82% | 122,573 | 60,454 | 63,308 |
+
+这组结果的直接结论是：
+
+- Full/Nested DVR 将 dependent miss 从约 58.4k 降到约 6.3k，并将 IPC 提升到约 1.70；
+- Offload 主要解决 source stream，dependent miss 基本没有下降；
+- VR-like 在这个命令路径上没有生成 helper，Discovery 也只完成识别/抑制，没有进入数据面，因此二者与 Baseline 相同；这不是“DVR 效果为零”，而是当前 Camel 没有走到这两个模式的数据面；
+- Full 与 Nested 在这个 Camel 上几乎相同，说明当前 workload 没有体现 Nested DVR 额外的 outer/inner flatten 优势。
+
+原始汇总：
+
+```text
+/home/lynnhoo/dvr-repro/results/camel-large-ablation-32k-current/summary.csv
+```
+
 计算方式：
 
 ```text
