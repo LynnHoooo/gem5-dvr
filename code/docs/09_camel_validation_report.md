@@ -64,6 +64,36 @@ PC access share = PC demand accesses / committed demand memory instructions
 
 按 gem5 的 L1D demand-access counter，Baseline 的整体 demand miss rate 为 13.33%，DVR run 为 8.79%。DVR run 的 overall miss rate 为 9.08%；其中 overall 还包括 helper 请求，因此不能直接当作主线程 demand miss rate。
 
+## Cache miss 集中度：两个关键 PC 是否代表主要瓶颈？
+
+这里需要区分两个概念：
+
+- **PC miss rate**：某个 PC 的 misses / 该 PC 的 accesses；
+- **miss concentration**：两个关键 PC 的 misses / 整个 L1D 的 misses。
+
+“两个 PC 的 miss rate 加起来达到 95%”不是一个有意义的比例，因为两个 miss rate 的分母不同。对于判断 benchmark 是否由这条依赖链主导，应使用 miss concentration。
+
+| 运行 | `0x103b4` misses | `0x103ba` misses | 两 PC 合计 | 全局 L1D demand misses | Miss concentration |
+|---|---:|---:|---:|---:|---:|
+| Baseline | 970 | 109 | 1079 | 1096 | **98.45%** |
+| DVR demand | 150 | 33 | 183 | 790 | 23.16% |
+
+Baseline 已经超过你要求的 95%，说明 Camel 的主要 cache-miss 瓶颈确实集中在这两个 PC。加入 DVR 后，这两个 PC 的主线程 demand misses 从 1079 降到 183：
+
+```text
+Demand miss reduction = (1079 - 183) / 1079 = 83.04%
+```
+
+DVR run 中还存在 helper 请求。将两个 PC 的 helper misses 一并计入：
+
+```text
+key-PC misses = 150 + 33 + 590 + 80 = 853
+overall L1D misses = 870
+key-PC overall miss concentration = 98.05%
+```
+
+因此，Baseline 证明 benchmark 的 miss 瓶颈由两个关键 PC 主导；DVR 结果证明这些 miss 被大量转化为 helper 预取流量，而不是简单消失。
+
 ### Helper 请求统计
 
 | PC | DVR source hits | DVR source misses | DVR dependent hits | DVR dependent misses |
