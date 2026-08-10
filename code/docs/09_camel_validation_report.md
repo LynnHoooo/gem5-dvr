@@ -40,12 +40,29 @@ Camel 的关键依赖链为：
 | `0x103b4` | source | 970 | 150 | 84.54% | 23.68% | 3.66% |
 | `0x103ba` | dependent | 109 | 33 | 69.72% | 2.66% | 0.81% |
 
+### 关键 PC 占全部访存指令的比例
+
+这里的分母使用 `system.cpu.commit.loads + commit.stores`，即主线程实际提交的访存指令数；不会把 helper 的 speculative 请求混入“总访存指令”。本次 Camel run 的主线程分母为 8,222。
+
+| PC | 类型 | Baseline 访问数 | DVR 访问数 | 占 Baseline 全部访存 | 占 DVR 全部访存 |
+|---|---|---:|---:|---:|---:|
+| `0x103b4` | source | 4,096 | 4,097 | 49.82% | 49.83% |
+| `0x103ba` | dependent | 4,096 | 4,096 | 49.82% | 49.82% |
+| 两个 PC 合计 | source + dependent | 8,192 | 8,193 | 99.64% | 99.65% |
+
+因此这两个 PC 不是“很少的采样点”，而是 Camel 访存指令的主要组成部分。它们合计约占全部主线程访存指令的 99.6%。
+
 计算方式：
 
 ```text
 miss rate = demand_misses / (demand_hits + demand_misses)
 miss reduction = (baseline_misses - dvr_misses) / baseline_misses
+PC access share = PC demand accesses / committed demand memory instructions
 ```
+
+### 全局 L1D 参考
+
+按 gem5 的 L1D demand-access counter，Baseline 的整体 demand miss rate 为 13.33%，DVR run 为 8.79%。DVR run 的 overall miss rate 为 9.08%；其中 overall 还包括 helper 请求，因此不能直接当作主线程 demand miss rate。
 
 ### Helper 请求统计
 
