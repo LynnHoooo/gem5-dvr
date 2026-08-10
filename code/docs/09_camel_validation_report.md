@@ -108,6 +108,21 @@ all memory instructions = commit.loads + commit.stores = 8,222
 
 这里的“全部访存”是主线程 committed loads/stores（131,103），没有把 helper speculative requests 放进分母。当前大输入结果说明：扩大 Camel 后，Baseline 的关键 PC miss 比例从短输入的 13.12% 提升到 56.31%；DVR 后降至 4.82%。截图中的旧 launchgate/nested DVR 数字与当前 Full DVR 数字不完全相同，但 Baseline 16/32 KiB 数字完全一致。
 
+为避免百分比混淆，Baseline 的三个相关指标应分开看：
+
+| L1D | PC | PC misses | PC accesses | PC 内部 miss rate | PC misses / 全部主线程访存 |
+|---|---|---:|---:|---:|---:|
+| 16 KiB | source `0x103a4` | 15,371 | 65,537 | **23.4539%** | **11.7244%** |
+| 16 KiB | dependent `0x103aa` | 61,907 | 65,536 | **94.4626%** | **47.2201%** |
+| 16 KiB | 两个 PC 合计 | 77,278 | 131,073 | — | **58.9445%** |
+| 32 KiB | source `0x103a4` | 15,394 | 65,537 | **23.4890%** | **11.7419%** |
+| 32 KiB | dependent `0x103aa` | 58,428 | 65,536 | **89.1541%** | **44.5665%** |
+| 32 KiB | 两个 PC 合计 | 73,822 | 131,073 | — | **56.3084%** |
+
+因此截图中的 `23.4539%` 和 `94.4626%` 是 PC 内部 miss rate，不是该 PC miss 占全部访存的比例；如果采用你要求的“占全部访存指令”，应分别报告 11.7244%/47.2201%，合计 58.9445%。
+
+同一 benchmark 的 Baseline 在 16 KiB 和 32 KiB 下不同是正常的：输入和指令流相同，但 L1D 容量不同。16 KiB 容纳不了同样多的 dependent 工作集，因此 dependent misses 从 58,428 增至 61,907；source 是近似流式访问，变化很小。只有在输入、ROI、cache 容量/关联度和预取器配置全部相同的情况下，Baseline 数值才应一致。
+
 原始结果目录：
 
 ```text
