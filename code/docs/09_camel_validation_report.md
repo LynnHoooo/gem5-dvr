@@ -95,6 +95,28 @@ all memory instructions = commit.loads + commit.stores = 8,222
 
 截图里 source 的 `23.45%`、dependent 的 `94.46%` 是**各自 PC 内部的 miss rate**；`49.9889%` 是该 PC 占全部 ROI 访存的访问比例；它们都不是“关键 PC misses / 全部访存指令”。所以截图显示的是“大输入下 dependent PC 的局部 miss 很高”，而 13.12% 是“小输入、32 KiB frozen run 下两个关键 PC miss 占全部访存”的比例，二者统计对象和输入规模都不同。
 
+### 当前 frozen 代码的大输入重跑结果
+
+我已使用当前服务器 frozen binary、同一个 65,536-key Camel 输入和 `--dvr-mode=full --dvr-vector-chunks --dvr-max-lanes=128` 重跑 Baseline/Full DVR：
+
+| L1D | 模式 | source misses | dependent misses | 关键 PC misses / 全部访存 | IPC | cycles 相对 Baseline |
+|---|---|---:|---:|---:|---:|---:|
+| 16 KiB | Baseline | 15,371 | 61,907 | 58.94% | 1.0088 | 1.00× |
+| 16 KiB | Full DVR | 491 | 7,604 | 6.17% | 1.6518 | **1.64×** |
+| 32 KiB | Baseline | 15,394 | 58,428 | 56.31% | 1.0179 | 1.00× |
+| 32 KiB | Full DVR | 42 | 6,274 | 4.82% | 1.7043 | **1.67×** |
+
+这里的“全部访存”是主线程 committed loads/stores（131,103），没有把 helper speculative requests 放进分母。当前大输入结果说明：扩大 Camel 后，Baseline 的关键 PC miss 比例从短输入的 13.12% 提升到 56.31%；DVR 后降至 4.82%。截图中的旧 launchgate/nested DVR 数字与当前 Full DVR 数字不完全相同，但 Baseline 16/32 KiB 数字完全一致。
+
+原始结果目录：
+
+```text
+/home/lynnhoo/dvr-repro/results/camel-large-current-16k-baseline
+/home/lynnhoo/dvr-repro/results/camel-large-current-16k-dvr
+/home/lynnhoo/dvr-repro/results/camel-large-current-32k-baseline
+/home/lynnhoo/dvr-repro/results/camel-large-current-32k-dvr
+```
+
 计算方式：
 
 ```text
