@@ -3170,6 +3170,12 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
         replay->triggerDestination = dvrInstructionRecorder[0].destination;
         for (unsigned index = 0; index < replay->count; ++index)
             replay->uops[index] = dvrInstructionRecorder[index];
+        // Keep the captured stream separate from the compact data slice.
+        // Alternate-path records are appended by augmentDVRAlternatePaths()
+        // and can only be entered by a decoded branch target, never by the
+        // data slice's sequential FLR fall-through.
+        const auto captured_uops = replay->uops;
+        const unsigned captured_count = replay->count;
 
         // A discovery window can contain adjacent, independent load chains.
         // Do not replay every load between trigger and FLR: that makes an
@@ -3198,6 +3204,7 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
         }
 
         bool trigger_feeds_flr = false;
+        bool post_flr_alternate_branch = false;
         if (final_load > 0 && replay->triggerDestination > 0) {
             std::array<bool, DVRInstructionRecorder::MaxUops> keep = {};
             keep[final_load] = true;
@@ -3232,14 +3239,54 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
                 if (keep[index])
                     sliced[sliced_count++] = replay->uops[index];
             }
+            // Retain only a tainted post-FLR branch that enters one of the
+            // verified alternate PCs.  Its operands are supplied by the
+            // terminal FLR response, so it is a control continuation rather
+            // than an extension of the ordinary data slice.
+            for (unsigned index = final_load + 1;
+                 index < captured_count &&
+                 sliced_count < DVRInstructionRecorder::MaxUops; ++index) {
+                const auto &candidate = captured_uops[index];
+                if (!candidate.conditional || !candidate.tainted)
+                    continue;
+                bool enters_alternate = false;
+                for (unsigned path_index = final_load + 1;
+                     path_index < captured_count; ++path_index) {
+                    const auto &path_uop = captured_uops[path_index];
+                    if (!path_uop.alternatePath)
+                        continue;
+                    enters_alternate |= candidate.branchTargetPC ==
+                        path_uop.pc || candidate.fallthroughPC ==
+                        path_uop.pc;
+                }
+                if (enters_alternate) {
+                    sliced[sliced_count++] = candidate;
+                    post_flr_alternate_branch = true;
+                }
+            }
+            // Reattach only alternate-cache uops.  Keeping arbitrary
+            // post-FLR uops would reintroduce the adjacent independent load
+            // chain that previously generated false dependent addresses.
+            for (unsigned index = final_load + 1;
+                 index < captured_count &&
+                 sliced_count < DVRInstructionRecorder::MaxUops; ++index) {
+                if (captured_uops[index].alternatePath)
+                    sliced[sliced_count++] = captured_uops[index];
+            }
             replay->uops = sliced;
             replay->count = sliced_count;
-            replay->scalarCount = sliced_count;
+            replay->scalarCount = 0;
+            for (unsigned index = 0; index < replay->count; ++index) {
+                if (replay->uops[index].pc == captured_uops[final_load].pc) {
+                    replay->scalarCount = index + 1;
+                    break;
+                }
+            }
         } else {
             replay->count = 0;
             replay->scalarCount = 0;
         }
-        replay->continuePastFLR = false;
+        replay->continuePastFLR = post_flr_alternate_branch;
         replay->valid = replay->scalarCount > 1 && trigger_feeds_flr &&
             replay->triggerDestination > 0 &&
             replay->triggerDestination <
@@ -4442,7 +4489,15 @@ CPU::issueDVRReplayLanes(unsigned slots)
                         break;
                     }
                 }
-                if (future_load &&
+                // A cache-validated alternate branch may consume the final
+                // FLR value after the normal data slice.  Keep that one
+                // response-driven continuation distinct from an unbounded
+                // post-FLR replay: only a retained branch whose successor
+                // is an alternate-cache PC can enable continuePastFLR.
+                const bool control_continuation =
+                    lane->program->continuePastFLR &&
+                    lane->uopIndex + 1 < lane->program->count;
+                if ((future_load || control_continuation) &&
                     lane_uop.destination > 0 &&
                     lane_uop.destination <
                         DVRLoopBoundDetector::MaxArchitecturalIntRegs &&
