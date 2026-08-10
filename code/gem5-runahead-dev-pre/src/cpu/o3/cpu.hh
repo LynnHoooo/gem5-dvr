@@ -814,6 +814,15 @@ class CPU : public BaseCPU
         statistics::Scalar dvrVRATAllocationFailures;
         statistics::Scalar dvrVRATScalarAllocationFailures;
         statistics::Scalar dvrVRATVectorAllocationFailures;
+        statistics::Scalar dvrSharedScalarNamesAllocated;
+        statistics::Scalar dvrSharedScalarNamesFreed;
+        statistics::Scalar dvrSharedScalarNamesLive;
+        statistics::Scalar dvrSharedScalarNamesPeak;
+        statistics::Scalar dvrSharedVectorNamesAllocated;
+        statistics::Scalar dvrSharedVectorNamesFreed;
+        statistics::Scalar dvrSharedVectorNamesLive;
+        statistics::Scalar dvrSharedVectorNamesPeak;
+        statistics::Scalar dvrSharedFreeListAdmissionStalls;
         statistics::Scalar dvrVIRChunkIssues;
         statistics::Scalar dvrVIRChunkExecutions;
         statistics::Scalar dvrDivergentBranches;
@@ -992,12 +1001,63 @@ class CPU : public BaseCPU
 
         PhysRegFile *sharedRegFile = nullptr;
         UnifiedFreeList *sharedFreeList = nullptr;
+        CPUStats *sharedStats = nullptr;
 
         void configureSharedPhysicalBank(PhysRegFile *reg_file,
-                                          UnifiedFreeList *free_list)
+                                          UnifiedFreeList *free_list,
+                                          CPUStats *stats)
         {
             sharedRegFile = reg_file;
             sharedFreeList = free_list;
+            sharedStats = stats;
+        }
+
+        void allocateSharedName(PhysRegIdPtr id)
+        {
+            if (!sharedStats || !id)
+                return;
+            if (id->is(IntRegClass)) {
+                ++sharedStats->dvrSharedScalarNamesAllocated;
+                ++sharedStats->dvrSharedScalarNamesLive;
+                sharedStats->dvrSharedScalarNamesPeak = std::max(
+                    sharedStats->dvrSharedScalarNamesPeak.value(),
+                    sharedStats->dvrSharedScalarNamesLive.value());
+            } else {
+                assert(id->is(VecElemClass));
+                ++sharedStats->dvrSharedVectorNamesAllocated;
+                ++sharedStats->dvrSharedVectorNamesLive;
+                sharedStats->dvrSharedVectorNamesPeak = std::max(
+                    sharedStats->dvrSharedVectorNamesPeak.value(),
+                    sharedStats->dvrSharedVectorNamesLive.value());
+            }
+        }
+
+        void freeSharedName(PhysRegIdPtr id)
+        {
+            if (!id)
+                return;
+            sharedFreeList->addReg(id);
+            if (!sharedStats)
+                return;
+            if (id->is(IntRegClass)) {
+                ++sharedStats->dvrSharedScalarNamesFreed;
+                assert(sharedStats->dvrSharedScalarNamesLive.value() != 0);
+                --sharedStats->dvrSharedScalarNamesLive;
+            } else {
+                assert(id->is(VecElemClass));
+                ++sharedStats->dvrSharedVectorNamesFreed;
+                assert(sharedStats->dvrSharedVectorNamesLive.value() != 0);
+                --sharedStats->dvrSharedVectorNamesLive;
+            }
+        }
+
+        void releaseSharedEntry(const PhysicalRegister &entry)
+        {
+            if (!usesSharedPhysicalBank())
+                return;
+            freeSharedName(entry.sharedId);
+            for (auto id : entry.sharedIds)
+                freeSharedName(id);
         }
 
         bool usesSharedPhysicalBank() const
@@ -1019,11 +1079,7 @@ class CPU : public BaseCPU
                     continue;
                 auto &entry = physical[phys];
                 if (usesSharedPhysicalBank()) {
-                    if (entry.sharedId)
-                        sharedFreeList->addReg(entry.sharedId);
-                    for (auto shared_id : entry.sharedIds)
-                        if (shared_id)
-                            sharedFreeList->addReg(shared_id);
+                    releaseSharedEntry(entry);
                 }
                 allocated[phys] = false;
                 entry = PhysicalRegister();
@@ -1075,8 +1131,13 @@ class CPU : public BaseCPU
                     PhysRegIdPtr shared_id = nullptr;
                     if (usesSharedPhysicalBank()) {
                         if (!sharedFreeList->hasFreeRegs(IntRegClass))
+                        {
+                            if (sharedStats)
+                                ++sharedStats->dvrSharedFreeListAdmissionStalls;
                             return -1;
+                        }
                         shared_id = sharedFreeList->getReg(IntRegClass);
+                        allocateSharedName(shared_id);
                     }
                     allocated[phys] = true;
                     physical[phys].allocated = true;
@@ -1102,16 +1163,19 @@ class CPU : public BaseCPU
                         for (unsigned element = 0;
                              element < LanesPerVectorCopy; ++element) {
                             if (!sharedFreeList->hasFreeRegs(VecElemClass)) {
+                                if (sharedStats)
+                                    ++sharedStats->dvrSharedFreeListAdmissionStalls;
                                 enough = false;
                                 break;
                             }
                             shared_ids[element] =
                                 sharedFreeList->getReg(VecElemClass);
+                            allocateSharedName(shared_ids[element]);
                         }
                         if (!enough) {
-                            for (auto shared_id : shared_ids)
-                                if (shared_id)
-                                    sharedFreeList->addReg(shared_id);
+                            PhysicalRegister partial;
+                            partial.sharedIds = shared_ids;
+                            releaseSharedEntry(partial);
                             break;
                         }
                     }
@@ -1127,9 +1191,7 @@ class CPU : public BaseCPU
                     if (phys >= 0) {
                         allocated[phys] = false;
                         if (usesSharedPhysicalBank()) {
-                            for (auto shared_id : physical[phys].sharedIds)
-                                if (shared_id)
-                                    sharedFreeList->addReg(shared_id);
+                            releaseSharedEntry(physical[phys]);
                         }
                         physical[phys] = PhysicalRegister();
                     }
@@ -1154,13 +1216,7 @@ class CPU : public BaseCPU
             // later tainted destination can reuse it.  The old policy kept
             // every shared name until template destruction and made
             // dead-source reclamation ineffective under long replay chains.
-            if (usesSharedPhysicalBank()) {
-                if (entry.sharedId)
-                    sharedFreeList->addReg(entry.sharedId);
-                for (auto shared_id : entry.sharedIds)
-                    if (shared_id)
-                        sharedFreeList->addReg(shared_id);
-            }
+            releaseSharedEntry(entry);
             allocated[phys] = false;
             entry = PhysicalRegister();
         }
@@ -1180,13 +1236,7 @@ class CPU : public BaseCPU
             if (entry.users != 0)
                 --entry.users;
             if (entry.users == 0 && entry.pendingRelease) {
-                if (usesSharedPhysicalBank()) {
-                    if (entry.sharedId)
-                        sharedFreeList->addReg(entry.sharedId);
-                    for (auto shared_id : entry.sharedIds)
-                        if (shared_id)
-                            sharedFreeList->addReg(shared_id);
-                }
+                releaseSharedEntry(entry);
                 allocated[phys] = false;
                 entry = PhysicalRegister();
             }

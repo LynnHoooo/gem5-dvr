@@ -14,14 +14,41 @@
    completed mask，并按 captured physical source name 释放。
 3. `conservationValid()` 在 rename 与 retire 处断言 VRAT mapping 与 physical allocation
    一致，捕获 released mapping、悬空 user 和 pending-release 状态。
-4. helper-private physical bank 现在是默认；`--dvr-shared-physical-bank` 仅作为显式
-   sensitivity option。更重要的是 VRAT 已从长期 replay template 移至每次 helper launch
-   的 execution context，历史 discovery 不会永久耗尽 private bank。
+4. VRAT physical names 已按论文改为默认借用主 O3 `PhysRegFile` 与
+   `UnifiedFreeList`；helper mapping 本身仍是 transient state，不进入主线程 rename map、
+   ROB、commit 或 squash。`--dvr-private-physical-bank` 只保留为资源敏感性 ablation。
+   RISC-V O3 当前使用 element rename mode，因此每个 512-bit copy 对应 8 个共享
+   `VecElemClass` names，16-copy bundle 对应 128 names。
 5. helper LSU 以每个 request 的 `readyTick` 作为 source/dependent 依赖门槛，不再因无关
    lane 的 frontend/replay 工作阻塞已 ready 的 dependent request。
+6. shared name 的分配、dead-source/WAW 释放、失败回滚和模板析构已统一计数，并增加
+   allocated/freed/live/peak 与 free-list admission-stall 统计。Camel drain 后 scalar 与
+   vector live names 均为 0，排除了 shared-name 泄漏和双重归还。
 
 这并不意味着 bit-exact Sniper reproduction：论文未公开所有仲裁细节，当前仍是
 paper-faithful、独立 in-order helper timing model，而非第二条 O3/ROB 线程。
+
+### 2026-08-10 VRAT shared physical-name 验收
+
+固定 `MAX_KEY=65536`、32 KiB L1D、full DVR 的 Camel 结果位于：
+
+```text
+/home/lynnhoo/dvr-repro/results/camel-vrat-ownership-20260810/
+```
+
+| 指标 | shared（论文默认） | private ablation |
+|---|---:|---:|
+| committed instructions | 5,767,296 | 5,767,296 |
+| IPC | 1.704192 | 1.903311 |
+| shared VRAT programs | 489 | 0 |
+| scalar allocated/freed/live/peak | 40,645/40,645/0/32 | 0/0/0/0 |
+| vector-element allocated/freed/live/peak | 62,592/62,592/0/128 | 0/0/0/0 |
+| shared free-list admission stalls | 9,559 | 0 |
+| dependent issued/completed | 60,463/60,463 | 65,274/65,274 |
+
+因此当前 `dvrVRATScalarAllocationFailures=9559` 是主线程与 helper 竞争 256-entry scalar
+physical bank 时出现的真实资源背压，不是泄漏。private 模式因绕过共享资源而 IPC 更高，
+只能作为理想化上界，不能作为论文默认配置。
 
 ### P1：算法和 workload 覆盖
 

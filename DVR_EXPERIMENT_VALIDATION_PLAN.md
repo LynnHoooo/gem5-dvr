@@ -20,7 +20,7 @@
 | FLR | 最后一个 tainted load 的 PC 作为 FLR | committed dependent load 更新 FLR | 基本一致，但投机回滚仍简化 |
 | Loop-Bound | 使用 LCR/SBB 找包围 stride 和 FLR 的 backward branch | 支持 `SLT/SLTU + BEQ/BNE`、`BNE`、`BLT/BGE/BLTU/BGEU` | 常见循环一致，复杂循环会 fallback |
 | Vectorizer | 根据 stride 生成多个未来 iteration，并向量化 dependent chain | 最多生成 128 lanes，并产生 source/dependent 地址 | 功能一致 |
-| VRAT | 标量寄存器可共享，tainted destination 分配 vector physical registers | helper-private VRAT、fresh 16-copy rename、physical lifetime 检查 | 结构一致，非 bit-exact |
+| VRAT | 标量寄存器可共享，tainted destination 分配 vector physical registers | 默认从主 O3 `UnifiedFreeList` 借用 scalar/vector-element physical names；fresh 16-copy rename；dead-source 后归还；private bank 仅 ablation | 共享归属与生命周期已验证，RISC-V element-mode 非 bit-exact |
 | VIR | 16 个独立 vector copies，带 mask、顺序 issue | 已有 16-copy、active/ready/issued/completed/dead-source mask | 基本一致，但 scheduler 是自定义模型 |
 | Helper frontend | 8-entry front-end buffer，产生 helper micro-ops | 独立 fetch/decode buffer、live RISC-V decode、`DVRDynUop` | 方向一致，仲裁细节近似 |
 | Helper issue/FU | helper 与主线程共享 FU，主线程 ready uop 优先 | `tryIssueDVRHelperFU()` 使用共享 FU pool | 基本一致，但不是论文完整流水线 |

@@ -1056,6 +1056,27 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                statistics::units::Count::get(),
                "DVR VRAT vectorizations rejected while allocating a "
                "complete 16-copy vector bundle"),
+      ADD_STAT(dvrSharedScalarNamesAllocated,
+               statistics::units::Count::get(),
+               "Shared O3 scalar physical names borrowed by DVR VRAT"),
+      ADD_STAT(dvrSharedScalarNamesFreed, statistics::units::Count::get(),
+               "Shared O3 scalar physical names returned by DVR VRAT"),
+      ADD_STAT(dvrSharedScalarNamesLive, statistics::units::Count::get(),
+               "Shared O3 scalar physical names currently owned by DVR VRAT"),
+      ADD_STAT(dvrSharedScalarNamesPeak, statistics::units::Count::get(),
+               "Peak shared O3 scalar physical-name ownership by DVR VRAT"),
+      ADD_STAT(dvrSharedVectorNamesAllocated,
+               statistics::units::Count::get(),
+               "Shared O3 vector-element physical names borrowed by DVR VRAT"),
+      ADD_STAT(dvrSharedVectorNamesFreed, statistics::units::Count::get(),
+               "Shared O3 vector-element physical names returned by DVR VRAT"),
+      ADD_STAT(dvrSharedVectorNamesLive, statistics::units::Count::get(),
+               "Shared O3 vector-element physical names currently owned by DVR VRAT"),
+      ADD_STAT(dvrSharedVectorNamesPeak, statistics::units::Count::get(),
+               "Peak shared O3 vector-element physical-name ownership by DVR VRAT"),
+      ADD_STAT(dvrSharedFreeListAdmissionStalls,
+               statistics::units::Count::get(),
+               "DVR launches or renames stalled by shared physical-name pressure"),
       ADD_STAT(dvrVIRChunkIssues, statistics::units::Count::get(),
                "Recorded uop chunks issued through the DVR VIR"),
       ADD_STAT(dvrVIRChunkExecutions, statistics::units::Count::get(),
@@ -3146,7 +3167,8 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
     // retire, instead of accumulating in historical replay templates.
     auto helper_regs = std::make_shared<DVRHelperVectorRegisterFile>();
     if (dvrSharedPhysicalBank)
-        helper_regs->configureSharedPhysicalBank(&regFile, &freeList);
+        helper_regs->configureSharedPhysicalBank(&regFile, &freeList,
+                                                  &cpuStats);
     const bool helper_regs_initialized =
         helper_regs->initialize(replay->initialRegs);
     if (!helper_regs_initialized) {
@@ -3554,7 +3576,8 @@ CPU::launchDVRNestedPrefetches(
     }
     auto helper_regs = std::make_shared<DVRHelperVectorRegisterFile>();
     if (dvrSharedPhysicalBank)
-        helper_regs->configureSharedPhysicalBank(&regFile, &freeList);
+        helper_regs->configureSharedPhysicalBank(&regFile, &freeList,
+                                                  &cpuStats);
     const bool helper_regs_initialized =
         helper_regs->initialize(replay->initialRegs);
     if (!helper_regs_initialized) {
