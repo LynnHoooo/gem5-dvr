@@ -546,10 +546,12 @@ CPU::completeDVRInstructionFetch(PacketPtr pkt)
     if (decoded) {
         dvrHelperThread.decodedUopCache[state->pc] = decoded;
         dvrHelperThread.frontendDecoded(state->pc, false, curTick());
+        dvrHelperThread.retireFrontend(state->pc);
         ++cpuStats.dvrHelperInstructionsDecoded;
     } else {
         dvrHelperThread.decodedUopCache[state->pc] = state->captured;
         dvrHelperThread.frontendDecoded(state->pc, true, curTick());
+        dvrHelperThread.retireFrontend(state->pc);
         ++cpuStats.dvrHelperDecodeFallbacks;
     }
     ++cpuStats.dvrHelperInstructionTimingResponses;
@@ -890,11 +892,11 @@ CPU::CPUStats::CPUStats(CPU *cpu)
       ADD_STAT(dvrHelperVIRCapacityStalls, statistics::units::Count::get(),
                "Helper uops blocked by the finite VIR capacity"),
       ADD_STAT(dvrHelperVRATPrograms, statistics::units::Count::get(),
-               "Replay programs initialized with a private helper VRAT"),
+               "Replay programs initialized with a helper-private VRAT map"),
       ADD_STAT(dvrHelperSharedVRATPrograms, statistics::units::Count::get(),
                "Replay programs mapped into the shared O3 physical register file"),
       ADD_STAT(dvrHelperVRATWrites, statistics::units::Count::get(),
-               "Lane writes into private helper vector registers"),
+               "Lane writes through the helper VRAT"),
       ADD_STAT(dvrHelperReadyUopCycles, statistics::units::Count::get(),
                "Sum of helper ready-queue occupancy across sampled cycles"),
       ADD_STAT(dvrHelperReadyOccupancySamples,
@@ -1043,6 +1045,17 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Recorded slices materialized as DVR vector programs"),
       ADD_STAT(dvrVRATAllocations, statistics::units::Count::get(),
                "16-lane physical mappings allocated by the DVR VRAT"),
+      ADD_STAT(dvrVRATAllocationFailures, statistics::units::Count::get(),
+               "DVR VRAT mappings rejected because the shared physical "
+               "register free list lacked the required names"),
+      ADD_STAT(dvrVRATScalarAllocationFailures,
+               statistics::units::Count::get(),
+               "DVR VRAT initializations rejected while allocating fresh "
+               "scalar snapshot mappings"),
+      ADD_STAT(dvrVRATVectorAllocationFailures,
+               statistics::units::Count::get(),
+               "DVR VRAT vectorizations rejected while allocating a "
+               "complete 16-copy vector bundle"),
       ADD_STAT(dvrVIRChunkIssues, statistics::units::Count::get(),
                "Recorded uop chunks issued through the DVR VIR"),
       ADD_STAT(dvrVIRChunkExecutions, statistics::units::Count::get(),
@@ -1111,6 +1124,34 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "DVR helpers terminated by an eight-entry stack overflow"),
       ADD_STAT(dvrHelpersSuppressed, statistics::units::Count::get(),
                "DVR helper launches suppressed by invalid or terminated VIR"),
+      ADD_STAT(dvrDiscoveryBlockedByHelper,
+               statistics::units::Count::get(),
+               "Stride candidates blocked while a bounded helper generation "
+               "is active"),
+      ADD_STAT(dvrDiscoveryBlockedActiveHelper,
+               statistics::units::Count::get(),
+               "Blocked candidates with non-idle helper state"),
+      ADD_STAT(dvrDiscoveryBlockedQueuedMemory,
+               statistics::units::Count::get(),
+               "Blocked candidates with queued helper memory work"),
+      ADD_STAT(dvrDiscoveryBlockedInFlightMemory,
+               statistics::units::Count::get(),
+               "Blocked candidates with shared-LSQ helper entries"),
+      ADD_STAT(dvrDiscoveryBlockedHelperFrontend,
+               statistics::units::Count::get(),
+               "Blocked candidates with helper fetch/decode work"),
+      ADD_STAT(dvrDiscoveryBlockedHelperReady,
+               statistics::units::Count::get(),
+               "Blocked candidates with helper ready-uop credits"),
+      ADD_STAT(dvrDiscoveryBlockedHelperOutstanding,
+               statistics::units::Count::get(),
+               "Blocked candidates with issued helper memory work"),
+      ADD_STAT(dvrDiscoveryBlockedHelperCompute,
+               statistics::units::Count::get(),
+               "Blocked candidates with helper compute/replay work"),
+      ADD_STAT(dvrDiscoveryBlockedHelperVIR,
+               statistics::units::Count::get(),
+               "Blocked candidates with in-flight VIR entries"),
       ADD_STAT(dvrControlFallbackSourceLaunches,
                statistics::units::Count::get(),
                "Source helpers launched after VIR-only control-flow rejection"),
@@ -1176,7 +1217,8 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                statistics::units::Count::get(),
                "Correct replay values rejected by the learned path predicate"),
       ADD_STAT(dvrReplayReferenceUnavailable, statistics::units::Count::get(),
-               "Replay loads without a trained scalar PC reference"),
+               "Replay loads without a scalar affine reference verified by "
+               "three later observations"),
       ADD_STAT(dvrAlternatePathLookups, statistics::units::Count::get(),
                "Alternate-path cache lookups for missing recorder branches"),
       ADD_STAT(dvrAlternatePathHits, statistics::units::Count::get(),
@@ -1349,14 +1391,9 @@ CPU::tick()
     dvrMainALUIssuesThisCycle = 0;
     dvrMainLSUIssuesThisCycle = 0;
     if (dvrVectorChunkModel) {
-        std::vector<uint64_t> retired_iq_tokens;
         const unsigned retired =
-            dvrHelperThread.retireCompletedVIR(
-                curTick(), retired_iq_tokens);
+            dvrHelperThread.retireCompletedVIR(curTick());
         cpuStats.dvrHelperDynUopsCompleted += retired;
-        assert(retired == retired_iq_tokens.size());
-        for (const uint64_t token : retired_iq_tokens)
-            iew.completeDVRHelperIQ(token);
     }
 
 //    activity = false;
@@ -1412,9 +1449,15 @@ CPU::tick()
         const StaticInstPtr frontend_decoded = fetchDecodeDVRUop(
             dvrHelperThread.frontendTid, frontend_uop.pc,
             frontend_uop.staticInst, fetch_fault, cache_hit);
-        if (frontend_decoded)
+        if (frontend_decoded) {
             dvrHelperThread.frontendDecoded(
                 frontend_uop.pc, fetch_fault, curTick());
+            // The eight entries model the helper fetch/decode staging
+            // buffer.  Once decoded, ownership transfers to VIR/scoreboard
+            // (or the shared LSQ for a load); execution latency must not keep
+            // the frontend slot occupied.
+            dvrHelperThread.retireFrontend(frontend_uop.pc);
+        }
         dvrHelperThread.helperPC = frontend_uop.pc;
         // Timing misses are accounted by request/response handlers.  A
         // nullptr here means the helper front-end is waiting on its cache
@@ -1462,6 +1505,14 @@ CPU::tick()
     // after the normal pre-commit helper arbitration point.  Give that
     // newly-created queue one same-cycle, residual service opportunity.
     serviceDVRPrefetchQueue();
+
+    // A bounded helper may execute fewer uops than the 200-uop safety cap.
+    // Completion is therefore defined by drained frontend/VIR/scoreboard and
+    // shared-LSQ work, not by reaching maxUops.  The old maxUops-only
+    // transition left short helpers Running until program exit and prevented
+    // every later Discovery generation.
+    if (dvrPrefetchQueue.empty() && dvrHelperLoadEntries.empty())
+        dvrHelperThread.finishIfQuiescent();
 
     const uint64_t outstanding_lines = dvrOutstandingPrefetchLines.size();
     ++cpuStats.dvrOutstandingPrefetchLineSamples;
@@ -2517,6 +2568,14 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 captureDVRRegisterSnapshot(tid, inst, finish_regs);
                 const auto inference = dvrLoopBoundDetector.infer(
                     dvrDiscoveryStartRegs, finish_regs, dvrMaxLanes);
+                // Trace-only diagnosis for loop-bound coverage.  Record every
+                // completed discovery, including discovery-only runs where no
+                // helper launch (and therefore no fallback-launch event) is
+                // emitted.  `invocation` is 1 for an exact bound and 0 for the
+                // paper's bounded 128-lane fallback.
+                dvrTraceVector("loop_bound_result", curTick(),
+                    result.triggerPC, inference.bound, inference.lanes,
+                    inference.matched ? 1 : 0);
                 // DVR follows the paper's reconvergence policy: all
                 // divergent paths are deferred until the final indirect
                 // load (FLR), which is the vector-runahead termination PC.
@@ -2897,6 +2956,14 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
                                    &finish_regs)
 {
     ++cpuStats.dvrHelperLaunchAttempts;
+    // Paper DVR admits one bounded helper generation at a time.  The main
+    // thread becomes eligible for another Discovery only after this helper's
+    // queued and in-flight memory work has drained.
+    if (dvrHelperThread.active() || !dvrPrefetchQueue.empty() ||
+        !dvrHelperLoadEntries.empty()) {
+        ++cpuStats.dvrHelpersSuppressed;
+        return;
+    }
     lanes = std::min(lanes, DVRLanePredicateTracker::MaxLanes);
     if (lanes == 0) {
         ++cpuStats.dvrHelperLaunchZeroLanes;
@@ -2908,18 +2975,14 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
     // another launch while its dependent target window is still full.
     const size_t dependent_window_occupancy =
         dvrQueuedDependentLines.size() +
-        dvrDependentOutstandingLines.size() +
-        dvrDependentCompletedLines.size();
+        dvrDependentOutstandingLines.size();
     if (dependent_window_occupancy >= DvrDependentTargetWindowCapacity) {
         ++cpuStats.dvrDependentWindowStalls;
         ++cpuStats.dvrHelpersSuppressed;
         return;
     }
 
-    // Multiple discoveries may be in flight, but admission remains bounded.
-    // The old active-helper/ non-empty-queue gate discarded a whole discovery
-    // generation even when the queue had room, which reduced source
-    // production to a small fraction of the observed dependent demand.
+    // A single admitted generation must fit in the bounded request queue.
     const unsigned available = DvrMaxQueuedPrefetches -
         std::min<unsigned>(dvrPrefetchQueue.size(), DvrMaxQueuedPrefetches);
     if (available == 0) {
@@ -3084,11 +3147,20 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
     auto helper_regs = std::make_shared<DVRHelperVectorRegisterFile>();
     if (dvrSharedPhysicalBank)
         helper_regs->configureSharedPhysicalBank(&regFile, &freeList);
-    helper_regs->initialize(replay->initialRegs);
+    const bool helper_regs_initialized =
+        helper_regs->initialize(replay->initialRegs);
+    if (!helper_regs_initialized) {
+        ++cpuStats.dvrVRATAllocationFailures;
+        ++cpuStats.dvrVRATScalarAllocationFailures;
+        ++cpuStats.dvrHelpersSuppressed;
+        return;
+    }
     if (replay->triggerDestination >= 0 &&
         replay->triggerDestination <
             DVRLoopBoundDetector::MaxArchitecturalIntRegs &&
         !helper_regs->vectorize(replay->triggerDestination)) {
+        ++cpuStats.dvrVRATAllocationFailures;
+        ++cpuStats.dvrVRATVectorAllocationFailures;
         ++cpuStats.dvrHelpersSuppressed;
         return;
     }
@@ -3143,6 +3215,11 @@ void
 CPU::launchDVRVectorRunahead(ThreadID tid, Addr current_address,
                              Addr pc, int64_t stride)
 {
+    if (dvrHelperThread.active() || !dvrPrefetchQueue.empty() ||
+        !dvrHelperLoadEntries.empty()) {
+        ++cpuStats.dvrHelpersSuppressed;
+        return;
+    }
     const unsigned lanes = std::min(dvrMaxLanes,
                                     DVRLanePredicateTracker::MaxLanes);
     dvrPrefetchQueue.clear();
@@ -3312,6 +3389,11 @@ void
 CPU::launchDVRNestedPrefetches(
     const DVRLoopBoundDetector::RegisterSnapshot &finish_regs)
 {
+    if (dvrHelperThread.active() || !dvrPrefetchQueue.empty() ||
+        !dvrHelperLoadEntries.empty()) {
+        ++cpuStats.dvrHelpersSuppressed;
+        return;
+    }
     auto replay = std::make_shared<DVRReplayTemplate>();
     replay->triggerPC = dvrNestedContext.triggerPC;
     // Keep branches after FLR in the persistent template for the same
@@ -3473,11 +3555,20 @@ CPU::launchDVRNestedPrefetches(
     auto helper_regs = std::make_shared<DVRHelperVectorRegisterFile>();
     if (dvrSharedPhysicalBank)
         helper_regs->configureSharedPhysicalBank(&regFile, &freeList);
-    helper_regs->initialize(replay->initialRegs);
+    const bool helper_regs_initialized =
+        helper_regs->initialize(replay->initialRegs);
+    if (!helper_regs_initialized) {
+        ++cpuStats.dvrVRATAllocationFailures;
+        ++cpuStats.dvrVRATScalarAllocationFailures;
+        ++cpuStats.dvrHelpersSuppressed;
+        return;
+    }
     if (replay->triggerDestination >= 0 &&
         replay->triggerDestination <
             DVRLoopBoundDetector::MaxArchitecturalIntRegs &&
         !helper_regs->vectorize(replay->triggerDestination)) {
+        ++cpuStats.dvrVRATAllocationFailures;
+        ++cpuStats.dvrVRATVectorAllocationFailures;
         ++cpuStats.dvrHelpersSuppressed;
         return;
     }
@@ -3579,8 +3670,7 @@ bool
 CPU::dependentDVRWindowFull() const
 {
     return dvrQueuedDependentLines.size() +
-           dvrDependentOutstandingLines.size() +
-           dvrDependentCompletedLines.size() >=
+           dvrDependentOutstandingLines.size() >=
            DvrDependentTargetWindowCapacity;
 }
 
@@ -3747,7 +3837,6 @@ CPU::issueDVRReplayLanes(unsigned slots)
         } else if (lane.program != seed->program ||
                    lane.helperRegs != seed->helperRegs ||
                    lane.uopIndex != seed->uopIndex ||
-                   lane.pendingIQToken != seed->pendingIQToken ||
                    copy != seed->lane / DVRHelperThread::LanesPerVIRCopy ||
                    lane.program->uops[lane.uopIndex].pc !=
                        seed->program->uops[seed->uopIndex].pc) {
@@ -3815,12 +3904,9 @@ CPU::issueDVRReplayLanes(unsigned slots)
         ++cpuStats.dvrVectorFUConflictCycles;
         return 0;
     }
-    // Give this helper uop a real queue identity. Admission and FU selection
-    // are owned atomically by InstructionQueue after the main IEW tick, so
-    // main-thread ready instructions retain strict priority.
-    const bool new_iq_entry = seed->pendingIQToken == 0;
-    const uint64_t iq_token = new_iq_entry ?
-        dvrNextHelperIQToken++ : seed->pendingIQToken;
+    // The paper keeps helper uops in the independent VIR rather than the
+    // main OoO IQ.  Check the helper VRAT/VIR scoreboard here, then request a
+    // shared FU after the main IEW stage has had strict first priority.
     Tick source_ready_tick = 0;
     for (Lane *lane : group) {
         const auto readyAt = [&](int8_t source) {
@@ -3833,27 +3919,17 @@ CPU::issueDVRReplayLanes(unsigned slots)
         };
         source_ready_tick = std::max(source_ready_tick,
             std::max(readyAt(uop.source0), readyAt(uop.source1)));
-        if (new_iq_entry)
-            lane->pendingIQToken = iq_token;
     }
-    bool admitted = false;
-    bool dependency_wait = false;
-    if (!iew.tryIssueDVRHelperIQ(
-            iq_token, op_class, source_ready_tick, curTick(), latency,
-            !dvrVectorUnlimitedFU, admitted, dependency_wait)) {
-        if (!admitted) {
-            for (Lane *lane : group)
-                if (lane->pendingIQToken == iq_token)
-                    lane->pendingIQToken = 0;
-        }
+    if (curTick() < source_ready_tick) {
         ++cpuStats.dvrHelperFUStalls;
-        if (!dependency_wait)
-            ++cpuStats.dvrVectorFUConflictCycles;
+        ++cpuStats.dvrHelperScoreboardWaitCycles;
         return 0;
     }
-    for (Lane *lane : group) {
-        assert(lane->pendingIQToken == iq_token);
-        lane->pendingIQToken = 0;
+    if (!dvrVectorUnlimitedFU &&
+        !iew.tryIssueDVRHelperFU(op_class, latency)) {
+        ++cpuStats.dvrHelperFUStalls;
+        ++cpuStats.dvrVectorFUConflictCycles;
+        return 0;
     }
 
     // This is the helper's actual same-PC vector issue group.  Keep the
@@ -3884,7 +3960,6 @@ CPU::issueDVRReplayLanes(unsigned slots)
     dyn_uop.pc = uop.pc;
     dyn_uop.copy = seed->lane / DVRHelperThread::LanesPerVIRCopy;
     dyn_uop.issueCycle = curTick();
-    dyn_uop.iqToken = iq_token;
     dyn_uop.state = DVRHelperThread::DVRDynUop::State::Ready;
     dyn_uop.lanes.reserve(group.size());
     dyn_uop.source0Physical.reserve(group.size());
@@ -3953,9 +4028,11 @@ CPU::issueDVRReplayLanes(unsigned slots)
     else
         ++cpuStats.dvrVectorALUChunkIssues;
 
-    // Rename a vector destination exactly once for this dynamic uop.  The
-    // old source names were retained above, so destination==source and WAW
-    // cases preserve the old values until this VIR copy retires.
+    // Paper DVR is in order and therefore does not rename every vector write
+    // to remove WAW/WAR dependencies. Allocate sixteen vector physical
+    // registers only on the scalar-to-vector transition; later vector writes
+    // update that mapping in program order. Sources were read/retained above,
+    // so destination==source remains safe until this VIR copy retires.
     const bool vector_destination = uop.destination > 0 &&
         uop.destination < DVRLoopBoundDetector::MaxArchitecturalIntRegs &&
         seed->helperRegs &&
@@ -3963,9 +4040,11 @@ CPU::issueDVRReplayLanes(unsigned slots)
           seed->helperRegs->isVectorized(uop.source0)) ||
          (uop.source1 >= 0 &&
           seed->helperRegs->isVectorized(uop.source1)));
-    if (vector_destination) {
-        if (!seed->helperRegs->renameVector(uop.destination)) {
-            ++cpuStats.dvrVIRSourceValueSemanticFailures;
+    if (vector_destination &&
+        !seed->helperRegs->isVectorized(uop.destination)) {
+        if (!seed->helperRegs->vectorize(uop.destination)) {
+            ++cpuStats.dvrVRATAllocationFailures;
+            ++cpuStats.dvrVRATVectorAllocationFailures;
             for (Lane *lane : group)
                 lane->active = false;
         }
@@ -4061,7 +4140,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
             const auto exact_relation = dvrAddressRelations.find(
                 DVRRelationKey{lane->triggerPC, lane_uop.pc});
             if (exact_relation != dvrAddressRelations.end() &&
-                exact_relation->second.trained) {
+                exact_relation->second.affineVerified) {
                 const auto &relation = exact_relation->second;
                 const RegVal trigger_value = lane->helperRegs ?
                     lane->helperRegs->read(
@@ -4072,10 +4151,13 @@ CPU::issueDVRReplayLanes(unsigned slots)
                     (relation.pattern & relation.stableMask);
                 const int64_t expected = relation.scale *
                     static_cast<int64_t>(trigger_value) + relation.offset;
-                relation_match = mask_match &&
-                    expected == static_cast<int64_t>(result) &&
-                    result >= relation.minAddress &&
-                    result <= relation.maxAddress;
+                // The recorded dependency chain is the semantic authority.
+                // Stable-mask and min/max observations are diagnostics for
+                // path confidence, not hard bounds: a valid vector lane may
+                // legitimately use a predicate value or address outside the
+                // scalar training sample.
+                relation_match =
+                    expected == static_cast<int64_t>(result);
                 const bool value_match =
                     expected == static_cast<int64_t>(result);
                 const bool in_training_range =
@@ -4131,12 +4213,8 @@ CPU::issueDVRReplayLanes(unsigned slots)
             // relation is only a legacy fallback/predicate aid; it can differ
             // across NDM invocations and can also alias across ordinary
             // discovery generations.  It must not veto the semantic replay.
-            if (!relation_match && lane->program && lane->program->valid) {
-                relation_match = exact_relation == dvrAddressRelations.end() ||
-                    !exact_relation->second.trained ||
-                    (result >= exact_relation->second.minAddress &&
-                     result <= exact_relation->second.maxAddress);
-            }
+            if (!relation_match && lane->program && lane->program->valid)
+                relation_match = true;
             if (!relation_match) {
                 lane->active = false;
                 ++cpuStats.dvrPredicateMisses;
@@ -4425,10 +4503,6 @@ CPU::serviceDVRPrefetchQueue()
         return;
     }
     const auto prefetch = dvrPrefetchQueue.front();
-    if (dvrHelperLoadQueueOccupancy >= DvrHelperLoadQueueCapacity) {
-        ++cpuStats.dvrHelperVIRCapacityStalls;
-        return;
-    }
     const uint64_t helper_load_id = dvrNextHelperLoadId++;
     if (!iew.allocateDVRHelperLoad(
             helper_load_id, prefetch.tid, prefetch.address, prefetch.pc)) {
@@ -4595,10 +4669,15 @@ CPU::serviceDVRPrefetchQueue()
         cpuStats.dvrHelperUopsBecameReady += became_ready;
     }
     ++cpuStats.dvrPrefetchesIssued;
-    ++dvrHelperLoadQueueOccupancy;
     ++dvrHelperIssuesThisCycle;
     ++cpuStats.dvrHelperIssueCycles;
     ++cpuStats.dvrHelperUopsIssued;
+    // Load uops bypass the compute issueQueue and become scalar lanes in the
+    // shared LSQ.  Retire the matching entry from the independent eight-entry
+    // helper frontend only after the real memory request is accepted; without
+    // this, load entries permanently fill the frontend and keep a completed
+    // bounded generation active until program exit.
+    dvrHelperThread.retireFrontend(prefetch.pc);
     dvrHelperThread.issue();
     dvrQualityTracker.issued(
         reinterpret_cast<uintptr_t>(pkt), dvrPrefetchLine(req->getPaddr()),
@@ -4632,8 +4711,6 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
         helper_entry->second.responseTick = curTick();
         ++cpuStats.dvrHelperLoadEntryWritebacks;
     }
-    assert(dvrHelperLoadQueueOccupancy != 0);
-    --dvrHelperLoadQueueOccupancy;
     ++cpuStats.dvrPrefetchesCompleted;
     if (state->oracle) {
         ++cpuStats.oraclePrefetchesCompleted;
@@ -4670,7 +4747,16 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
         if (dependent_outstanding != dvrDependentOutstandingLines.end()) {
             if (--dependent_outstanding->second == 0) {
                 dvrDependentOutstandingLines.erase(dependent_outstanding);
-                dvrDependentCompletedLines.insert(line);
+                if (dvrDependentCompletedLines.insert(line).second) {
+                    dvrDependentCompletedLineOrder.push_back(line);
+                    while (dvrDependentCompletedLineOrder.size() >
+                           DvrDependentCompletedHistoryCapacity) {
+                        const Addr old =
+                            dvrDependentCompletedLineOrder.front();
+                        dvrDependentCompletedLineOrder.pop_front();
+                        dvrDependentCompletedLines.erase(old);
+                    }
+                }
             }
         }
     }
@@ -4968,14 +5054,16 @@ CPU::startDVRHelper(
     helper_resources.shift *= work_units;
     helper_resources.multiply *= work_units;
     helper_resources.lsu *= work_units;
+    // New generations are gated before reaching this point.  Keeping begin()
+    // as the only transition prevents unrelated discoveries from extending a
+    // live VIR/front-end stream beyond the paper's 200-uop generation.
     if (dvrHelperThread.active()) {
-        dvrHelperThread.extend(trigger_pc, program_uops, work_units,
-                               helper_resources, dvrVectorChunkModel, replay);
-    } else {
-        dvrHelperThread.begin(dvrNextHelperId++, trigger_pc, program_uops,
-                              work_units, dvrHelperMaxUops, helper_resources,
-                              dvrVectorChunkModel, replay, tid);
+        ++cpuStats.dvrHelpersSuppressed;
+        return;
     }
+    dvrHelperThread.begin(dvrNextHelperId++, trigger_pc, program_uops,
+                          work_units, dvrHelperMaxUops, helper_resources,
+                          dvrVectorChunkModel, replay, tid);
     if (dvrVectorChunkModel)
         cpuStats.dvrVectorActiveLanes += lanes;
     cpuStats.dvrHelperALUOps += resources.alu * lanes;
@@ -5124,9 +5212,7 @@ CPU::replayDVRSource(const DVRPrefetchSenderState &state,
                 const auto &relation = relation_it->second;
                 const int64_t expected = relation.scale *
                     static_cast<int64_t>(source_value) + relation.offset;
-                if (expected < 0 || static_cast<Addr>(expected) != result ||
-                    result < relation.minAddress ||
-                    result > relation.maxAddress) {
+                if (expected < 0 || static_cast<Addr>(expected) != result) {
                     ++cpuStats.dvrReplayUnstableInputs;
                     return false;
                 }
@@ -5287,6 +5373,22 @@ CPU::trainDVRAddressRelation(Addr trigger_pc, Addr flr_pc, RegVal source_value,
         relation.minAddress = std::min(relation.minAddress, dependent_address);
         relation.maxAddress = std::max(relation.maxAddress, dependent_address);
     }
+    if (relation.trained) {
+        const int64_t expected = relation.scale *
+            static_cast<int64_t>(source_value) + relation.offset;
+        if (expected == static_cast<int64_t>(dependent_address)) {
+            ++relation.affineValidationMatches;
+            // Two observations choose an affine candidate. Require three
+            // later scalar observations to agree before treating it as an
+            // independent replay oracle; hash/pointer chains otherwise look
+            // spuriously affine for one adjacent sample pair.
+            relation.affineVerified =
+                relation.affineValidationMatches >= 3;
+        } else {
+            relation.affineValidationMatches = 0;
+            relation.affineVerified = false;
+        }
+    }
     ++relation.samples;
     if (relation.hasPrevious && source_value != relation.previousValue) {
         const int64_t value_delta = static_cast<int64_t>(
@@ -5297,9 +5399,16 @@ CPU::trainDVRAddressRelation(Addr trigger_pc, Addr flr_pc, RegVal source_value,
             const int64_t scale = address_delta / value_delta;
             if (scale != 0 && std::abs(scale) <= 4096) {
                 const bool newly_trained = !relation.trained;
-                relation.scale = scale;
-                relation.offset = static_cast<int64_t>(dependent_address) -
+                const int64_t offset =
+                    static_cast<int64_t>(dependent_address) -
                     scale * static_cast<int64_t>(source_value);
+                if (!relation.trained || relation.scale != scale ||
+                    relation.offset != offset) {
+                    relation.affineValidationMatches = 0;
+                    relation.affineVerified = false;
+                }
+                relation.scale = scale;
+                relation.offset = offset;
                 relation.trained = true;
                 if (newly_trained)
                     ++cpuStats.dvrAddressRelationsTrained;
@@ -6145,6 +6254,29 @@ CPU::observeDVRDispatch(const DynInstPtr &inst)
                         true, candidate->pc, inst->seqNum,
                         candidate->address, candidate->stride};
                 }
+            } else if (dvrHelperThread.active() ||
+                       !dvrPrefetchQueue.empty() ||
+                       !dvrHelperLoadEntries.empty()) {
+                // The paper only re-enables Discovery once the previous
+                // bounded helper generation has terminated.
+                ++cpuStats.dvrDiscoveryBlockedByHelper;
+                if (dvrHelperThread.active())
+                    ++cpuStats.dvrDiscoveryBlockedActiveHelper;
+                if (!dvrPrefetchQueue.empty())
+                    ++cpuStats.dvrDiscoveryBlockedQueuedMemory;
+                if (!dvrHelperLoadEntries.empty())
+                    ++cpuStats.dvrDiscoveryBlockedInFlightMemory;
+                if (dvrHelperThread.fetchRemaining != 0 ||
+                    dvrHelperThread.decodeRemaining != 0)
+                    ++cpuStats.dvrDiscoveryBlockedHelperFrontend;
+                if (dvrHelperThread.readyUops != 0)
+                    ++cpuStats.dvrDiscoveryBlockedHelperReady;
+                if (dvrHelperThread.outstanding != 0)
+                    ++cpuStats.dvrDiscoveryBlockedHelperOutstanding;
+                if (dvrHelperThread.computePending())
+                    ++cpuStats.dvrDiscoveryBlockedHelperCompute;
+                if (!dvrHelperThread.virBuffer.empty())
+                    ++cpuStats.dvrDiscoveryBlockedHelperVIR;
             } else {
                 beginDVRDiscoveryAtDispatch(inst, *candidate, false);
             }

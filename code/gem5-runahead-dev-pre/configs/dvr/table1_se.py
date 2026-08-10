@@ -149,6 +149,19 @@ def parse_args():
     parser.add_argument("--cmd", required=True)
     parser.add_argument("--options", default="")
     parser.add_argument("--maxinsts", type=int, default=0)
+    parser.add_argument(
+        "--restore-checkpoint", default="",
+        help="Restore this SE checkpoint before starting the measured run",
+    )
+    parser.add_argument(
+        "--take-checkpoint", default="",
+        help=("Write a checkpoint at the --maxinsts exit and stop; use a "
+              "DVR-disabled warmup run to create a mode-neutral ROI"),
+    )
+    parser.add_argument(
+        "--l1d-size", default="32KiB",
+        help="L1 data-cache capacity; all other Table-1 parameters remain fixed",
+    )
     parser.add_argument("--dvr", action="store_true")
     parser.add_argument("--pre", action="store_true",
                         help="Enable the original Precise Runahead Execution")
@@ -197,10 +210,20 @@ def parse_args():
         help="Disable speculative launches without a proven loop bound")
     parser.add_argument(
         "--dvr-private-physical-bank", action="store_true",
-        help="Deprecated compatibility flag; helper-private is now default")
+        help="Use helper-local register storage for an explicit ablation")
     parser.add_argument(
         "--dvr-shared-physical-bank", action="store_true",
-        help="Borrow O3 physical names for a shared-bank sensitivity run")
+        help="Deprecated compatibility flag; shared physical banks are default")
+    parser.add_argument(
+        "--num-phys-vec-regs", type=int, default=128,
+        help=("Physical vector-register count; 128 is the paper/Table-1 "
+              "default and larger values are sensitivity-only"),
+    )
+    parser.add_argument(
+        "--num-phys-int-regs", type=int, default=256,
+        help=("Physical integer-register count; 256 is the paper/Table-1 "
+              "default and larger values are sensitivity-only"),
+    )
     parser.add_argument("--discovery-max-insts", type=int, default=512)
     parser.add_argument("--dvr-ndm-threshold", type=int, default=64)
     parser.add_argument("--dvr-ndm-max-insts", type=int, default=512)
@@ -233,7 +256,8 @@ def main():
         # This is transport storage only; wbWidth still limits retirement.
         forwardComSize=64,
         numROBEntries=350, numIQEntries=128, LQEntries=128, SQEntries=72,
-        numPhysIntRegs=256, numPhysFloatRegs=256, numPhysVecRegs=128,
+        numPhysIntRegs=args.num_phys_int_regs, numPhysFloatRegs=256,
+        numPhysVecRegs=args.num_phys_vec_regs,
         branchPred=TAGE_SC_L_8KB(), fuPool=DVRFUPool(),
         enableDVR=args.dvr, dvrMode=args.dvr_mode,
         enablePRE=args.pre,
@@ -253,8 +277,7 @@ def main():
         dvrVectorElementBits=args.dvr_vector_element_bits,
         dvrEnableDependentPrefetch=not args.dvr_no_dependent_prefetch,
         dvrAllowBoundedFallback=not args.dvr_no_bounded_fallback,
-        dvrSharedPhysicalBank=(args.dvr_shared_physical_bank and
-                               not args.dvr_private_physical_bank),
+        dvrSharedPhysicalBank=not args.dvr_private_physical_bank,
         dvrNDMThreshold=args.dvr_ndm_threshold,
         dvrNDMMaxInsts=args.dvr_ndm_max_insts,
     )
@@ -263,6 +286,7 @@ def main():
 
     l1i = Table1L1I()
     l1d = Table1L1D()
+    l1d.size = args.l1d_size
     system.cpu.addPrivateSplitL1Caches(l1i, l1d)
 
     if args.dvr_quality_probe:
@@ -314,9 +338,19 @@ def main():
     system.cpu.createInterruptController()
 
     root = Root(full_system=False, system=system)
-    m5.instantiate()
+    if args.take_checkpoint and not args.maxinsts:
+        raise RuntimeError("--take-checkpoint requires --maxinsts")
+
+    m5.instantiate(args.restore_checkpoint or None)
+    if args.restore_checkpoint:
+        # Checkpoints preserve warmed caches, predictor and architectural
+        # state.  Only the post-restore interval belongs to the ROI.
+        m5.stats.reset()
     event = m5.simulate()
     print("Exiting @ tick {} because {}".format(m5.curTick(), event.getCause()))
+    if args.take_checkpoint:
+        m5.checkpoint(args.take_checkpoint)
+        print("Checkpoint written to {}".format(args.take_checkpoint))
 
 
 if __name__ == "__m5_main__":

@@ -520,78 +520,6 @@ InstructionQueue::numFreeEntries(ThreadID tid)
     return std::min(freeEntries, maxEntries[tid] - count[tid]);
 }
 
-bool
-InstructionQueue::reserveDVRHelperEntry()
-{
-    if (freeEntries == 0)
-        return false;
-    --freeEntries;
-    ++dvrHelperReservedEntries;
-    return true;
-}
-
-void
-InstructionQueue::releaseDVRHelperEntry()
-{
-    assert(dvrHelperReservedEntries != 0);
-    assert(freeEntries < numEntries);
-    --dvrHelperReservedEntries;
-    ++freeEntries;
-}
-
-bool
-InstructionQueue::tryIssueDVRHelperEntry(
-    uint64_t token, OpClass op_class, Tick source_ready_tick, Tick now,
-    Cycles &latency, bool use_fu, bool &admitted, bool &dependency_wait)
-{
-    assert(token != 0);
-    admitted = false;
-    dependency_wait = false;
-    auto entry = dvrHelperEntries.find(token);
-    if (entry == dvrHelperEntries.end()) {
-        if (freeEntries == 0)
-            return false;
-        --freeEntries;
-        ++dvrHelperReservedEntries;
-        entry = dvrHelperEntries.emplace(token,
-            DVRHelperEntry{op_class, source_ready_tick}).first;
-    } else {
-        assert(entry->second.opClass == op_class);
-        // The helper register scoreboard is authoritative.  In particular a
-        // load consumer first arrives with MaxTick and LSQ writeback later
-        // lowers it to the real completion tick.
-        entry->second.sourceReadyTick = source_ready_tick;
-    }
-    admitted = true;
-    if (now < entry->second.sourceReadyTick) {
-        dependency_wait = true;
-        return false;
-    }
-
-    int fu_idx = FUPool::NoFreeFU;
-    if (use_fu) {
-        fu_idx = fuPool->getUnit(op_class);
-        if (fu_idx == FUPool::NoFreeFU || fu_idx == FUPool::NoCapableFU)
-            return false;
-        latency = fuPool->getOpLatency(op_class);
-    } else {
-        latency = Cycles(1);
-    }
-
-    if (use_fu)
-        fuPool->freeUnitNextCycle(fu_idx);
-    return true;
-}
-
-void
-InstructionQueue::releaseDVRHelperEntry(uint64_t token)
-{
-    const auto entry = dvrHelperEntries.find(token);
-    assert(entry != dvrHelperEntries.end());
-    dvrHelperEntries.erase(entry);
-    releaseDVRHelperEntry();
-}
-
 // Might want to do something more complex if it knows how many instructions
 // will be issued this cycle.
 bool
@@ -672,8 +600,7 @@ InstructionQueue::insert(const DynInstPtr &new_inst)
 
     count[new_inst->threadNumber]++;
 
-    assert(freeEntries ==
-           (numEntries - countInsts() - dvrHelperReservedEntries));
+    assert(freeEntries == (numEntries - countInsts()));
 }
 
 void
@@ -719,8 +646,7 @@ InstructionQueue::insertNonSpec(const DynInstPtr &new_inst)
 
     count[new_inst->threadNumber]++;
 
-    assert(freeEntries ==
-           (numEntries - countInsts() - dvrHelperReservedEntries));
+    assert(freeEntries == (numEntries - countInsts()));
 }
 
 void
@@ -1032,8 +958,7 @@ InstructionQueue::commit(const InstSeqNum &inst, ThreadID tid)
         instList[tid].pop_front();
     }
 
-    assert(freeEntries ==
-           (numEntries - countInsts() - dvrHelperReservedEntries));
+    assert(freeEntries == (numEntries - countInsts()));
 }
 
 int

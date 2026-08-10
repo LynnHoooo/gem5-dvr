@@ -853,34 +853,6 @@ IEW::tryIssueDVRHelperFU(OpClass op_class, Cycles &latency)
 }
 
 bool
-IEW::tryIssueDVRHelperIQ(
-    uint64_t token, OpClass op_class, Tick source_ready_tick, Tick now,
-    Cycles &latency, bool use_fu, bool &admitted, bool &dependency_wait)
-{
-    return instQueue.tryIssueDVRHelperEntry(
-        token, op_class, source_ready_tick, now, latency, use_fu,
-        admitted, dependency_wait);
-}
-
-void
-IEW::completeDVRHelperIQ(uint64_t token)
-{
-    instQueue.releaseDVRHelperEntry(token);
-}
-
-bool
-IEW::reserveDVRHelperIQEntry()
-{
-    return instQueue.reserveDVRHelperEntry();
-}
-
-void
-IEW::releaseDVRHelperIQEntry()
-{
-    instQueue.releaseDVRHelperEntry();
-}
-
-bool
 IEW::hasFreeDVRHelperLoadEntry(ThreadID tid)
 {
     return ldstQueue.numFreeLoadEntries(tid) > 0;

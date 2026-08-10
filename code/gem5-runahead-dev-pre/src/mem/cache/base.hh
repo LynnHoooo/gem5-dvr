@@ -49,6 +49,7 @@
 #include <cassert>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 
 #include "base/addr_range.hh"
 #include "base/compiler.hh"
@@ -376,6 +377,25 @@ class BaseCache : public ClockedObject
      * this probe partially overlaps with other probes.
      */
     ProbePointArg<DataUpdate> *ppDataUpdate;
+
+    // Optional, exact tag-lookup accounting used by the DVR PC pipeline
+    // diagnostic.  Keeping this aggregated avoids per-access trace files.
+    struct PCAccessCounts
+    {
+        uint64_t demandHits = 0;
+        uint64_t demandMisses = 0;
+        uint64_t sourceHits = 0;
+        uint64_t sourceMisses = 0;
+        uint64_t dependentHits = 0;
+        uint64_t dependentMisses = 0;
+    };
+    std::unordered_map<Addr, PCAccessCounts> pcAccessCounts;
+    bool pcAccessSummaryEnabled = false;
+    bool pcAccessSummaryFrozen = false;
+    std::string pcAccessSummaryDir;
+    void accountPCAccess(PacketPtr pkt, bool hit, bool demand,
+                         bool source, bool dependent);
+    void dumpPCAccessSummary() const;
 
     /**
      * The writeAllocator drive optimizations for streaming writes.

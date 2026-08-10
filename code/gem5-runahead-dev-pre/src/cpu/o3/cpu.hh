@@ -811,6 +811,9 @@ class CPU : public BaseCPU
         statistics::Scalar dvrRecorderOverflows;
         statistics::Scalar dvrVectorProgramsBuilt;
         statistics::Scalar dvrVRATAllocations;
+        statistics::Scalar dvrVRATAllocationFailures;
+        statistics::Scalar dvrVRATScalarAllocationFailures;
+        statistics::Scalar dvrVRATVectorAllocationFailures;
         statistics::Scalar dvrVIRChunkIssues;
         statistics::Scalar dvrVIRChunkExecutions;
         statistics::Scalar dvrDivergentBranches;
@@ -835,6 +838,15 @@ class CPU : public BaseCPU
         statistics::Scalar dvrHelperTimeouts;
         statistics::Scalar dvrReconvergenceStackOverflows;
         statistics::Scalar dvrHelpersSuppressed;
+        statistics::Scalar dvrDiscoveryBlockedByHelper;
+        statistics::Scalar dvrDiscoveryBlockedActiveHelper;
+        statistics::Scalar dvrDiscoveryBlockedQueuedMemory;
+        statistics::Scalar dvrDiscoveryBlockedInFlightMemory;
+        statistics::Scalar dvrDiscoveryBlockedHelperFrontend;
+        statistics::Scalar dvrDiscoveryBlockedHelperReady;
+        statistics::Scalar dvrDiscoveryBlockedHelperOutstanding;
+        statistics::Scalar dvrDiscoveryBlockedHelperCompute;
+        statistics::Scalar dvrDiscoveryBlockedHelperVIR;
         statistics::Scalar dvrControlFallbackSourceLaunches;
         statistics::Scalar dvrPredicateSelections;
         statistics::Scalar dvrDistinctPredicatePaths;
@@ -926,9 +938,9 @@ class CPU : public BaseCPU
     void launchDVRVectorRunaheadOnStall(ThreadID tid);
 
     /**
-     * Private vector register file for one helper program.  It is deliberately
-     * separate from the main O3 physical register file: DVR is a transient,
-     * in-order subthread and must not create architectural rename/commit state.
+     * Helper-private VRAT metadata backed, in paper mode, by physical names
+     * borrowed from the main O3 scalar/vector register files.  The mappings do
+     * not enter the architectural rename map, ROB, commit, or squash state.
      */
     struct DVRHelperVectorRegisterFile
     {
@@ -937,9 +949,9 @@ class CPU : public BaseCPU
         static constexpr unsigned VectorCopies = MaxLanes / LanesPerVectorCopy;
         static constexpr unsigned NumArchitecturalRegs =
             DVRLoopBoundDetector::MaxArchitecturalIntRegs;
-        // Match the paper's helper-side physical-register budget: 256 scalar
-        // entries and 128 vector entries. The bank remains helper-private,
-        // but can now hold several vectorized destinations in flight.
+        // Local slots encode the VRAT mapping shape. In paper mode every live
+        // slot must also own a shared O3 physical name; local-only allocation
+        // is retained solely for the explicit private-bank ablation.
         static constexpr unsigned NumScalarPhysicalRegs = 256;
         static constexpr unsigned NumVectorPhysicalRegs = 128;
         static constexpr unsigned NumPhysicalRegs =
@@ -1024,15 +1036,15 @@ class CPU : public BaseCPU
                 !allocated[phys] || lane >= MaxLanes)
                 return 0;
             const auto &entry = physical[phys];
-            // A scalar physical name is a single O3 value, while the helper
-            // still carries one scalar value per lane until that register is
-            // vectorized.  Never overwrite the shared scalar slot once per
-            // lane; that would collapse the lane state to the last writer.
-            if (usesSharedPhysicalBank() && entry.vector) {
-                const auto shared_id = entry.sharedIds[lane %
-                    LanesPerVectorCopy];
-                if (shared_id)
-                    return sharedRegFile->getReg(shared_id);
+            if (usesSharedPhysicalBank()) {
+                if (!entry.vector && entry.sharedId)
+                    return sharedRegFile->getReg(entry.sharedId);
+                if (entry.vector) {
+                    const auto shared_id = entry.sharedIds[lane %
+                        LanesPerVectorCopy];
+                    if (shared_id)
+                        return sharedRegFile->getReg(shared_id);
+                }
             }
             return entry.values[lane];
         }
@@ -1043,11 +1055,15 @@ class CPU : public BaseCPU
                 !allocated[phys] || lane >= MaxLanes)
                 return;
             auto &entry = physical[phys];
-            if (usesSharedPhysicalBank() && entry.vector) {
-                const auto shared_id = entry.sharedIds[lane %
-                    LanesPerVectorCopy];
-                if (shared_id)
-                    sharedRegFile->setReg(shared_id, value);
+            if (usesSharedPhysicalBank()) {
+                if (!entry.vector && entry.sharedId)
+                    sharedRegFile->setReg(entry.sharedId, value);
+                if (entry.vector) {
+                    const auto shared_id = entry.sharedIds[lane %
+                        LanesPerVectorCopy];
+                    if (shared_id)
+                        sharedRegFile->setReg(shared_id, value);
+                }
             }
             entry.values[lane] = value;
         }
@@ -1057,11 +1073,9 @@ class CPU : public BaseCPU
             for (unsigned phys = 0; phys < NumScalarPhysicalRegs; ++phys) {
                 if (!allocated[phys]) {
                     PhysRegIdPtr shared_id = nullptr;
-                    if (usesSharedPhysicalBank() &&
-                        sharedFreeList->hasFreeRegs(IntRegClass)) {
-                        // Shared names are opportunistic.  The helper still
-                        // owns a local scalar slot when the O3 free list is
-                        // temporarily exhausted by other live templates.
+                    if (usesSharedPhysicalBank()) {
+                        if (!sharedFreeList->hasFreeRegs(IntRegClass))
+                            return -1;
                         shared_id = sharedFreeList->getReg(IntRegClass);
                     }
                     allocated[phys] = true;
@@ -1098,7 +1112,7 @@ class CPU : public BaseCPU
                             for (auto shared_id : shared_ids)
                                 if (shared_id)
                                     sharedFreeList->addReg(shared_id);
-                            shared_ids.fill(nullptr);
+                            break;
                         }
                     }
                     allocated[phys] = true;
@@ -1206,13 +1220,15 @@ class CPU : public BaseCPU
             }
         }
 
-        void initialize(const DVRLoopBoundDetector::RegisterSnapshot &regs)
+        bool initialize(const DVRLoopBoundDetector::RegisterSnapshot &regs)
         {
             reset();
             for (unsigned arch = 0; arch < NumArchitecturalRegs; ++arch) {
                 const int16_t phys = allocateScalar();
-                if (phys < 0)
-                    break;
+                if (phys < 0) {
+                    reset();
+                    return false;
+                }
                 vrat[arch].scalar = phys;
                 auto &entry = physical[phys];
                 for (unsigned lane = 0; lane < MaxLanes; ++lane) {
@@ -1220,6 +1236,7 @@ class CPU : public BaseCPU
                     entry.valid[lane / 64] |= uint64_t(1) << (lane % 64);
                 }
             }
+            return true;
         }
 
         // The trigger destination is the first architectural register that
@@ -1611,7 +1628,6 @@ class CPU : public BaseCPU
             unsigned chunksRemaining = 1;
             Tick issueCycle = 0;
             Tick completeCycle = 0;
-            uint64_t iqToken = 0;
             State state = State::Decoded;
         };
         // Paper DVR holds sixteen independent 512-bit copies in the VIR.
@@ -1685,7 +1701,6 @@ class CPU : public BaseCPU
             unsigned reconvergenceDepth = 0;
             unsigned helperUops = 0;
             unsigned chainDepth = 0;
-            uint64_t pendingIQToken = 0;
             bool nested = false;
             bool active = true;
         };
@@ -1789,35 +1804,6 @@ class CPU : public BaseCPU
             state = fetchRemaining == 0 ? State::Idle : State::Fetch;
         }
 
-        void extend(Addr pc, unsigned uops, unsigned units,
-                    const DVRInstructionRecorder::ResourceCounts &resources,
-                    bool vector_model,
-                    std::shared_ptr<const DVRReplayTemplate> replay)
-        {
-            if (state == State::Idle) {
-                begin(id, pc, uops, units, maxUops, resources, vector_model,
-                      replay, frontendTid);
-                return;
-            }
-
-            // A discovery may complete while an older generation is still
-            // draining.  Preserve both generations in the bounded helper
-            // stream instead of resetting the helper's frontend and issue
-            // budget to the newest one.
-            const uint64_t generation_uops =
-                std::min<uint64_t>(uint64_t(uops) * units, maxUops);
-            fetchRemaining += generation_uops;
-            maxUops += generation_uops;
-            if (!(replay && vector_model)) {
-                aluRemaining += resources.alu;
-                shiftRemaining += resources.shift;
-                multiplyRemaining += resources.multiply;
-            }
-            vectorChunkModel = vector_model;
-            if (state == State::Draining || state == State::Decode)
-                state = State::Fetch;
-        }
-
         unsigned advanceFrontend(unsigned fetch_width, unsigned decode_width)
         {
             lastFetched = 0;
@@ -1877,7 +1863,7 @@ class CPU : public BaseCPU
             }
         }
 
-        void retireFrontend(Addr pc)
+        bool retireFrontend(Addr pc)
         {
             for (auto it = frontendBuffer.begin();
                  it != frontendBuffer.end(); ++it) {
@@ -1885,9 +1871,20 @@ class CPU : public BaseCPU
                     (it->state == FrontendEntry::State::Ready ||
                      it->state == FrontendEntry::State::Fault)) {
                     frontendBuffer.erase(it);
-                    return;
+                    return true;
                 }
             }
+            return false;
+        }
+
+        void retireDecodedLoad(Addr pc)
+        {
+            // Scalar load lanes are represented by shared-LSQ entries rather
+            // than VIR compute entries.  Consuming the decoded frontend uop
+            // here transfers ownership to that memory path; external queues
+            // and outstanding entries still keep the generation alive.
+            if (retireFrontend(pc) && readyUops != 0)
+                --readyUops;
         }
 
         unsigned advanceCompute(unsigned alu_width, unsigned shift_width,
@@ -2012,8 +2009,7 @@ class CPU : public BaseCPU
             return true;
         }
 
-        unsigned retireCompletedVIR(
-            Tick now, std::vector<uint64_t> &retired_iq_tokens)
+        unsigned retireCompletedVIR(Tick now)
         {
             unsigned retired = 0;
             for (auto it = virBuffer.begin(); it != virBuffer.end();) {
@@ -2042,8 +2038,6 @@ class CPU : public BaseCPU
                             it->helperRegs->releasePhysical(phys);
                         assert(it->helperRegs->conservationValid());
                     }
-                    assert(it->iqToken != 0);
-                    retired_iq_tokens.push_back(it->iqToken);
                     ++retired;
                     it = virBuffer.erase(it);
                 } else {
@@ -2300,6 +2294,27 @@ class CPU : public BaseCPU
                 state = State::Idle;
         }
 
+        bool quiescent() const
+        {
+            return fetchRemaining == 0 && decodeRemaining == 0 &&
+                   outstanding == 0 && !computePending() &&
+                   virBuffer.empty();
+        }
+
+        void finishIfQuiescent()
+        {
+            if (state != State::Idle && quiescent()) {
+                // readyUops is an arbitration credit, not an owning work
+                // structure. Scalarized loads can leave surplus credits
+                // because one decoded vector load fans out into many shared
+                // LSQ lanes. No work is discarded here: frontend, VIR,
+                // replay/compute, issued memory, and the CPU-level memory
+                // queues have all independently drained.
+                readyUops = 0;
+                state = State::Idle;
+            }
+        }
+
         bool active() const { return state != State::Idle; }
 
     } dvrHelperThread;
@@ -2322,10 +2337,9 @@ class CPU : public BaseCPU
     // residual LSU slot drains source lanes, burying dependent targets behind
     // an unbounded source queue.
     static constexpr unsigned DvrMaxQueuedPrefetches = 256;
-    // Helper loads are transient and never enter the ROB, but each one holds
-    // a bounded helper-LQ reservation until its timing response returns.
-    static constexpr unsigned DvrHelperLoadQueueCapacity = 16;
-    unsigned dvrHelperLoadQueueOccupancy = 0;
+    // Helper gather lanes are transient and never enter the ROB, but every
+    // issued scalar lane reserves capacity in the shared architectural LQ
+    // until its timing response returns.  There is no second private LQ cap.
     enum class DVRHelperLoadState : uint8_t
     {
         Allocated,
@@ -2382,6 +2396,8 @@ class CPU : public BaseCPU
         Addr minAddress = 0;
         Addr maxAddress = 0;
         unsigned samples = 0;
+        unsigned affineValidationMatches = 0;
+        bool affineVerified = false;
     };
     struct DVRRelationKey
     {
@@ -2413,6 +2429,8 @@ class CPU : public BaseCPU
     std::unordered_map<Addr, unsigned> dvrDependentOutstandingLines;
     static constexpr size_t DvrDependentTargetWindowCapacity = 128;
     std::unordered_set<Addr> dvrDependentCompletedLines;
+    static constexpr size_t DvrDependentCompletedHistoryCapacity = 4096;
+    std::deque<Addr> dvrDependentCompletedLineOrder;
     std::unordered_set<Addr> dvrAlternateDependentLines;
     struct DVRAlternatePathKey
     {
@@ -2454,7 +2472,6 @@ class CPU : public BaseCPU
     uint64_t dvrPrefetchQueuePeak = 0;
     uint64_t dvrNextPredicateGeneration = 1;
     uint64_t dvrNextHelperId = 1;
-    uint64_t dvrNextHelperIQToken = 1;
     std::shared_ptr<DVRPredicateGeneration> dvrActivePredicateGeneration;
     Addr dvrCurrentTriggerPC = 0;
     Addr dvrCurrentTriggerAddress = 0;

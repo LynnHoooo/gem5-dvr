@@ -45,6 +45,10 @@
 
 #include "mem/cache/base.hh"
 
+#include <algorithm>
+#include <cstdlib>
+#include <fstream>
+
 #include "base/compiler.hh"
 #include "base/logging.hh"
 #include "debug/Cache.hh"
@@ -53,6 +57,7 @@
 #include "debug/CacheRepl.hh"
 #include "debug/CacheVerbose.hh"
 #include "debug/HWPrefetch.hh"
+#include "sim/core.hh"
 #include "mem/cache/compressors/base.hh"
 #include "mem/cache/mshr.hh"
 #include "mem/cache/prefetch/base.hh"
@@ -112,6 +117,21 @@ BaseCache::BaseCache(const BaseCacheParams &p, unsigned blk_size)
       system(p.system),
       stats(*this)
 {
+    if (const char *dir = std::getenv("DVR_PC_SUMMARY_DIR")) {
+        pcAccessSummaryEnabled = true;
+        pcAccessSummaryDir = dir;
+        statistics::registerResetCallback([this]() {
+            pcAccessCounts.clear();
+            pcAccessSummaryFrozen = false;
+        });
+        statistics::registerDumpCallback([this]() {
+            if (!pcAccessSummaryFrozen) {
+                dumpPCAccessSummary();
+                pcAccessSummaryFrozen = true;
+            }
+        });
+        registerExitCallback([this]() { dumpPCAccessSummary(); });
+    }
     // the MSHR queue has no reserve entries as we check the MSHR
     // queue on every single allocation, whereas the write queue has
     // as many reserve entries as we have MSHRs, since every MSHR may
@@ -138,7 +158,45 @@ BaseCache::BaseCache(const BaseCacheParams &p, unsigned blk_size)
 
 BaseCache::~BaseCache()
 {
+    dumpPCAccessSummary();
     delete tempBlock;
+}
+
+void
+BaseCache::accountPCAccess(PacketPtr pkt, bool hit, bool demand,
+                           bool source, bool dependent)
+{
+    if (!pcAccessSummaryEnabled || pcAccessSummaryFrozen || !pkt->req ||
+        !pkt->req->hasPC())
+        return;
+    auto &counts = pcAccessCounts[pkt->req->getPC()];
+    if (demand)
+        hit ? ++counts.demandHits : ++counts.demandMisses;
+    else if (source)
+        hit ? ++counts.sourceHits : ++counts.sourceMisses;
+    else if (dependent)
+        hit ? ++counts.dependentHits : ++counts.dependentMisses;
+}
+
+void
+BaseCache::dumpPCAccessSummary() const
+{
+    if (!pcAccessSummaryEnabled || pcAccessCounts.empty())
+        return;
+    std::string cache_name = name();
+    std::replace(cache_name.begin(), cache_name.end(), '.', '_');
+    std::ofstream out(pcAccessSummaryDir + "/cache_pc_" + cache_name +
+                      ".csv");
+    if (!out)
+        return;
+    out << "cache,pc,demand_hits,demand_misses,dvr_source_hits,"
+           "dvr_source_misses,dvr_dependent_hits,dvr_dependent_misses\n";
+    for (const auto &[pc, c] : pcAccessCounts) {
+        out << name() << ",0x" << std::hex << pc << std::dec << ','
+            << c.demandHits << ',' << c.demandMisses << ','
+            << c.sourceHits << ',' << c.sourceMisses << ','
+            << c.dependentHits << ',' << c.dependentMisses << '\n';
+    }
 }
 
 void
@@ -465,6 +523,8 @@ BaseCache::recvTimingReq(PacketPtr pkt)
     pkt->headerDelay = pkt->payloadDelay = 0;
 
     if (satisfied) {
+        accountPCAccess(pkt, true, architectural_demand, dvr_source,
+                        dvr_dependent);
         if (architectural_demand)
             ++stats.architecturalDemandHits;
         else if (dvr_source)
@@ -495,6 +555,8 @@ BaseCache::recvTimingReq(PacketPtr pkt)
         }
         handleTimingReqHit(pkt, blk, request_time);
     } else {
+        accountPCAccess(pkt, false, architectural_demand, dvr_source,
+                        dvr_dependent);
         if (architectural_demand)
             ++stats.architecturalDemandMisses;
         else if (dvr_source)

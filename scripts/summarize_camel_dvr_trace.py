@@ -3,6 +3,7 @@ import csv
 import json
 import os
 import sys
+import glob
 from collections import Counter, defaultdict
 
 
@@ -14,6 +15,7 @@ def main():
     by_trigger = defaultdict(Counter)
     kind_counts = Counter()
     flr_samples = defaultdict(list)
+    stages_by_pc = defaultdict(Counter)
     with open(dep, newline="") as stream:
         for row in csv.DictReader(stream):
             trigger = row["trigger_pc"]
@@ -21,6 +23,9 @@ def main():
             kind = row["kind"]
             by_trigger[trigger][pc] += 1
             kind_counts[kind] += 1
+            stages_by_pc[pc][kind] += 1
+            if trigger not in ("0", "0x0"):
+                stages_by_pc[trigger]["trigger_events"] += 1
             if kind in ("flr", "nested_flr") and len(flr_samples[trigger]) < 5:
                 flr_samples[trigger].append({
                     "pc": pc,
@@ -65,6 +70,49 @@ def main():
                 " ".join(x["pc"] for x in item["top_chain_pcs"]),
                 " ".join(x["pc"] for x in item["flr_samples"]),
             ])
+
+    cache_by_pc = defaultdict(Counter)
+    for path in glob.glob(os.path.join(root, "cache_pc_*.csv")):
+        with open(path, newline="") as stream:
+            for row in csv.DictReader(stream):
+                pc = row["pc"]
+                cache = row["cache"]
+                if cache.endswith("dcache"):
+                    for field in (
+                        "demand_hits", "demand_misses", "dvr_source_hits",
+                        "dvr_source_misses", "dvr_dependent_hits",
+                        "dvr_dependent_misses",
+                    ):
+                        cache_by_pc[pc][field] += int(row[field])
+                elif cache.endswith(".l2"):
+                    cache_by_pc[pc]["l2_demand_misses"] += int(row["demand_misses"])
+                elif cache.endswith(".l3"):
+                    cache_by_pc[pc]["l3_demand_misses"] += int(row["demand_misses"])
+
+    fields = [
+        "pc", "demand_hits", "demand_misses", "dvr_source_hits",
+        "dvr_source_misses", "dvr_dependent_hits", "dvr_dependent_misses",
+        "l2_demand_misses", "l3_demand_misses",
+        "trigger_events", "tainted", "flr", "nested_tainted", "nested_flr",
+        "relation_trained", "replay_target", "alternate_replay_target",
+        "translation_fault",
+    ]
+    all_pcs = set(cache_by_pc) | set(stages_by_pc)
+    with open(os.path.join(root, "pc_pipeline_summary.csv"), "w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for pc in sorted(
+            all_pcs,
+            key=lambda value: (
+                -cache_by_pc[value]["demand_misses"],
+                -stages_by_pc[value]["replay_target"],
+                int(value, 0),
+            ),
+        ):
+            row = {"pc": pc}
+            row.update({field: cache_by_pc[pc][field] for field in fields[1:9]})
+            row.update({field: stages_by_pc[pc][field] for field in fields[9:]})
+            writer.writerow(row)
     print("CAMEL_DVR_TRACE_SUMMARY_WRITTEN", root)
 
 

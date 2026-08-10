@@ -215,16 +215,6 @@ class IEW
     /** Reserve a native O3 FU for one DVR helper compute uop. */
     bool tryIssueDVRHelperFU(OpClass op_class, Cycles &latency);
 
-    /** Admit/select an identified non-architectural helper through IQ. */
-    bool tryIssueDVRHelperIQ(uint64_t token, OpClass op_class,
-        Tick source_ready_tick, Tick now, Cycles &latency, bool use_fu,
-        bool &admitted, bool &dependency_wait);
-    void completeDVRHelperIQ(uint64_t token);
-
-    /** Reserve/release native IQ capacity for a helper compute uop. */
-    bool reserveDVRHelperIQEntry();
-    void releaseDVRHelperIQEntry();
-
     /** True only while the architectural LSQ retains a demand-load slot. */
     bool hasFreeDVRHelperLoadEntry(ThreadID tid);
 

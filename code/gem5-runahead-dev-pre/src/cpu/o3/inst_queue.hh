@@ -172,21 +172,6 @@ class InstructionQueue
     /** Returns number of free entries for a thread. */
     unsigned numFreeEntries(ThreadID tid);
 
-    /** Reserve/release a real IQ capacity slot for a non-architectural DVR
-     * helper uop.  The helper is not inserted into the architectural
-     * dependency graph, but the reservation participates in the same global
-     * capacity seen by rename/dispatch for its complete FU lifetime. */
-    bool reserveDVRHelperEntry();
-    void releaseDVRHelperEntry();
-
-    /** Atomically admit and select a helper uop through the native IQ/FU
-     * owner.  The token gives every non-architectural helper uop an explicit
-     * queue identity which must be released at modeled completion. */
-    bool tryIssueDVRHelperEntry(uint64_t token, OpClass op_class,
-        Tick source_ready_tick, Tick now, Cycles &latency, bool use_fu,
-        bool &admitted, bool &dependency_wait);
-    void releaseDVRHelperEntry(uint64_t token);
-
     /** Returns whether or not the IQ is full. */
     bool isFull();
 
@@ -440,17 +425,6 @@ class InstructionQueue
 
     /** Number of free IQ entries left. */
     unsigned freeEntries;
-
-    /** IQ slots currently owned by non-architectural DVR helper uops. */
-    unsigned dvrHelperReservedEntries = 0;
-
-    /** Live helper identities occupying native IQ capacity. */
-    struct DVRHelperEntry
-    {
-        OpClass opClass;
-        Tick sourceReadyTick;
-    };
-    std::map<uint64_t, DVRHelperEntry> dvrHelperEntries;
 
     /** The number of entries in the instruction queue. */
     unsigned numEntries;
