@@ -701,8 +701,10 @@ class CPU : public BaseCPU
         statistics::Scalar dvrNestedDependentGenerated;
         statistics::Scalar dvrNestedFlattenBatches;
         statistics::Scalar dvrNestedOuterInstances;
+        statistics::Scalar dvrNestedMaxOuterInvocations;
         statistics::Scalar dvrNestedInnerLanes;
         statistics::Scalar dvrNestedFlattenedLanes;
+        statistics::Scalar dvrNestedMaxFlattenedLanes;
         statistics::Scalar dvrNestedFlattenInvariantChecks;
         statistics::Scalar dvrNestedFlattenInvariantFailures;
         statistics::Scalar dvrNestedFlattenExpectedLanes;
@@ -801,6 +803,9 @@ class CPU : public BaseCPU
         statistics::Scalar dvrDiscoveriesWithBounds;
         statistics::Scalar dvrLoopBoundMatches;
         statistics::Scalar dvrLoopBoundFallbacks;
+        statistics::Scalar dvrExactBoundLaneSelections;
+        statistics::Scalar dvrLaneSelectionsTruncated128;
+        statistics::Scalar dvrUnboundedFallbacksSuppressed;
         statistics::Scalar dvrLaneCountSamples;
         statistics::Scalar dvrTotalActiveLanes;
         statistics::Scalar dvrPrefetchesGenerated;

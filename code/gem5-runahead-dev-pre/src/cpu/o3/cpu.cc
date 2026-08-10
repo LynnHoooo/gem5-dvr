@@ -808,10 +808,16 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Nested helper batches flattened from outer x inner loops"),
       ADD_STAT(dvrNestedOuterInstances, statistics::units::Count::get(),
                "Outer-loop instances consumed by nested flatten batches"),
+      ADD_STAT(dvrNestedMaxOuterInvocations,
+               statistics::units::Count::get(),
+               "Maximum outer invocations in one nested flatten batch"),
       ADD_STAT(dvrNestedInnerLanes, statistics::units::Count::get(),
                "Inner lanes inferred across nested flatten batches"),
       ADD_STAT(dvrNestedFlattenedLanes, statistics::units::Count::get(),
                "Actual flattened nested lanes, capped at 128 per batch"),
+      ADD_STAT(dvrNestedMaxFlattenedLanes,
+               statistics::units::Count::get(),
+               "Maximum flattened lanes in one nested batch"),
       ADD_STAT(dvrNestedFlattenInvariantChecks,
                statistics::units::Count::get(),
                "Nested flatten batches checked against the per-batch lane cap"),
@@ -1026,6 +1032,14 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Loop bounds matched by the two register checkpoints"),
       ADD_STAT(dvrLoopBoundFallbacks, statistics::units::Count::get(),
                "Loop bounds that fell back to the maximum lane count"),
+      ADD_STAT(dvrExactBoundLaneSelections, statistics::units::Count::get(),
+               "Discovery lane selections backed by a proven loop bound"),
+      ADD_STAT(dvrLaneSelectionsTruncated128,
+               statistics::units::Count::get(),
+               "Proven loop selections truncated to the 128-lane cap"),
+      ADD_STAT(dvrUnboundedFallbacksSuppressed,
+               statistics::units::Count::get(),
+               "Unbounded data-bearing fallback launches suppressed"),
       ADD_STAT(dvrLaneCountSamples, statistics::units::Count::get(),
                "Completed DVR discoveries assigned an active lane count"),
       ADD_STAT(dvrTotalActiveLanes, statistics::units::Count::get(),
@@ -2695,7 +2709,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                     dvrNestedDiscoveryMode.recordOuterInvocation(
                         dvrCurrentTriggerAddress, inference.lanes,
                         result.triggerPC, committed_flr,
-                        inference.increment)) {
+                        result.stride)) {
                     ++cpuStats.dvrNDMOuterInvocations;
                     dvrTraceVector("invocation", curTick(),
                         result.triggerPC, dvrCurrentTriggerAddress,
@@ -2744,6 +2758,12 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                     ++cpuStats.dvrLoopBoundMatches;
                 else
                     ++cpuStats.dvrLoopBoundFallbacks;
+                if (inference.matched && inference.lanes != 0) {
+                    ++cpuStats.dvrExactBoundLaneSelections;
+                    if (inference.remaining >
+                            DVRLanePredicateTracker::MaxLanes)
+                        ++cpuStats.dvrLaneSelectionsTruncated128;
+                }
                 cpuStats.dvrRecordedUops += dvrInstructionRecorder.size();
                 bool helper_allowed = dvrMode != "discovery" &&
                                       inference.matched &&
@@ -2762,6 +2782,12 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 // valid.  Keep the legacy parameter for compatibility, but
                 // do not admit data-bearing helper replay from fallback.
                 const bool fallback_allowed = false;
+                if (!inference.matched && inference.fallback &&
+                    dvrMode != "discovery" &&
+                    dvrInstructionRecorder.size() > 1 &&
+                    committed_flr != 0 &&
+                    !dvrInstructionRecorder.overflow())
+                    ++cpuStats.dvrUnboundedFallbacksSuppressed;
                 // A complete opposite-path entry is independently safe to
                 // replay: it has a single entry/exit, a known reconvergence,
                 // and validated live-ins.  Do not discard it solely because
@@ -2889,7 +2915,10 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                     dvrNestedContext.triggerPC = result.triggerPC;
                     dvrNestedContext.triggerAddress =
                         dvrCurrentTriggerAddress;
-                    dvrNestedContext.stride = inference.increment;
+                    // This is the byte stride of the trigger load, not the
+                    // loop induction increment.  NDM uses it to form each
+                    // source-load address in a flattened invocation.
+                    dvrNestedContext.stride = result.stride;
                     dvrNestedContext.taint = dvrTaintTracker;
                     dvrNestedContext.taint.setFLR(committed_flr);
                     dvrNestedContext.recorder = dvrInstructionRecorder;
@@ -3374,7 +3403,7 @@ CPU::completeDVRNestedContext(
         dvrNestedDiscoveryMode.recordOuterInvocation(
             dvrNestedContext.triggerAddress, ndm_invocation_lanes,
             dvrNestedContext.triggerPC, dvrNestedContext.taint.flr(),
-            inference.increment)) {
+            dvrNestedContext.stride)) {
         ++cpuStats.dvrNDMOuterInvocations;
         dvrTraceVector("invocation", curTick(), dvrNestedContext.triggerPC,
             dvrNestedContext.triggerAddress, ndm_invocation_lanes);
@@ -3446,7 +3475,8 @@ CPU::completeDVRNestedContext(
             dvrNestedInvocationBatch.bases[slot] =
                 dvrNestedContext.triggerAddress;
             dvrNestedInvocationBatch.innerLanes[slot] = inference.lanes;
-            dvrNestedInvocationBatch.innerStrides[slot] = inference.increment;
+            dvrNestedInvocationBatch.innerStrides[slot] =
+                dvrNestedContext.stride;
         }
         // A single completed invocation is not Nested DVR.  Wait until at
         // least two independently bounded invocations can be combined.
@@ -3599,8 +3629,12 @@ CPU::launchDVRNestedPrefetches(
     }
     ++cpuStats.dvrNestedFlattenBatches;
     cpuStats.dvrNestedOuterInstances += invocations;
+    if (invocations > cpuStats.dvrNestedMaxOuterInvocations.value())
+        cpuStats.dvrNestedMaxOuterInvocations = invocations;
     cpuStats.dvrNestedInnerLanes += total_inner_lanes;
     cpuStats.dvrNestedFlattenedLanes += flattened;
+    if (flattened > cpuStats.dvrNestedMaxFlattenedLanes.value())
+        cpuStats.dvrNestedMaxFlattenedLanes = flattened;
     if (variable_lanes)
         ++cpuStats.dvrNestedVariableLaneBatches;
     ++cpuStats.dvrNestedFlattenInvariantChecks;
