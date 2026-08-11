@@ -1,10 +1,40 @@
 # gem5 RISC-V DVR 复现代码导览
 
-> 更新时间：2026-08-03
+> 更新时间：2026-08-11
 >
 > 项目定位：这是一个 **RISC-V ISA-adapted DVR（Decoupled Vector
 > Runahead）机制原型**。它复现论文的核心思想并把 x86/AVX-512 后端映射为
 > 128 个逻辑 lane，但不是论文 x86/Sniper 绝对性能数字的逐项复刻。
+
+## 发布快照（2026-08-11）
+
+本提交冻结的是一版 RISC-V DVR 机制原型。它包含普通 Discovery、
+source/dependent replay、真实 cache/LSQ 请求、轻量 helper front-end、VRAT/VIR、
+NDM 专项数据面，以及 branch reconvergence 的基础路径。本文所有“已验证”均只指
+已有日志对应的 binary；新增源码不因提交本身自动获得 workload 级验证结论。
+
+当前最强的端到端证据是 Camel `MAX_KEY=65536` 固定 ROI：Baseline 与 Full 的
+committed instructions 都是 `5,767,296`，Full 的 `simTicks` 从 `1,416,496,500`
+降为 `857,769,500`（`1.6514x`）。主 pointer-chain 的 architectural L1D demand
+miss 从 `73,836` 降为 `7,123`，translation fault 为 0。该证据只支持“普通 DVR
+数据路径在该 RISC-V/Camel 配置中有效”，不支持论文绝对性能或全 workload 复现的
+声明。
+
+本次还纳入跨 Discovery alternate-path cache 的增量：不完整的 alternate fragment
+以 `{branch PC, target PC, reconvergence PC, ASID}` 保存并仅作证据；只有后续
+Discovery 将它延伸到同一 reconvergence 后才会标为 executable。它不会对不完整
+路径猜测或回退 affine 地址。该增量应先通过 `run_remote_dvr_alternate_path.sh` 和
+`dvr_divergent.c` 的专项回归，才可宣称 alternate dependent replay 已覆盖。
+
+仍未完成或只能专项验证的边界：
+
+- helper 使用自定义 `DVRDynUop`/VIR 时序模型，不是完整 helper-owned gem5
+  `DynInst`，也不进入主线程 ROB/commit；
+- helper fetch/decode 与主线程的共享仲裁是显式模型，不是完整共用 O3 前端；
+- VRAT 是 ISA-adapted helper 状态，不等价于论文实现或 gem5 主线程物理寄存器的
+  bit-exact 映射；
+- NDM、分歧和重汇聚存在专项证据，但尚未覆盖所有复杂控制流与真实 workload 路径；
+- 论文的 x86/AVX-512、Sniper、500M ROI workload 套件尚未一对一复现。
 
 ## 1. 从哪里开始看
 
@@ -473,14 +503,15 @@ grep -E 'system.cpu.dvr|system.cpu.numCycles|dcache.ReadReq.misses' \
   两路径微基准已经通过，但尚未覆盖任意 branch opcode 或复杂多分支程序。
 - RISC-V 实验可用于机制探索和同 ISA 对比，不能直接宣称复现论文 x86 speedup。
 
-更详细的设计说明见：
+历史设计草稿已从发布树移除。实现边界、运行命令和当前复现状态以本文为准；
+可复查的实验结果见仓库根目录的
+`DVR_EXPERIMENT_VALIDATION_PLAN.md`、`DVR_DEBUG_20260809.md`，以及
+`code/docs/09_camel_validation_report.md`。
 
-```text
-docs/04_gem5_dvr_implementation.md
-docs/02_reproduction_status.md
-docs/05_gap_experiment_plan.md
-docs/06_nested_dvr_design.md
-```
+本次服务器整理时，原来固定的 Python 3.11 Nix 路径已失效，而服务器仅有 Python
+3.13 虚拟环境；当前 gem5 配置拒绝 3.13。因此构建脚本现在要求 Python 3.8–3.12
+并在版本不兼容时立即失败。本次只完成 `git diff --check` 与脚本语法检查；本提交的
+alternate-path 增量尚待兼容环境中的 gem5 编译和专项回归。
 
 ## 9. 复现缺口审计与后续方案
 

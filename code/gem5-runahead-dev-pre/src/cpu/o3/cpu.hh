@@ -843,6 +843,7 @@ class CPU : public BaseCPU
         statistics::Scalar dvrVIRNormalTerminatedLanes;
         statistics::Scalar dvrVIREarlyExitLanes;
         statistics::Scalar dvrVIRExternalPathLanes;
+        statistics::Scalar dvrVIRExternalPathProvenance;
         statistics::Scalar dvrVIRUnsupportedSemanticLanes;
         statistics::Scalar dvrVIRSourceValueExecutions;
         statistics::Scalar dvrVIRSourceValueBranches;
@@ -905,6 +906,9 @@ class CPU : public BaseCPU
         statistics::Scalar dvrAlternatePathControlRejects;
         statistics::Scalar dvrAlternatePathDirectJumps;
         statistics::Scalar dvrAlternatePathSafeSkips;
+        statistics::Scalar dvrAlternatePathPendingFragments;
+        statistics::Scalar dvrAlternatePathPendingMerges;
+        statistics::Scalar dvrAlternatePathPendingCompletes;
         statistics::Scalar dvrAlternatePathUopsReplayed;
         statistics::Scalar dvrAlternatePathDependentTargets;
         statistics::Scalar dvrAlternatePathDemandCovered;
@@ -1738,6 +1742,19 @@ class CPU : public BaseCPU
                 bool alternatePath = false;
             };
             static constexpr unsigned ReconvergenceEntries = 8;
+            // The first branch whose selected successor is absent from this
+            // template.  Retain the full alternate-cache identity so an
+            // external-lane report identifies the control prefix that
+            // blocked replay, rather than merely counting stopped lanes.
+            struct ExternalPathProvenance
+            {
+                Addr branchPC = 0;
+                Addr targetPC = 0;
+                Addr reconvergencePC = 0;
+                ContextID addressSpaceID = 0;
+                uint64_t laneMask = 0;
+                bool valid = false;
+            } externalPath;
             std::shared_ptr<const DVRReplayTemplate> program;
             std::shared_ptr<DVRHelperVectorRegisterFile> helperRegs;
             std::array<RegVal, DVRLoopBoundDetector::MaxArchitecturalIntRegs>
@@ -2561,6 +2578,10 @@ class CPU : public BaseCPU
         std::vector<DVRInstructionRecorder::Uop> uops;
         uint32_t liveInRegisters = 0;
         uint64_t codeVersion = 0;
+        // An incomplete cache record is evidence only.  A later discovery
+        // may extend it at this exact PC, but it is never replayable until
+        // the recorded suffix reaches the key's reconvergence PC.
+        Addr tailPC = 0;
         bool complete = false;
     };
     std::unordered_map<DVRAlternatePathKey, DVRAlternatePath,

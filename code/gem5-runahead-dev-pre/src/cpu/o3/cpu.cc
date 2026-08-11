@@ -1131,6 +1131,9 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "VIR lanes that exited through a captured branch"),
       ADD_STAT(dvrVIRExternalPathLanes, statistics::units::Count::get(),
                "VIR lanes that selected a recorder-external target"),
+      ADD_STAT(dvrVIRExternalPathProvenance,
+               statistics::units::Count::get(),
+               "First helper-lane external targets recorded with branch provenance"),
       ADD_STAT(dvrVIRUnsupportedSemanticLanes,
                statistics::units::Count::get(),
                "VIR lanes stopped by an unsupported recorded semantic"),
@@ -1294,6 +1297,14 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Direct jumps retained as alternate-path control metadata"),
       ADD_STAT(dvrAlternatePathSafeSkips, statistics::units::Count::get(),
                "Unsupported non-stateful uops omitted from alternate paths"),
+      ADD_STAT(dvrAlternatePathPendingFragments,
+               statistics::units::Count::get(),
+               "Incomplete alternate-path fragments retained across discoveries"),
+      ADD_STAT(dvrAlternatePathPendingMerges, statistics::units::Count::get(),
+               "Pending alternate fragments extended through PC overlap"),
+      ADD_STAT(dvrAlternatePathPendingCompletes,
+               statistics::units::Count::get(),
+               "Pending alternate fragments promoted to complete paths"),
       ADD_STAT(dvrAlternatePathUopsReplayed, statistics::units::Count::get(),
                "Uops executed from alternate-path cache entries"),
       ADD_STAT(dvrAlternatePathDependentTargets,
@@ -1684,6 +1695,18 @@ CPU::startup()
     iew.startupStage();
     rename.startupStage();
     commit.startupStage();
+
+    // No DVR generation exists before the first committed stride trigger.
+    // Re-establish this invariant after every O3 stage has initialized: it
+    // prevents stale incremental-build/checkpoint state from presenting a
+    // phantom full frontend/ready queue that permanently blocks Discovery.
+    dvrHelperThread.reset();
+    dvrPrefetchQueue.clear();
+    dvrHelperLoadEntries.clear();
+    dvrQueuedPrefetchAddresses.clear();
+    dvrOutstandingPrefetchAddresses.clear();
+    dvrQueuedDependentLines.clear();
+    dvrInstructionFetchPending.clear();
 }
 
 void
@@ -4315,6 +4338,90 @@ CPU::issueDVRReplayLanes(unsigned slots)
             }
             const unsigned next_index = findPC(lane->program, next_pc);
             if (next_index == std::numeric_limits<unsigned>::max()) {
+                // A helper can outlive the discovery which populated the
+                // alternate cache.  Its immutable captured template may
+                // therefore lack a target that has since become a validated
+                // complete suffix.  Splice only an exact complete cache key
+                // (or the existing path-family fallback) into a private copy
+                // of this lane's template; an incomplete path remains a hard
+                // stop and is never made executable here.
+                const ContextID address_space_id =
+                    thread[lane->tid]->getTC()->contextId();
+                const DVRAlternatePathKey exact_key{
+                    lane_uop.pc, next_pc, lane_uop.reconvergencePC,
+                    address_space_id};
+                auto cached = dvrAlternatePathCache.find(exact_key);
+                if (cached == dvrAlternatePathCache.end()) {
+                    for (auto candidate = dvrAlternatePathCache.begin();
+                         candidate != dvrAlternatePathCache.end();
+                         ++candidate) {
+                        if (candidate->first.branchPC == lane_uop.pc &&
+                            candidate->first.targetPC == next_pc &&
+                            candidate->first.addressSpaceID ==
+                                address_space_id &&
+                            candidate->second.complete) {
+                            cached = candidate;
+                            break;
+                        }
+                    }
+                }
+                if (cached != dvrAlternatePathCache.end() &&
+                    cached->second.complete &&
+                    !cached->second.uops.empty() &&
+                    lane->program->count + cached->second.uops.size() <=
+                        DVRInstructionRecorder::MaxUops) {
+                    auto spliced = std::make_shared<DVRReplayTemplate>(
+                        *lane->program);
+                    const unsigned start = spliced->count;
+                    for (const auto &cached_uop : cached->second.uops) {
+                        auto alternate_uop = cached_uop;
+                        alternate_uop.alternatePath = true;
+                        spliced->uops[spliced->count++] = alternate_uop;
+                    }
+                    lane->program = std::move(spliced);
+                    lane->lanePC = next_pc;
+                    lane->uopIndex = start;
+                    ++cpuStats.dvrAlternatePathCompleteHits;
+                    dvrTraceVector("alternate_path_runtime_admit", curTick(),
+                        lane_uop.pc, next_pc,
+                        cached->second.uops.size(),
+                        static_cast<int>(lane->lane));
+                    ++lane->helperUops;
+                    continue;
+                }
+                if (!lane->externalPath.valid) {
+                    // Preserve the complete cache identity for the first
+                    // prefix branch that this lane cannot execute.  The
+                    // target is the dynamically selected successor, so this
+                    // record can be joined directly with a pending fragment
+                    // keyed by {branch,target,reconvergence,ASID}.
+                    lane->externalPath.branchPC = lane_uop.pc;
+                    lane->externalPath.targetPC = next_pc;
+                    lane->externalPath.reconvergencePC =
+                        lane_uop.reconvergencePC;
+                    lane->externalPath.addressSpaceID =
+                        thread[lane->tid]->getTC()->contextId();
+                    lane->externalPath.laneMask =
+                        uint64_t(1) << (lane->lane % 64);
+                    lane->externalPath.valid = true;
+                    dvrTraceDependency("helper_lane_external_branch",
+                        curTick(), lane->triggerPC, lane_uop.pc, next_pc,
+                        taken ? 1 : 0, static_cast<int>(lane->lane));
+                    dvrTraceDependency("helper_lane_external_cache_key",
+                        curTick(), lane->triggerPC,
+                        lane->externalPath.branchPC,
+                        lane->externalPath.reconvergencePC,
+                        static_cast<uint32_t>(
+                            lane->externalPath.addressSpaceID),
+                        static_cast<int>(lane->lane));
+                    dvrTraceVector("helper_lane_external_reconvergence",
+                        curTick(), lane_uop.pc, lane_uop.reconvergencePC,
+                        1, static_cast<int>(lane->lane));
+                    dvrTraceVector("helper_external_lane_mask", curTick(),
+                        lane_uop.pc, lane->externalPath.laneMask, 1,
+                        static_cast<int>(lane->lane / 64));
+                    ++cpuStats.dvrVIRExternalPathProvenance;
+                }
                 lane->active = false;
                 ++cpuStats.dvrVIRExternalPathLanes;
                 ++lane->helperUops;
@@ -5688,6 +5795,78 @@ CPU::recordDVRAlternatePaths(const DVRInstructionRecorder &recorder,
                 return Addr(0);
             return uop.reconvergencePC;
         };
+
+    // Complete an evidence-only suffix only when a later discovery resumes
+    // at its exact tail and reaches the same reconvergence PC.  The compact
+    // extension deliberately accepts straight-line supported uops only;
+    // nested/unresolved control stays pending rather than being guessed.
+    for (auto &entry : dvrAlternatePathCache) {
+        auto &key = entry.first;
+        auto &pending = entry.second;
+        if (pending.complete || key.addressSpaceID != address_space_id ||
+            pending.tailPC == 0 || pending.uops.empty() ||
+            key.reconvergencePC == 0)
+            continue;
+
+        unsigned tail = recorder.size();
+        for (unsigned index = 0; index < recorder.size(); ++index) {
+            if (recorder[index].pc == pending.tailPC) {
+                tail = index;
+                break;
+            }
+        }
+        if (tail == recorder.size())
+            continue;
+        unsigned reconvergence = recorder.size();
+        for (unsigned index = tail + 1; index < recorder.size(); ++index) {
+            if (recorder[index].pc == key.reconvergencePC) {
+                reconvergence = index;
+                break;
+            }
+        }
+        if (reconvergence == recorder.size())
+            continue;
+
+        std::vector<DVRInstructionRecorder::Uop> extension;
+        bool safe = true;
+        for (unsigned index = tail + 1; index < reconvergence; ++index) {
+            const auto &uop = recorder[index];
+            if (uop.semantic == DVRInstructionRecorder::Uop::Semantic::Unsupported ||
+                uop.control) {
+                safe = false;
+                break;
+            }
+            auto cached_uop = uop;
+            cached_uop.alternatePath = true;
+            extension.push_back(cached_uop);
+        }
+        if (!safe || pending.uops.size() + extension.size() >
+                DVRInstructionRecorder::MaxUops) {
+            dvrTraceVector("alternate_path_pending_reject", curTick(),
+                key.branchPC, pending.tailPC, extension.size(),
+                static_cast<int>(address_space_id));
+            continue;
+        }
+        if (recorder[reconvergence].load) {
+            auto boundary = recorder[reconvergence];
+            boundary.alternatePath = true;
+            extension.push_back(boundary);
+        }
+        if (extension.empty())
+            continue;
+        pending.uops.insert(pending.uops.end(), extension.begin(),
+                            extension.end());
+        pending.tailPC = pending.uops.back().pc;
+        if (reconvergence + 1 < recorder.size())
+            pending.uops.back().alternateResumePC =
+                recorder[reconvergence + 1].pc;
+        pending.complete = true;
+        ++cpuStats.dvrAlternatePathPendingCompletes;
+        dvrTraceVector("alternate_path_pending_complete", curTick(),
+            key.branchPC, key.targetPC, pending.uops.size(),
+            static_cast<int>(address_space_id));
+    }
+
     for (unsigned branch = 0; branch < recorder.size(); ++branch) {
         const auto &op = recorder[branch];
         if (!op.conditional || !op.tainted)
@@ -5710,7 +5889,7 @@ CPU::recordDVRAlternatePaths(const DVRInstructionRecorder &recorder,
         path.complete = end < recorder.size() && end > branch + 1;
         // Include a boundary FLR in the cached suffix.  Without the load,
         // an alternate branch can replay arithmetic but cannot emit a target.
-        unsigned path_end = end;
+        unsigned path_end = path.complete ? end : recorder.size();
         Addr alternate_resume = 0;
         if (path.complete && recorder[end].load) {
             path_end = end + 1;
@@ -5723,7 +5902,7 @@ CPU::recordDVRAlternatePaths(const DVRInstructionRecorder &recorder,
             for (unsigned index = end; index < recorder.size(); ++index)
                 live_out |= recorder[index].intSources;
         }
-        if (path.complete) {
+        if (path_end > branch + 1) {
             const auto captured_pc = [&](Addr pc) {
                 if (pc == reconvergence)
                     return true;
@@ -5857,6 +6036,8 @@ CPU::recordDVRAlternatePaths(const DVRInstructionRecorder &recorder,
         DVRAlternatePathKey key{op.pc, target, cache_reconvergence(op),
                                 address_space_id};
         path.codeVersion = 0;
+        if (!path.uops.empty())
+            path.tailPC = path.uops.back().pc;
         // Keep the full cache key in the compact dependency trace.  The
         // vector trace only has room for branch/target, while reconvergence
         // and address-space identity are part of the correctness key.
@@ -5868,10 +6049,61 @@ CPU::recordDVRAlternatePaths(const DVRInstructionRecorder &recorder,
                        op.pc, target, path.uops.size(),
                        static_cast<int>(address_space_id));
         const auto existing = dvrAlternatePathCache.find(key);
-        if (existing == dvrAlternatePathCache.end() ||
-            (!existing->second.complete && path.complete))
+        if (existing == dvrAlternatePathCache.end()) {
             dvrAlternatePathCache[key] = std::move(path);
+            if (!dvrAlternatePathCache[key].complete &&
+                !dvrAlternatePathCache[key].uops.empty())
+                ++cpuStats.dvrAlternatePathPendingFragments;
+            continue;
+        }
+
+        auto &cached = existing->second;
+        if (cached.complete)
+            continue;
+        if (path.complete) {
+            cached = std::move(path);
+            ++cpuStats.dvrAlternatePathPendingCompletes;
+            continue;
+        }
+        if (path.uops.empty())
+            continue;
+
+        // A discovery window need not start at the previous fragment's tail.
+        // Merge at the latest common PC, which makes overlapping recorder
+        // windows accumulate one target-path fragment under the full cache
+        // key without making an incomplete path executable.
+        int cached_overlap = -1;
+        int path_overlap = -1;
+        for (int left = static_cast<int>(cached.uops.size()) - 1;
+             left >= 0 && cached_overlap < 0; --left) {
+            for (unsigned right = 0; right < path.uops.size(); ++right) {
+                if (cached.uops[left].pc == path.uops[right].pc) {
+                    cached_overlap = left;
+                    path_overlap = right;
+                    break;
+                }
+            }
+        }
+        if (cached_overlap < 0)
+            continue;
+        std::vector<DVRInstructionRecorder::Uop> merged;
+        merged.reserve(cached_overlap + 1 +
+                       path.uops.size() - path_overlap - 1);
+        merged.insert(merged.end(), cached.uops.begin(),
+                      cached.uops.begin() + cached_overlap + 1);
+        merged.insert(merged.end(), path.uops.begin() + path_overlap + 1,
+                      path.uops.end());
+        if (merged.size() > DVRInstructionRecorder::MaxUops)
+            continue;
+        cached.uops = std::move(merged);
+        cached.liveInRegisters |= path.liveInRegisters;
+        cached.tailPC = cached.uops.back().pc;
+        ++cpuStats.dvrAlternatePathPendingMerges;
+        dvrTraceVector("alternate_path_pending_merge", curTick(),
+            key.branchPC, cached.tailPC, cached.uops.size(),
+            static_cast<int>(address_space_id));
     }
+
 }
 
 bool
