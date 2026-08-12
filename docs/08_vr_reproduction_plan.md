@@ -343,3 +343,8 @@ U > P 时，终止后**立即**用下一个 striding load 重新进入 VR，重�
 | 10 | 待开始 | — | — |
 
 > 本分支建立时 `main` HEAD = `920a20e`（DVR Stage 13 全回归通过）。
+>
+> 2026-08-12：Stage 0/1 代码与脚本已提交 `5b55d1b`（vr: Stage 1 机制实现 +
+> Stage 0/1 脚本）。待服务器 `scons build/RISCV/gem5.opt -j N` 编译通过后，
+> 依次运行 `scripts/run_remote_vr_stage0_prebase.sh` 与
+> `scripts/run_remote_vr_stage1_smoke.sh`。
