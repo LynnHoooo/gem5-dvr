@@ -35,9 +35,13 @@
 提前于主线程主动预取、有序轻量子线程"；本论文 VR 是"核内 runahead 模式下**不改 OoO 结构**、
 以向量化压榨 MLP"。
 
-更关键的是：**本仓库 gem5 fork 内已有一个可用的 PRE 实现**
-（`src/cpu/o3/pre.{cc,hh}`，含 `enablePRE`/`enablePREBranch` 参数、full-window stall
-进入/退出、RDQ 回收、SST 与 MispTable，冒烟脚本 `scripts/run_remote_pre_smoke.sh`）。
+更关键的是：**本仓库 gem5 fork 内已有一个可用的 PRE 实现**——它正是上游
+[`lshpku/gem5-runahead` @ `dev-pre`](https://github.com/lshpku/gem5-runahead)（HPCA'20
+PRE 的官方 gem5 实现）的直接拷贝，位于 `code/gem5-runahead-dev-pre/`（由外层 `vr-repro`
+分支追踪），含 `enablePRE`/`enablePREBranch`/`enablePREEarlyRecycle`/
+`numPRDQEntries`(=192)/`numSSTEntries`(=128) 参数、full-window stall 进入/退出、RDQ
+回收、SST 与 MispTable，上游配置 `examples/three_level_o3.py`。本分支的 VR 改动直接落在
+该 gem5 源码树上。冒烟脚本 `scripts/run_remote_pre_smoke.sh`。
 
 **实现基座决策：在 PRE 之上增量实现 VR，复用 DVR 的共享构建块。**
 论文将 VR 定义为 PRE 的增量修改（改终止条件、复用 PRE 的 RDQ、去掉 PRE 的
@@ -250,6 +254,24 @@ U > P 时，终止后**立即**用下一个 striding load 重新进入 VR，重�
    （PRE 是 stalling load 返回即退）。
 4. **Unrolling (U) + Pipelining (P)**：多轮向量化 + 软件流水化重叠（全新结构，U=P=8）。
 5. **lane 掩码语义**：非法 lane → 后续向量指令 mask（DVR 是 actual-value predicate）。
+
+### 5.3 VR 挂载点（代码级，基于 2026-08-12 对 PRE/DVR 源码的梳理）
+
+| # | 位置 | 现状 | VR 改动 |
+|---|---|---|---|
+| 1 | `commit.cc:748-771` | PRE 进入：ROB 满 + 头部 load 未就绪 → `cpu->enterPRE()` | 不动；VR 是 PRE 内的子模式 |
+| 2 | `cpu.cc:2690/2722` `enterPRE/exitPRE` | checkpoint/恢复 RAT + free list，`inPRE` 标志 | 增加 `inVR` 标志与 VR checkpoint |
+| 3 | `commit.cc:805-830` | PRE 退出：stalling load `readyToCommit()` → `exitPRE()` + `squashDueToPRE` | 在 VR 子模式下替换为四项终止条件（§2.9） |
+| 4 | `pre.hh:32` `DVRStrideDetector` | 32 项 RPT：地址/步幅/置信度/年龄，无 terminator；阈值=2 | 新增 VR stride 表：阈值 **confidence=3** + **terminator** 字段（链末 dependent load PC） |
+| 5 | `pre.hh:110` `DVRVectorTaintTracker` | 32 int reg 单 bit taint，src→dst 传播，记 FLR | 新增 VR TV：**2-bit/reg**（vectorize + invalid），propagate 逻辑同构 |
+| 6 | **向量化器**（全新） | 无 | 标量指令 → 512-bit/RVV 向量 + gather；微程序例程生成向量指令注入流水线 |
+| 7 | `pre.hh:199` `DVRVectorRenameTable` | 32 arch × 8 chunk × 128 phys（DVR 用） | VR 的 **VRAT**：P(=8) 项/arch reg，指向物理向量寄存器 |
+| 8 | `BaseO3CPU.py:185` `numPRDQEntries` / `enablePREEarlyRecycle` | PRE 的 PRDQ 已存在 | VR 的 **RDQ** 直接用 PRE 的 PRDQ 语义（按序回收） |
+| 9 | `rename.cc` / `commit.cc:1515` | PRE 模式 dispatch 过滤已存在 | 在 rename/dispatch 处检测 confidence=3 striding load 并切向量化路径 |
+| 10 | **Unroll+Pipeline 状态机**（全新） | 无 | U=P=8 轮次控制、向量流水化重叠、MSHR 饱和 |
+
+**向量化器的关键依赖**：需要 gem5 RISC-V 的向量指令（RVV）支持或自建向量物理寄存器，
+这决定 Stage 0 必须先确认（§6 Stage 0）。
 
 ---
 
