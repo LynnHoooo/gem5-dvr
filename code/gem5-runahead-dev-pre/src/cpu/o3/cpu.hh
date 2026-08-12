@@ -751,6 +751,12 @@ class CPU : public BaseCPU
         statistics::Scalar vrRDQReleases;
         statistics::Scalar vrInvalidLanes;
         statistics::Scalar vrPrefetchRetries;
+        statistics::Scalar vrVectorUopsIssued;
+        statistics::Scalar vrVectorChunksExecuted;
+        statistics::Scalar vrDivergentBranches;
+        statistics::Scalar vrReconvergences;
+        statistics::Scalar vrChainUopsRecorded;
+        statistics::Scalar vrSourceResponsesWithData;
     } cpuStats;
 
   public:
@@ -799,10 +805,11 @@ class CPU : public BaseCPU
 
     /** Returns whether the CPU is in vector-runahead mode. */
     bool isInVR() const { return inVR; };
+    bool isVRDraining() const { return vrDraining; };
 
     /** Enqueue the N lanes of one vector gather (striding or dependent). */
     void issueVRGather(Addr pc, Addr base, int64_t stride, unsigned lanes,
-                       unsigned level, bool source);
+                       unsigned level, bool source, unsigned group = 0);
 
     /** Drain one entry of the VR prefetch queue into the L1D timing port,
      *  mirroring DVR's software-prefetch engine. */
@@ -817,6 +824,7 @@ class CPU : public BaseCPU
     void updateVRPrefetchQueuePeak();
     void invalidateVRLane(unsigned lane);
     void replayPendingVRResponses();
+    void finalizeVRDrain();
 
     struct DVRReplayTemplate
     {
@@ -907,6 +915,8 @@ class CPU : public BaseCPU
     VRRound vrRound;
     DVRInstructionRecorder vrChain;
     DVRVectorRenameTable vrRAT;
+    std::array<DVRVectorRenameTable, 8> vrGroupRAT;
+    DVRVectorInstructionRegister vrVIR;
     DVRLoopBoundDetector::RegisterSnapshot vrInitialRegs = {};
     unsigned vrVectorLanes;
     unsigned vrUnrollLength;
@@ -923,13 +933,27 @@ class CPU : public BaseCPU
         unsigned nextUop;
         int8_t valueReg;
         ThreadID tid;
+        unsigned group;
     };
     std::deque<VRPendingResponse> vrPendingResponses;
+    struct VRLaneState
+    {
+        DVRLoopBoundDetector::RegisterSnapshot regs = {};
+        unsigned nextUop = 1;
+        unsigned level = 0;
+        unsigned group = 0;
+        bool valid = true;
+    };
+    std::array<std::array<VRLaneState, 64>, 8> vrLaneStates = {};
     std::deque<unsigned> vrRDQ;
     uint64_t vrPrefetchQueuePeak = 0;
     uint64_t vrActiveLaneMask = 0;
     unsigned vrMaxRDQEntries = 192;
     unsigned vrCycles = 0;
+    unsigned vrOutstandingResponses = 0;
+    bool vrDraining = false;
+    std::array<int8_t, 8> vrBranchOutcome = {};
+    std::array<bool, 8> vrBranchDiverged = {};
 
     struct DVRPrefetchAddress
     {

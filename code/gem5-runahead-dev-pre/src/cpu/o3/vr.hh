@@ -135,6 +135,10 @@ struct VRRound
     unsigned lanes = 0;
     unsigned instructions = 0;
     unsigned unrollsIssued = 0;
+    unsigned pipelineGroups = 0;
+    unsigned outstanding = 0;
+    uint64_t activeLaneMask = 0;
+    bool draining = false;
     Addr terminator = 0;
 };
 
@@ -147,6 +151,7 @@ struct VRPrefetchEntry
     bool source;     // striding (level-0) load; ReadReq so data feeds the chain
     unsigned level;  // 0 = striding gather, 1+ = dependent gather level
     unsigned lane;   // lane index within the gather
+    unsigned group = 0; // software-pipelined unroll group
     unsigned nextUop = 1; // next recorded uop to evaluate on a response
     int8_t valueReg = -1; // register receiving the previous load value
 };
@@ -156,9 +161,11 @@ struct VRPrefetchSenderState : public Packet::SenderState
 {
     VRPrefetchSenderState(bool is_source, unsigned chain_level,
                           unsigned lane_index, ThreadID thread_id,
-                          unsigned next_uop = 1, int8_t value_reg = -1)
+                          unsigned next_uop = 1, int8_t value_reg = -1,
+                          unsigned group_id = 0)
         : source(is_source), level(chain_level), lane(lane_index),
-          tid(thread_id), nextUop(next_uop), valueReg(value_reg)
+          tid(thread_id), nextUop(next_uop), valueReg(value_reg),
+          group(group_id)
     {}
 
     bool source;
@@ -167,6 +174,7 @@ struct VRPrefetchSenderState : public Packet::SenderState
     ThreadID tid;
     unsigned nextUop;
     int8_t valueReg;
+    unsigned group;
 };
 
 } // namespace o3
