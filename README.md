@@ -1,5 +1,11 @@
 # gem5 DVR Reproduction
 
+> **分支 `vr-repro`**：专门复现 **Vector Runahead (ISCA 2020)** 论文
+> （Naithani et al.，`docs/paper/Vector_Runahead_Ajeya.pdf`）。复现点与分阶段计划见
+> [`docs/08_vr_reproduction_plan.md`](docs/08_vr_reproduction_plan.md)。
+> 该分支复用 `main` 的 DVR 基座（stride 检测 / taint / VRAT/RDQ / 控制流），
+> 新增 VR 特有的推测性向量化、进入/终止条件、U=P=8 展开+流水化。
+
 A RISC-V/gem5 prototype of Decoupled Vector Runahead (DVR).
 
 This repository contains:
