@@ -746,6 +746,11 @@ class CPU : public BaseCPU
         statistics::Scalar vrTerminatedAllInvalid;
         statistics::Scalar vrTerminatedTimeout;
         statistics::Scalar vrPrefetchQueuePeak;
+        statistics::Scalar vrVRATAllocations;
+        statistics::Scalar vrRDQEnqueues;
+        statistics::Scalar vrRDQReleases;
+        statistics::Scalar vrInvalidLanes;
+        statistics::Scalar vrPrefetchRetries;
     } cpuStats;
 
   public:
@@ -810,6 +815,8 @@ class CPU : public BaseCPU
 
     /** Track the high-water mark of the VR prefetch queue. */
     void updateVRPrefetchQueuePeak();
+    void invalidateVRLane(unsigned lane);
+    void replayPendingVRResponses();
 
     struct DVRReplayTemplate
     {
@@ -907,7 +914,22 @@ class CPU : public BaseCPU
     unsigned vrTimeoutInstructions;
     unsigned vrUnrollsIssued = 0;
     std::deque<VRPrefetchEntry> vrPrefetchQueue;
+    struct VRPendingResponse
+    {
+        RegVal value;
+        bool source;
+        unsigned level;
+        unsigned lane;
+        unsigned nextUop;
+        int8_t valueReg;
+        ThreadID tid;
+    };
+    std::deque<VRPendingResponse> vrPendingResponses;
+    std::deque<unsigned> vrRDQ;
     uint64_t vrPrefetchQueuePeak = 0;
+    uint64_t vrActiveLaneMask = 0;
+    unsigned vrMaxRDQEntries = 192;
+    unsigned vrCycles = 0;
 
     struct DVRPrefetchAddress
     {

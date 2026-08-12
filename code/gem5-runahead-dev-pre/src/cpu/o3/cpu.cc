@@ -634,7 +634,17 @@ CPU::CPUStats::CPUStats(CPU *cpu)
       ADD_STAT(vrTerminatedTimeout, statistics::units::Count::get(),
                "VR rounds terminated by the instruction budget"),
       ADD_STAT(vrPrefetchQueuePeak, statistics::units::Count::get(),
-               "Peak number of waiting VR prefetch requests")
+               "Peak number of waiting VR prefetch requests"),
+      ADD_STAT(vrVRATAllocations, statistics::units::Count::get(),
+               "VR vector physical-register mappings allocated"),
+      ADD_STAT(vrRDQEnqueues, statistics::units::Count::get(),
+               "VR register-deallocation entries enqueued"),
+      ADD_STAT(vrRDQReleases, statistics::units::Count::get(),
+               "VR register-deallocation entries released"),
+      ADD_STAT(vrInvalidLanes, statistics::units::Count::get(),
+               "VR lanes masked as invalid"),
+      ADD_STAT(vrPrefetchRetries, statistics::units::Count::get(),
+               "VR prefetch requests retried after port backpressure")
 {
     // Register any of the O3CPU's stats here.
     timesIdled
@@ -731,6 +741,11 @@ CPU::tick()
     rename.tick();
 
     iew.tick();
+
+    if (inVR && ++vrCycles >= vrTimeoutInstructions * 8) {
+        ++cpuStats.vrTerminatedTimeout;
+        exitVR();
+    }
 
     // The main thread gets the first opportunity to use the LSQ data port.
     // A DVR helper probes the port only after IEW has issued this cycle's
@@ -2816,7 +2831,7 @@ CPU::enterVR(const DynInstPtr &inst, Addr address, int64_t stride)
     vrRound.triggerAddress = address;
     vrRound.triggerSequence = inst->seqNum;
     vrRound.stride = stride;
-    vrRound.lanes = vrVectorLanes;
+    vrRound.lanes = std::min(vrVectorLanes, 64U);
     vrRound.instructions = 0;
     vrRound.terminator = vrStrideDetector.terminator(vrRound.triggerPC);
 
@@ -2824,10 +2839,27 @@ CPU::enterVR(const DynInstPtr &inst, Addr address, int64_t stride)
     vrChain.begin(inst);
     captureDVRRegisterSnapshot(0, inst, vrInitialRegs);
     vrUnrollsIssued = 0;
+    vrCycles = 0;
 
-    // Vectorize the triggering striding load: one N-lane gather.
-    issueVRGather(vrRound.triggerPC, address, stride, vrRound.lanes,
-                  0, true);
+    vrActiveLaneMask = vrRound.lanes == 64 ? ~uint64_t(0) :
+                        ((uint64_t(1) << vrRound.lanes) - 1);
+    const unsigned groups = std::max(1U, std::min(vrUnrollLength,
+                                                   vrPipelineDepth));
+    vrRound.unrollsIssued = groups;
+    for (unsigned group = 0; group < groups; ++group) {
+        const Addr groupBase = static_cast<Addr>(
+            static_cast<int64_t>(address) +
+            stride * static_cast<int64_t>(group * vrRound.lanes));
+        issueVRGather(vrRound.triggerPC, groupBase, stride,
+                      vrRound.lanes, 0, true);
+    }
+    const unsigned allocations = vrRAT.build(vrChain, vrRound.lanes);
+    cpuStats.vrVRATAllocations += allocations;
+    for (unsigned i = 0; i < allocations &&
+                        vrRDQ.size() < vrMaxRDQEntries; ++i) {
+        vrRDQ.push_back(i);
+        ++cpuStats.vrRDQEnqueues;
+    }
     ++cpuStats.vrRoundsEntered;
 }
 
@@ -2845,17 +2877,20 @@ CPU::observeVRInstruction(const DynInstPtr &inst)
     }
 
     const auto obs = vrTaint.observe(inst);
+    const bool had_terminator = vrRound.terminator != 0;
     if (obs.vectorized) {
         ++cpuStats.vrTaintedInstructions;
         if (!obs.invalid)
             vrChain.record(inst);
         if (obs.dependentLoad) {
-            // Learn / refresh the chain terminator.
-            vrRound.terminator = inst->pcState().instAddr();
-            vrStrideDetector.setTerminator(vrRound.triggerPC,
-                                           vrRound.terminator);
+            if (vrRound.terminator == 0) {
+                vrRound.terminator = inst->pcState().instAddr();
+                vrStrideDetector.setTerminator(vrRound.triggerPC,
+                                               vrRound.terminator);
+            }
         }
     }
+    replayPendingVRResponses();
 
     // Termination conditions (paper Section III-J):
     // (1) a dynamic instance of the same striding load re-appears;
@@ -2867,7 +2902,7 @@ CPU::observeVRInstruction(const DynInstPtr &inst)
         return;
     }
     // (2) the chain terminator has been issued;
-    if (inst->isLoad() && vrRound.terminator != 0 &&
+    if (inst->isLoad() && had_terminator &&
         inst->pcState().instAddr() == vrRound.terminator &&
         obs.dependentLoad) {
         ++cpuStats.vrTerminatedTerminator;
@@ -2880,7 +2915,11 @@ void
 CPU::issueVRGather(Addr pc, Addr base, int64_t stride, unsigned lanes,
                    unsigned level, bool source)
 {
+    lanes = std::min(lanes, 64U);
     for (unsigned lane = 0; lane < lanes; ++lane) {
+        if (vrActiveLaneMask &&
+            !(vrActiveLaneMask & (uint64_t(1) << lane)))
+            continue;
         const Addr addr = static_cast<Addr>(
             static_cast<int64_t>(base) +
             stride * static_cast<int64_t>(lane));
@@ -2897,7 +2936,6 @@ CPU::serviceVRPrefetchQueue()
         return;
 
     const auto prefetch = vrPrefetchQueue.front();
-    vrPrefetchQueue.pop_front();
 
     Request::Flags flags;
     flags.set(Request::PREFETCH);
@@ -2910,6 +2948,8 @@ CPU::serviceVRPrefetchQueue()
         req, thread[prefetch.tid]->getTC(), BaseMMU::Read);
     if (fault != NoFault) {
         ++cpuStats.vrPrefetchTranslationFaults;
+        vrPrefetchQueue.pop_front();
+        invalidateVRLane(prefetch.lane);
         return;
     }
 
@@ -2920,21 +2960,23 @@ CPU::serviceVRPrefetchQueue()
         req, prefetch.source ? MemCmd::ReadReq : MemCmd::SoftPFReq);
     pkt->allocate();
     pkt->senderState = new VRPrefetchSenderState{
-        prefetch.source, prefetch.level, prefetch.lane, prefetch.tid};
+        prefetch.source, prefetch.level, prefetch.lane, prefetch.tid,
+        prefetch.nextUop, prefetch.valueReg};
 
     auto &port = iew.ldstQueue.getDataPort();
     if (!port.tryTiming(pkt)) {
-        ++cpuStats.vrPrefetchesDropped;
+        ++cpuStats.vrPrefetchRetries;
         delete pkt->senderState;
         delete pkt;
         return;
     }
     if (!port.sendTimingReq(pkt)) {
-        ++cpuStats.vrPrefetchesDropped;
+        ++cpuStats.vrPrefetchRetries;
         delete pkt->senderState;
         delete pkt;
         return;
     }
+    vrPrefetchQueue.pop_front();
     ++cpuStats.vrPrefetchesIssued;
     if (prefetch.source)
         ++cpuStats.vrSourcePrefetchesIssued;
@@ -2949,11 +2991,25 @@ CPU::completeVRPrefetch(PacketPtr pkt)
     assert(state);
     ++cpuStats.vrPrefetchesCompleted;
 
+    if (pkt->isError()) {
+        invalidateVRLane(state->lane);
+        delete state;
+        pkt->senderState = nullptr;
+        delete pkt;
+        return;
+    }
+
     // A source (striding-lane) response carries the loaded value that feeds
     // the dependent-chain replay for the next gather level.
     if (state->source && pkt->hasData()) {
         const RegVal value = pkt->getLE<RegVal>();
-        replayVRChain(value, *state);
+        if (vrChain.size() <= state->nextUop) {
+            vrPendingResponses.push_back({value, state->source, state->level,
+                                          state->lane, state->nextUop,
+                                          state->valueReg, state->tid});
+        } else {
+            replayVRChain(value, *state);
+        }
     }
 
     delete state;
@@ -2968,17 +3024,23 @@ CPU::replayVRChain(RegVal source_value,
     // Mirror the DVR replay: substitute the returned source value into the
     // trigger's destination register, then evaluate the recorded chain.
     // The first load in the chain becomes a dependent gather.
-    if (vrChain.size() == 0)
+    if (vrChain.size() == 0 || state.nextUop >= vrChain.size())
         return;
     auto regs = vrInitialRegs;
     regs[0] = 0;
     const auto &trigger = vrChain[0];
-    if (trigger.destination <= 0 ||
-        trigger.destination >= DVRLoopBoundDetector::MaxArchitecturalIntRegs)
-        return;
-    regs[trigger.destination] = source_value;
+    if (state.valueReg >= 0 &&
+        state.valueReg < DVRLoopBoundDetector::MaxArchitecturalIntRegs) {
+        regs[state.valueReg] = source_value;
+    } else {
+        if (trigger.destination <= 0 ||
+            trigger.destination >=
+                DVRLoopBoundDetector::MaxArchitecturalIntRegs)
+            return;
+        regs[trigger.destination] = source_value;
+    }
 
-    for (unsigned index = 1; index < vrChain.size(); ++index) {
+    for (unsigned index = state.nextUop; index < vrChain.size(); ++index) {
         const auto &uop = vrChain[index];
         if (uop.source0 < 0 ||
             uop.source0 >= DVRLoopBoundDetector::MaxArchitecturalIntRegs)
@@ -2998,13 +3060,19 @@ CPU::replayVRChain(RegVal source_value,
 
         if (uop.semantic ==
             DVRInstructionRecorder::Uop::Semantic::LoadAddress) {
+            if (result == 0) {
+                invalidateVRLane(state.lane);
+                return;
+            }
             VRPrefetchEntry dependent;
             dependent.address = static_cast<Addr>(result);
             dependent.pc = uop.pc;
             dependent.tid = state.tid;
-            dependent.source = false;
+            dependent.source = true;
             dependent.level = state.level + 1;
             dependent.lane = state.lane;
+            dependent.nextUop = index + 1;
+            dependent.valueReg = uop.destination;
             vrPrefetchQueue.push_back(dependent);
             updateVRPrefetchQueuePeak();
             ++cpuStats.vrDependentPrefetchesGenerated;
@@ -3027,9 +3095,46 @@ CPU::exitVR()
     vrTaint.reset();
     vrChain.reset();
     vrRAT.reset();
+    while (!vrRDQ.empty()) {
+        vrRDQ.pop_front();
+        ++cpuStats.vrRDQReleases;
+    }
+    vrActiveLaneMask = 0;
+    vrPendingResponses.clear();
+    vrCycles = 0;
     if (!vrPrefetchQueue.empty()) {
         cpuStats.vrPrefetchesDropped += vrPrefetchQueue.size();
         vrPrefetchQueue.clear();
+    }
+}
+
+void
+CPU::replayPendingVRResponses()
+{
+    if (vrPendingResponses.empty() || vrChain.size() == 0)
+        return;
+    for (auto it = vrPendingResponses.begin(); it != vrPendingResponses.end();) {
+        if (it->nextUop >= vrChain.size()) {
+            ++it;
+            continue;
+        }
+        VRPrefetchSenderState state(it->source, it->level, it->lane, it->tid,
+                                    it->nextUop, it->valueReg);
+        replayVRChain(it->value, state);
+        it = vrPendingResponses.erase(it);
+    }
+}
+
+void
+CPU::invalidateVRLane(unsigned lane)
+{
+    if (lane >= 64 || !(vrActiveLaneMask & (uint64_t(1) << lane)))
+        return;
+    vrActiveLaneMask &= ~(uint64_t(1) << lane);
+    ++cpuStats.vrInvalidLanes;
+    if (vrActiveLaneMask == 0 && inVR) {
+        ++cpuStats.vrTerminatedAllInvalid;
+        exitVR();
     }
 }
 
