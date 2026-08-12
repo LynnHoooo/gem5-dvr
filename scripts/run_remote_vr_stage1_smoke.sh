@@ -80,12 +80,26 @@ gathers="$(read_stat "$stats" system.cpu.vrGathersIssued)"
 issued="$(read_stat "$stats" system.cpu.vrPrefetchesIssued)"
 completed="$(read_stat "$stats" system.cpu.vrPrefetchesCompleted)"
 tainted="$(read_stat "$stats" system.cpu.vrTaintedInstructions)"
+dependent_generated="$(read_stat "$stats" system.cpu.vrDependentPrefetchesGenerated)"
+dependent_issued="$(read_stat "$stats" system.cpu.vrDependentPrefetchesIssued)"
+dependent_completed="$(read_stat "$stats" system.cpu.vrDependentPrefetchesCompleted)"
+rdq_enqueues="$(read_stat "$stats" system.cpu.vrRDQEnqueues)"
+rdq_releases="$(read_stat "$stats" system.cpu.vrRDQReleases)"
 
 require_positive vrRoundsEntered "$rounds"
 require_positive vrGathersIssued "$gathers"
 require_positive vrPrefetchesIssued "$issued"
 require_positive vrPrefetchesCompleted "$completed"
 require_positive vrTaintedInstructions "$tainted"
+require_positive vrDependentPrefetchesGenerated "$dependent_generated"
+require_positive vrDependentPrefetchesIssued "$dependent_issued"
+require_positive vrDependentPrefetchesCompleted "$dependent_completed"
+if [[ "$rdq_enqueues" != "$rdq_releases" ]]; then
+    printf 'error: VR RDQ imbalance enqueues=%s releases=%s\n' \
+        "$rdq_enqueues" "$rdq_releases" >&2
+    exit 1
+fi
 
-printf 'VR_STAGE1_SMOKE_PASSED rounds=%s gathers=%s issued=%s completed=%s tainted=%s\n' \
-    "$rounds" "$gathers" "$issued" "$completed" "$tainted"
+printf 'VR_STAGE1_SMOKE_PASSED rounds=%s gathers=%s issued=%s completed=%s tainted=%s dependent_generated=%s dependent_issued=%s dependent_completed=%s rdq=%s\n' \
+    "$rounds" "$gathers" "$issued" "$completed" "$tainted" \
+    "$dependent_generated" "$dependent_issued" "$dependent_completed" "$rdq_enqueues"

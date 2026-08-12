@@ -332,8 +332,17 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
     const uint32_t funct3 = (uop.encoding >> 12) & 0x7;
     const uint32_t funct7 = (uop.encoding >> 25) & 0x7f;
 
-    if (opcode == 0x33 && funct3 == 0 && funct7 == 0) {
-        uop.semantic = Semantic::Add;
+    if (opcode == 0x33) {
+        if (funct3 == 0 && funct7 == 0)
+            uop.semantic = Semantic::Add;
+        else if (funct3 == 0 && funct7 == 0x20)
+            uop.semantic = Semantic::Sub;
+        else if (funct3 == 0 && funct7 == 1)
+            uop.semantic = Semantic::Mul;
+        else if (funct3 == 6 && funct7 == 0)
+            uop.semantic = Semantic::Or;
+        else if (funct3 == 4 && funct7 == 0)
+            uop.semantic = Semantic::Xor;
         return;
     }
 
@@ -343,6 +352,9 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
             uop.immediate = dvrSignExtend(uop.encoding >> 20, 12);
         } else if (funct3 == 1 && (uop.encoding >> 26) == 0) {
             uop.semantic = Semantic::ShiftLeftImmediate;
+            uop.immediate = (uop.encoding >> 20) & 0x3f;
+        } else if (funct3 == 5) {
+            uop.semantic = Semantic::ShiftRightImmediate;
             uop.immediate = (uop.encoding >> 20) & 0x3f;
         } else if (funct3 == 7) {
             uop.semantic = Semantic::AndImmediate;
@@ -368,12 +380,27 @@ DVRInstructionRecorder::Uop::evaluate(
       case Semantic::Add:
         result = source0_value + source1_value;
         return true;
+      case Semantic::Sub:
+        result = source0_value - source1_value;
+        return true;
+      case Semantic::Mul:
+        result = source0_value * source1_value;
+        return true;
+      case Semantic::Or:
+        result = source0_value | source1_value;
+        return true;
+      case Semantic::Xor:
+        result = source0_value ^ source1_value;
+        return true;
       case Semantic::AddImmediate:
       case Semantic::LoadAddress:
         result = source0_value + static_cast<RegVal>(immediate);
         return true;
       case Semantic::ShiftLeftImmediate:
         result = source0_value << (static_cast<unsigned>(immediate) & 0x3f);
+        return true;
+      case Semantic::ShiftRightImmediate:
+        result = source0_value >> (static_cast<unsigned>(immediate) & 0x3f);
         return true;
       case Semantic::AndImmediate:
         result = source0_value & static_cast<RegVal>(immediate);
@@ -435,6 +462,7 @@ DVRVectorRenameTable::reset()
     for (auto &reg : mapping)
         reg.fill(-1);
     nextPhysical = 0;
+    mappedUops = 0;
 }
 
 unsigned
@@ -456,6 +484,29 @@ DVRVectorRenameTable::build(const DVRInstructionRecorder &program,
             }
         }
     }
+    mappedUops = program.size();
+    return allocations;
+}
+
+unsigned
+DVRVectorRenameTable::extend(const DVRInstructionRecorder &program,
+                              unsigned lanes)
+{
+    lanes = std::min(lanes, 128U);
+    const unsigned chunks = std::min(NumChunks, (lanes + 15) / 16);
+    unsigned allocations = 0;
+    for (unsigned uop = mappedUops; uop < program.size(); ++uop) {
+        const uint32_t destinations = program[uop].intDestinations;
+        for (unsigned reg = 0; reg < NumArchitecturalRegs; ++reg) {
+            if (!(destinations & (uint32_t(1) << reg)))
+                continue;
+            for (unsigned chunk = 0; chunk < chunks; ++chunk) {
+                mapping[reg][chunk] = nextPhysical++ % NumPhysicalRegs;
+                ++allocations;
+            }
+        }
+    }
+    mappedUops = program.size();
     return allocations;
 }
 

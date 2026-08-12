@@ -737,6 +737,7 @@ class CPU : public BaseCPU
         statistics::Scalar vrSourcePrefetchesIssued;
         statistics::Scalar vrDependentPrefetchesGenerated;
         statistics::Scalar vrDependentPrefetchesIssued;
+        statistics::Scalar vrDependentPrefetchesCompleted;
         statistics::Scalar vrPrefetchesCompleted;
         statistics::Scalar vrPrefetchesDropped;
         statistics::Scalar vrPrefetchTranslationFaults;
@@ -822,7 +823,7 @@ class CPU : public BaseCPU
 
     /** Track the high-water mark of the VR prefetch queue. */
     void updateVRPrefetchQueuePeak();
-    void invalidateVRLane(unsigned lane);
+    void invalidateVRLane(unsigned lane, unsigned group = 0);
     void replayPendingVRResponses();
     void finalizeVRDrain();
 
@@ -916,6 +917,7 @@ class CPU : public BaseCPU
     DVRInstructionRecorder vrChain;
     DVRVectorRenameTable vrRAT;
     std::array<DVRVectorRenameTable, 8> vrGroupRAT;
+    std::array<unsigned, 8> vrGroupAllocated = {};
     DVRVectorInstructionRegister vrVIR;
     DVRLoopBoundDetector::RegisterSnapshot vrInitialRegs = {};
     unsigned vrVectorLanes;
@@ -948,6 +950,7 @@ class CPU : public BaseCPU
     std::deque<unsigned> vrRDQ;
     uint64_t vrPrefetchQueuePeak = 0;
     uint64_t vrActiveLaneMask = 0;
+    std::array<uint64_t, 8> vrGroupLaneMasks = {};
     unsigned vrMaxRDQEntries = 192;
     unsigned vrCycles = 0;
     unsigned vrOutstandingResponses = 0;

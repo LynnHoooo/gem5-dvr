@@ -148,8 +148,13 @@ class DVRInstructionRecorder
         {
             Unsupported,
             Add,
+            Sub,
+            Mul,
+            Or,
+            Xor,
             AddImmediate,
             ShiftLeftImmediate,
+            ShiftRightImmediate,
             AndImmediate,
             LoadAddress
         };
@@ -208,10 +213,12 @@ class DVRVectorRenameTable
   private:
     Mapping mapping = {};
     unsigned nextPhysical = 0;
+    unsigned mappedUops = 0;
 
   public:
     DVRVectorRenameTable();
     unsigned build(const DVRInstructionRecorder &program, unsigned lanes);
+    unsigned extend(const DVRInstructionRecorder &program, unsigned lanes);
     void reset();
     int16_t lookup(unsigned architectural, unsigned chunk) const;
 };

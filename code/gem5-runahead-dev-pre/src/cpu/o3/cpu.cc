@@ -615,6 +615,9 @@ CPU::CPUStats::CPUStats(CPU *cpu)
       ADD_STAT(vrDependentPrefetchesIssued,
                statistics::units::Count::get(),
                "VR dependent prefetches accepted by L1D"),
+      ADD_STAT(vrDependentPrefetchesCompleted,
+               statistics::units::Count::get(),
+               "VR dependent prefetch responses completed"),
       ADD_STAT(vrPrefetchesCompleted, statistics::units::Count::get(),
                "VR prefetch responses completed"),
       ADD_STAT(vrPrefetchesDropped, statistics::units::Count::get(),
@@ -2355,7 +2358,11 @@ CPU::replayDVRSource(const DVRPrefetchSenderState &state,
             return false;
         const RegVal source0 = regs[uop.source0];
         RegVal source1 = 0;
-        if (uop.semantic == DVRInstructionRecorder::Uop::Semantic::Add) {
+        if (uop.semantic == DVRInstructionRecorder::Uop::Semantic::Add ||
+            uop.semantic == DVRInstructionRecorder::Uop::Semantic::Sub ||
+            uop.semantic == DVRInstructionRecorder::Uop::Semantic::Mul ||
+            uop.semantic == DVRInstructionRecorder::Uop::Semantic::Or ||
+            uop.semantic == DVRInstructionRecorder::Uop::Semantic::Xor) {
             if (uop.source1 < 0 ||
                 uop.source1 >=
                     DVRLoopBoundDetector::MaxArchitecturalIntRegs)
@@ -2824,7 +2831,7 @@ CPU::observeVRLoad(const DynInstPtr &inst, Addr address)
 {
     // VR runs on the PRE runahead stream.  Once in VR, stride training is
     // suspended for the rest of the round.
-    if (!enableVR || !inPRE || inVR)
+    if (!enableVR || inVR || vrDraining)
         return;
 
     const auto candidate =
@@ -2862,6 +2869,8 @@ CPU::enterVR(const DynInstPtr &inst, Addr address, int64_t stride)
                         ((uint64_t(1) << vrRound.lanes) - 1);
     const unsigned groups = std::max(1U, std::min(vrUnrollLength,
                                                    vrPipelineDepth));
+    for (unsigned group = 0; group < groups; ++group)
+        vrGroupLaneMasks[group] = vrActiveLaneMask;
     vrRound.activeLaneMask = vrActiveLaneMask;
     vrRound.pipelineGroups = groups;
     vrRound.unrollsIssued = groups;
@@ -2880,11 +2889,13 @@ CPU::enterVR(const DynInstPtr &inst, Addr address, int64_t stride)
     }
     vrRAT.reset();
     vrVIR.reset();
+    vrGroupAllocated.fill(0);
     vrBranchOutcome.fill(-1);
     vrBranchDiverged.fill(false);
     for (unsigned group = 0; group < groups; ++group) {
         const unsigned allocations = vrGroupRAT[group].build(
             vrChain, vrRound.lanes);
+        vrGroupAllocated[group] = allocations;
         cpuStats.vrVRATAllocations += allocations;
         for (unsigned i = 0; i < allocations &&
                             vrRDQ.size() < vrMaxRDQEntries; ++i) {
@@ -2918,8 +2929,25 @@ CPU::observeVRInstruction(const DynInstPtr &inst)
     if (obs.vectorized) {
         ++cpuStats.vrTaintedInstructions;
         if (!obs.invalid) {
-            if (vrChain.record(inst))
+            if (vrChain.record(inst)) {
                 ++cpuStats.vrChainUopsRecorded;
+                const unsigned groups = std::max(
+                    1U, std::min(vrUnrollLength, vrPipelineDepth));
+                for (unsigned group = 0; group < groups; ++group) {
+                    const unsigned allocations = vrGroupRAT[group].extend(
+                        vrChain, vrRound.lanes);
+                    if (allocations != 0) {
+                        vrGroupAllocated[group] += allocations;
+                        cpuStats.vrVRATAllocations += allocations;
+                        for (unsigned i = 0; i < allocations &&
+                                            vrRDQ.size() < vrMaxRDQEntries;
+                             ++i) {
+                            vrRDQ.push_back((group << 16) | i);
+                            ++cpuStats.vrRDQEnqueues;
+                        }
+                    }
+                }
+            }
         }
         if (obs.dependentLoad) {
             if (vrRound.terminator == 0) {
@@ -2956,8 +2984,8 @@ CPU::issueVRGather(Addr pc, Addr base, int64_t stride, unsigned lanes,
 {
     lanes = std::min(lanes, 64U);
     for (unsigned lane = 0; lane < lanes; ++lane) {
-        if (vrActiveLaneMask &&
-            !(vrActiveLaneMask & (uint64_t(1) << lane)))
+        const uint64_t groupMask = vrGroupLaneMasks[group % vrGroupLaneMasks.size()];
+        if (groupMask && !(groupMask & (uint64_t(1) << lane)))
             continue;
         const Addr addr = static_cast<Addr>(
             static_cast<int64_t>(base) +
@@ -2982,12 +3010,31 @@ CPU::serviceVRPrefetchQueue()
     if (vrPrefetchQueue.empty())
         return;
 
+    while (vrDraining && !vrPrefetchQueue.empty() &&
+           vrPrefetchQueue.front().source &&
+           vrPrefetchQueue.front().level == 0) {
+        vrPrefetchQueue.pop_front();
+    }
+    if (vrPrefetchQueue.empty()) {
+        finalizeVRDrain();
+        return;
+    }
     const auto prefetch = vrPrefetchQueue.front();
+
+    constexpr unsigned VRCacheBlockBytes = 64;
+    const unsigned offset = prefetch.address & (VRCacheBlockBytes - 1);
+    if (offset > VRCacheBlockBytes - 8 && prefetch.source) {
+        vrPrefetchQueue.pop_front();
+        invalidateVRLane(prefetch.lane, prefetch.group);
+        return;
+    }
+    const unsigned requestSize =
+        (offset > VRCacheBlockBytes - 8) ? 1 : 8;
 
     Request::Flags flags;
     flags.set(Request::PREFETCH);
     RequestPtr req = std::make_shared<Request>(
-        prefetch.address, 8, flags, dataRequestorId(), prefetch.pc,
+        prefetch.address, requestSize, flags, dataRequestorId(), prefetch.pc,
         thread[prefetch.tid]->contextId());
     req->taskId(context_switch_task_id::Prefetcher);
 
@@ -2996,7 +3043,7 @@ CPU::serviceVRPrefetchQueue()
     if (fault != NoFault) {
         ++cpuStats.vrPrefetchTranslationFaults;
         vrPrefetchQueue.pop_front();
-        invalidateVRLane(prefetch.lane);
+        invalidateVRLane(prefetch.lane, prefetch.group);
         return;
     }
 
@@ -3029,9 +3076,9 @@ CPU::serviceVRPrefetchQueue()
     if (prefetch.source)
         ++vrOutstandingResponses;
     ++cpuStats.vrPrefetchesIssued;
-    if (prefetch.source)
+    if (prefetch.source && prefetch.level == 0)
         ++cpuStats.vrSourcePrefetchesIssued;
-    else
+    else if (prefetch.source)
         ++cpuStats.vrDependentPrefetchesIssued;
 }
 
@@ -3047,7 +3094,7 @@ CPU::completeVRPrefetch(PacketPtr pkt)
             --vrOutstandingResponses;
         if (state->source && vrRound.outstanding != 0)
             --vrRound.outstanding;
-        invalidateVRLane(state->lane);
+        invalidateVRLane(state->lane, state->group);
         delete state;
         pkt->senderState = nullptr;
         delete pkt;
@@ -3079,9 +3126,14 @@ CPU::completeVRPrefetch(PacketPtr pkt)
         }
     }
 
+    if (state->source && state->level != 0)
+        ++cpuStats.vrDependentPrefetchesCompleted;
+
     delete state;
     pkt->senderState = nullptr;
     delete pkt;
+    if (!vrPrefetchQueue.empty())
+        serviceVRPrefetchQueue();
     replayPendingVRResponses();
     finalizeVRDrain();
 }
@@ -3120,7 +3172,11 @@ CPU::replayVRChain(RegVal source_value,
             return;
         const RegVal source0 = regs[uop.source0];
         RegVal source1 = 0;
-        if (uop.semantic == DVRInstructionRecorder::Uop::Semantic::Add) {
+        if (uop.semantic == DVRInstructionRecorder::Uop::Semantic::Add ||
+            uop.semantic == DVRInstructionRecorder::Uop::Semantic::Sub ||
+            uop.semantic == DVRInstructionRecorder::Uop::Semantic::Mul ||
+            uop.semantic == DVRInstructionRecorder::Uop::Semantic::Or ||
+            uop.semantic == DVRInstructionRecorder::Uop::Semantic::Xor) {
             if (uop.source1 < 0 ||
                 uop.source1 >=
                     DVRLoopBoundDetector::MaxArchitecturalIntRegs)
@@ -3143,6 +3199,8 @@ CPU::replayVRChain(RegVal source_value,
                 lane_state.valid = false;
                 return;
             }
+            lane_state.nextUop = index + 1;
+            continue;
         }
         if (!uop.evaluate(source0, source1, result))
             return;
@@ -3150,7 +3208,7 @@ CPU::replayVRChain(RegVal source_value,
         if (uop.semantic ==
             DVRInstructionRecorder::Uop::Semantic::LoadAddress) {
             if (result == 0) {
-                invalidateVRLane(state.lane);
+                invalidateVRLane(state.lane, state.group);
                 return;
             }
             VRPrefetchEntry dependent;
@@ -3190,16 +3248,15 @@ CPU::exitVR()
     vrRound.active = false;
     vrRound.draining = true;
     vrActiveLaneMask = 0;
+    for (auto &mask : vrGroupLaneMasks)
+        mask = 0;
+    vrRound.activeLaneMask = 0;
     if (vrChain.size() != 0) {
         const auto vir = vrVIR.execute(vrChain, vrRound.lanes);
         cpuStats.vrVectorUopsIssued += vir.helperUops;
         cpuStats.vrVectorChunksExecuted += vir.chunkExecutions;
         cpuStats.vrDivergentBranches += vir.divergentBranches;
         cpuStats.vrReconvergences += vir.reconvergences;
-    }
-    if (!vrPrefetchQueue.empty()) {
-        cpuStats.vrPrefetchesDropped += vrPrefetchQueue.size();
-        vrPrefetchQueue.clear();
     }
     if (vrOutstandingResponses == 0)
         finalizeVRDrain();
@@ -3218,6 +3275,7 @@ CPU::finalizeVRDrain()
     vrRAT.reset();
     for (auto &rat : vrGroupRAT)
         rat.reset();
+    vrGroupAllocated.fill(0);
     vrVIR.reset();
     while (!vrRDQ.empty()) {
         vrRDQ.pop_front();
@@ -3256,14 +3314,17 @@ CPU::replayPendingVRResponses()
 }
 
 void
-CPU::invalidateVRLane(unsigned lane)
+CPU::invalidateVRLane(unsigned lane, unsigned group)
 {
-    if (lane >= 64 || !(vrActiveLaneMask & (uint64_t(1) << lane)))
+    if (lane >= 64 || group >= vrGroupLaneMasks.size() ||
+        !(vrGroupLaneMasks[group] & (uint64_t(1) << lane)))
         return;
-    vrActiveLaneMask &= ~(uint64_t(1) << lane);
+    vrGroupLaneMasks[group] &= ~(uint64_t(1) << lane);
+    vrActiveLaneMask = 0;
+    for (const auto mask : vrGroupLaneMasks)
+        vrActiveLaneMask |= mask;
     vrRound.activeLaneMask = vrActiveLaneMask;
-    for (auto &group_lanes : vrLaneStates)
-        group_lanes[lane].valid = false;
+    vrLaneStates[group][lane].valid = false;
     ++cpuStats.vrInvalidLanes;
     if (vrActiveLaneMask == 0 && inVR) {
         ++cpuStats.vrTerminatedAllInvalid;
