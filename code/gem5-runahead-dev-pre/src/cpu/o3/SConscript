@@ -54,6 +54,7 @@ if env['CONF']['TARGET_ISA'] != 'null':
     Source('pre.cc')
     Source('regfile.cc')
     Source('rename.cc')
+    Source('vr.cc')
     Source('rename_map.cc')
     Source('rob.cc')
     Source('scoreboard.cc')

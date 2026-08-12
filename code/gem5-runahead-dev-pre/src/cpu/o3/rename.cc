@@ -858,6 +858,12 @@ Rename::renameInsts(ThreadID tid)
         // Decrement how many instructions are available.
         --insts_available;
 
+        // Feed the VR vectorizer on the PRE runahead stream.  During a VR
+        // round, every PRE instruction passes through rename, which is where
+        // taint propagation, chain recording and termination are applied.
+        if (cpu->isInVR())
+            cpu->observeVRInstruction(inst);
+
         // In PRE, put instruction in the PRDQ instead of ROB.
         if (cpu->isInPRE()) {
             inst->setPRE();

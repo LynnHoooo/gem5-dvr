@@ -186,4 +186,14 @@ class BaseO3CPU(BaseCPU):
                                     "deallocation queue entries")
     numSSTEntries = Param.Unsigned(128, "Number of stalling slice table "
                                    "entries")
+
+    # Vector Runahead (ISCA 2020) parameters.
+    enableVR = Param.Bool(False, "Enable Vector Runahead on top of PRE")
+    vrStrideEntries = Param.Unsigned(32, "VR 步幅检测表项数")
+    vrVectorLanes = Param.Unsigned(8, "VR 每个向量 gather 的标量等价通道数 (N)")
+    vrUnrollLength = Param.Unsigned(8, "VR 向量展开轮数 (U)")
+    vrPipelineDepth = Param.Unsigned(8, "VR 向量流水化深度 (P)")
+    vrTimeoutInstructions = Param.Unsigned(200,
+        "VR 单轮允许的最大标量等价指令数")
+
     enableMJ = Param.Bool(False, "Enable my journal")

@@ -777,6 +777,9 @@ Commit::tick()
         if (commitStatus[0] == ROBSquashing && cpu->isInPRE()) {
             MJ("Commit", "exit pre exception");
             cpu->exitPRE();
+            // VR runs on the PRE stream; a squash that ends PRE also ends VR.
+            if (cpu->isInVR())
+                cpu->exitVR();
         }
     }
 
@@ -804,6 +807,8 @@ Commit::tick()
     // to flush all PRE instructions in the pipeline.
     if (cpu->isInPRE() && rob->readHeadInst(0)->readyToCommit()) {
         cpu->exitPRE();
+        if (cpu->isInVR())
+            cpu->exitVR();
 
         // Find the last instruction in ROB that has been dispatched and
         // squash after it.

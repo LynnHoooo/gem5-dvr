@@ -330,8 +330,8 @@ U > P 时，终止后**立即**用下一个 striding load 重新进入 VR，重�
 
 | Stage | 状态 | 证据摘要 | 判定 |
 |---|---|---|---|
-| 0 | 待开始 | — | — |
-| 1 | 待开始 | — | — |
+| 0 | 结论完成，脚本就绪（待服务器运行） | RVV 确认：fork 无真实 RVV（`DummyVecRegContainer`），向量化走 DVR 同款"模拟向量物理寄存器 + L1D timing port 真实预取"；`scripts/run_remote_vr_stage0_prebase.sh` 提供 OoO/PRE 两组冒烟与 `numCycles`/L1D 缺失留底 | 待 `VR_STAGE0_PREBASE_PASSED` |
+| 1 | 代码完成，脚本就绪（待服务器编译运行） | `vr.{hh,cc}`（confidence=3 RPT + terminator 字段、2-bit TV、round/prefetch 结构）；cpu.hh/cc：`observeVRLoad/enterVR/observeVRInstruction/issueVRGather/serviceVRPrefetchQueue/completeVRPrefetch/replayVRChain/exitVR` + 16 项 vr\* 统计；钩子：commit.cc 两处退出、lsq_unit.cc 观察点、rename.cc 观察点、lsq.cc 响应分发；`BaseO3CPU.py` 6 个 VR 参数；`scripts/run_remote_vr_stage1_smoke.sh` 断言 rounds/gathers/issued/completed/tainted 全正 | 待 `VR_STAGE1_SMOKE_PASSED` |
 | 2 | 待开始 | — | — |
 | 3 | 待开始 | — | — |
 | 4 | 待开始 | — | — |

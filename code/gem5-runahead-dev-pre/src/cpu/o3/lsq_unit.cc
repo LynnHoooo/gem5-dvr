@@ -1394,8 +1394,11 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
 
     // 只将主线程的架构 load 送入 DVR 的 RPT。
     // PRE 产生的访问在 CPU 回调中会被排除。
-    if (request->mainReq()->hasVaddr())
+    if (request->mainReq()->hasVaddr()) {
         cpu->observeDVRLoad(load_inst, request->mainReq()->getVaddr());
+        // VR 步幅检测/进入（内部通过 inPRE 门控，仅在 PRE 运行期间生效）。
+        cpu->observeVRLoad(load_inst, request->mainReq()->getVaddr());
+    }
 
     if (request->mainReq()->isLLSC()) {
         // Disable recording the result temporarily.  Writing to misc

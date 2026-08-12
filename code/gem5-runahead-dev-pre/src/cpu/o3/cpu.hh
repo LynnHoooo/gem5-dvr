@@ -67,6 +67,7 @@
 #include "cpu/o3/iew.hh"
 #include "cpu/o3/limits.hh"
 #include "cpu/o3/pre.hh"
+#include "cpu/o3/vr.hh"
 #include "cpu/o3/rename.hh"
 #include "cpu/o3/rob.hh"
 #include "cpu/o3/scoreboard.hh"
@@ -728,6 +729,23 @@ class CPU : public BaseCPU
         statistics::Scalar dvrQualityIssuedBytes;
         statistics::Scalar dvrQualityCompletedBytes;
         statistics::Scalar dvrQualityDemandAddressesObserved;
+
+        // Vector Runahead statistics.
+        statistics::Scalar vrRoundsEntered;
+        statistics::Scalar vrGathersIssued;
+        statistics::Scalar vrPrefetchesIssued;
+        statistics::Scalar vrSourcePrefetchesIssued;
+        statistics::Scalar vrDependentPrefetchesGenerated;
+        statistics::Scalar vrDependentPrefetchesIssued;
+        statistics::Scalar vrPrefetchesCompleted;
+        statistics::Scalar vrPrefetchesDropped;
+        statistics::Scalar vrPrefetchTranslationFaults;
+        statistics::Scalar vrTaintedInstructions;
+        statistics::Scalar vrTerminatedRecurringStride;
+        statistics::Scalar vrTerminatedTerminator;
+        statistics::Scalar vrTerminatedAllInvalid;
+        statistics::Scalar vrTerminatedTimeout;
+        statistics::Scalar vrPrefetchQueuePeak;
     } cpuStats;
 
   public:
@@ -754,6 +772,44 @@ class CPU : public BaseCPU
 
     /** 用主线程 load 地址训练 DVR 的 RPT。 */
     void observeDVRLoad(const DynInstPtr &inst, Addr address);
+
+    /**
+     * Vector Runahead: called from the LSQ for every PRE-mode load whose
+     * address is known.  Trains the VR stride detector and, on confidence 3,
+     * enters vector-runahead mode (paper Section III-C).
+     */
+    void observeVRLoad(const DynInstPtr &inst, Addr address);
+
+    /** Called from rename for every instruction in the runahead stream while
+     *  in vector-runahead mode: taint-track, capture the chain and enforce
+     *  the four termination conditions (paper Section III-J). */
+    void observeVRInstruction(const DynInstPtr &inst);
+
+    /** Enter vector-runahead mode for the striding load that just reached
+     *  confidence 3, vectorizing it into an N-lane gather. */
+    void enterVR(const DynInstPtr &inst, Addr address, int64_t stride);
+
+    /** Leave vector-runahead mode and clear its state. */
+    void exitVR();
+
+    /** Returns whether the CPU is in vector-runahead mode. */
+    bool isInVR() const { return inVR; };
+
+    /** Enqueue the N lanes of one vector gather (striding or dependent). */
+    void issueVRGather(Addr pc, Addr base, int64_t stride, unsigned lanes,
+                       unsigned level, bool source);
+
+    /** Drain one entry of the VR prefetch queue into the L1D timing port,
+     *  mirroring DVR's software-prefetch engine. */
+    void serviceVRPrefetchQueue();
+
+    /** Replay the captured chain rooted at the trigger, substituting the
+     *  returned striding value, and generate the dependent gather(s). */
+    void replayVRChain(RegVal source_value,
+                       const VRPrefetchSenderState &state);
+
+    /** Track the high-water mark of the VR prefetch queue. */
+    void updateVRPrefetchQueuePeak();
 
     struct DVRReplayTemplate
     {
@@ -806,6 +862,9 @@ class CPU : public BaseCPU
     /** 处理 DVR 软件预取生成的响应。 */
     void completeDVRPrefetch(PacketPtr pkt);
 
+    /** 处理 VR gather 预取响应；source 响应携带数据用于依赖链回放。 */
+    void completeVRPrefetch(PacketPtr pkt);
+
   private:
     /** Whether PRE is enabled. */
     bool enablePRE;
@@ -829,6 +888,27 @@ class CPU : public BaseCPU
     DVRLoopBoundDetector::RegisterSnapshot dvrDiscoveryStartRegs = {};
     unsigned dvrMaxLanes;
     unsigned dvrHelperMaxUops;
+
+    /**
+     * Vector Runahead state.  The stride detector, taint vector, round
+     * context, VRAT (reused DVRVectorRenameTable) and the VR prefetch queue.
+     */
+    bool enableVR;
+    bool inVR;
+    VRStrideDetector vrStrideDetector;
+    VRVectorTaintTracker vrTaint;
+    VRRound vrRound;
+    DVRInstructionRecorder vrChain;
+    DVRVectorRenameTable vrRAT;
+    DVRLoopBoundDetector::RegisterSnapshot vrInitialRegs = {};
+    unsigned vrVectorLanes;
+    unsigned vrUnrollLength;
+    unsigned vrPipelineDepth;
+    unsigned vrTimeoutInstructions;
+    unsigned vrUnrollsIssued = 0;
+    std::deque<VRPrefetchEntry> vrPrefetchQueue;
+    uint64_t vrPrefetchQueuePeak = 0;
+
     struct DVRPrefetchAddress
     {
         Addr address;
