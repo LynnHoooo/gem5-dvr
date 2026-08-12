@@ -29,7 +29,7 @@
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/pre.hh"
 #include "cpu/reg_class.hh"
-#include "sim/packet.hh"
+#include "mem/packet.hh"
 
 namespace gem5
 {
@@ -151,6 +151,12 @@ struct VRPrefetchEntry
 /** Sender state attached to each VR prefetch packet. */
 struct VRPrefetchSenderState : public Packet::SenderState
 {
+    VRPrefetchSenderState(bool is_source, unsigned chain_level,
+                          unsigned lane_index, ThreadID thread_id)
+        : source(is_source), level(chain_level), lane(lane_index),
+          tid(thread_id)
+    {}
+
     bool source;
     unsigned level;
     unsigned lane;

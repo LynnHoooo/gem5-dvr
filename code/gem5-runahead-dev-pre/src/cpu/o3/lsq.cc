@@ -406,7 +406,7 @@ LSQ::recvTimingResp(PacketPtr pkt)
         DPRINTF(LSQ, "Got error packet back for address: %#X\n",
                 pkt->getAddr());
 
-    if (dynamic_cast<CPU::VRPrefetchSenderState*>(pkt->senderState)) {
+    if (dynamic_cast<VRPrefetchSenderState*>(pkt->senderState)) {
         cpu->completeVRPrefetch(pkt);
         return true;
     }
