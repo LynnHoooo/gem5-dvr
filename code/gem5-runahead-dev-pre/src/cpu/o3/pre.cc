@@ -314,6 +314,43 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
             return;
         }
 
+        // C.BEQZ/C.BNEZ -- quadrant 1, compare rs1' against x0.
+        if (quadrant == 1 && (funct3 == 6 || funct3 == 7)) {
+            const uint32_t rs1p = 8 + ((compressed >> 7) & 0x7);
+            const uint32_t imm = (((compressed >> 12) & 1) << 8) |
+                (((compressed >> 10) & 0x3) << 6) |
+                (((compressed >> 5) & 0x3) << 3) |
+                (((compressed >> 3) & 0x3) << 1) |
+                (((compressed >> 2) & 1) << 5);
+            uop.source0 = rs1p;
+            uop.source1 = 0;
+            uop.intSources |= uint32_t(1) << 0;
+            uop.semantic = funct3 == 6 ? Semantic::BranchEqual :
+                           Semantic::BranchNotEqual;
+            uop.immediate = dvrSignExtend(imm, 9);
+            uop.conditional = true;
+            uop.control = true;
+            uop.target = uop.pc + uop.immediate;
+            return;
+        }
+
+        // C.J -- quadrant 1, unconditional PC-relative jump.
+        if (quadrant == 1 && funct3 == 5) {
+            const uint32_t imm = (((compressed >> 12) & 1) << 11) |
+                (((compressed >> 11) & 1) << 4) |
+                (((compressed >> 9) & 0x3) << 8) |
+                (((compressed >> 8) & 1) << 10) |
+                (((compressed >> 7) & 1) << 6) |
+                (((compressed >> 6) & 1) << 7) |
+                (((compressed >> 3) & 0x7) << 1) |
+                (((compressed >> 2) & 1) << 5);
+            uop.semantic = Semantic::JumpAndLink;
+            uop.immediate = dvrSignExtend(imm, 12);
+            uop.control = true;
+            uop.target = uop.pc + uop.immediate;
+            return;
+        }
+
         /*
          * C.ADD rd, rs2 -- quadrant 2, funct3 100, bit12=1 and both
          * registers non-zero.  C.JALR/C.EBREAK share the major encoding.
@@ -323,6 +360,17 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
             ((compressed >> 7) & 0x1f) != 0 &&
             ((compressed >> 2) & 0x1f) != 0) {
             uop.semantic = Semantic::Add;
+            return;
+        }
+        // C.JR/C.JALR -- quadrant 2, funct3 100, rs1 != 0, rs2 == 0.
+        if (quadrant == 2 && funct3 == 4 &&
+            ((compressed >> 12) & 1) <= 1 &&
+            ((compressed >> 7) & 0x1f) != 0 &&
+            ((compressed >> 2) & 0x1f) == 0) {
+            uop.source0 = (compressed >> 7) & 0x1f;
+            uop.semantic = ((compressed >> 12) & 1) ?
+                Semantic::JumpAndLinkRegister : Semantic::JumpAndLinkRegister;
+            uop.control = true;
             return;
         }
         return;
@@ -670,6 +718,9 @@ DVRInstructionRecorder::record(const DynInstPtr &inst)
     uop.source1 = dvrFirstIntRegister(inst, true, 1);
     uop.destination = dvrFirstIntRegister(inst, false, 0);
     uop.load = inst->isLoad();
+    uop.sideEffect = inst->isStore() || inst->isAtomic() ||
+                     inst->isSerializeBefore() || inst->isSerializeAfter() ||
+                     inst->isSyscall() || inst->isStoreConditional();
     uop.control = inst->isControl();
     uop.conditional = inst->isCondCtrl();
     uop.branchTaken = inst->pcState().branching();

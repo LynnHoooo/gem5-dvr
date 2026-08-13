@@ -758,6 +758,7 @@ class CPU : public BaseCPU
         statistics::Scalar vrReconvergences;
         statistics::Scalar vrChainUopsRecorded;
         statistics::Scalar vrSourceResponsesWithData;
+        statistics::Scalar vrUnsupportedSideEffects;
     } cpuStats;
 
   public:

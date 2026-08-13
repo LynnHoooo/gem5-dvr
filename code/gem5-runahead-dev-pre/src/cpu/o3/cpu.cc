@@ -659,7 +659,9 @@ CPU::CPUStats::CPUStats(CPU *cpu)
       ADD_STAT(vrChainUopsRecorded, statistics::units::Count::get(),
                "VR chain uops recorded"),
       ADD_STAT(vrSourceResponsesWithData, statistics::units::Count::get(),
-               "VR source responses carrying data")
+               "VR source responses carrying data"),
+      ADD_STAT(vrUnsupportedSideEffects, statistics::units::Count::get(),
+               "VR chains stopped at side-effecting instructions")
 {
     // Register any of the O3CPU's stats here.
     timesIdled
@@ -2947,6 +2949,13 @@ CPU::observeVRInstruction(const DynInstPtr &inst)
     const bool had_terminator = vrRound.terminator != 0;
     if (obs.vectorized) {
         ++cpuStats.vrTaintedInstructions;
+        if (inst->isStore() || inst->isAtomic() ||
+            inst->isSerializeBefore() || inst->isSerializeAfter() ||
+            inst->isSyscall() || inst->isStoreConditional()) {
+            ++cpuStats.vrUnsupportedSideEffects;
+            exitVR();
+            return;
+        }
         if (!obs.invalid) {
             if (vrChain.record(inst)) {
                 ++cpuStats.vrChainUopsRecorded;

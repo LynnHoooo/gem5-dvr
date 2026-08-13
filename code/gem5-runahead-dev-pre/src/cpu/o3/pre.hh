@@ -202,6 +202,7 @@ class DVRInstructionRecorder
         Semantic semantic = Semantic::Unsupported;
         bool encodingValid = false;
         bool load = false;
+        bool sideEffect = false;
         bool control = false;
         bool conditional = false;
         bool branchTaken = false;
