@@ -2906,8 +2906,9 @@ CPU::enterVR(const DynInstPtr &inst, Addr address, int64_t stride)
         vrVectorRegs.seed(group, vrInitialRegs, vrRound.lanes);
     vrRAT.reset();
     vrVIR.reset();
-    vrVectorRegs.reset();
     vrGroupAllocated.fill(0);
+    for (unsigned group = groups; group < vrGroupLaneMasks.size(); ++group)
+        vrGroupLaneMasks[group] = 0;
     vrBranchOutcome.fill(-1);
     vrBranchDiverged.fill(false);
     for (unsigned group = 0; group < groups; ++group) {
@@ -3245,6 +3246,28 @@ CPU::replayVRChain(RegVal source_value,
             lane_state.nextUop = index + 1;
             continue;
         }
+        if (uop.semantic == DVRInstructionRecorder::Uop::Semantic::JumpAndLink ||
+            uop.semantic == DVRInstructionRecorder::Uop::Semantic::JumpAndLinkRegister) {
+            const Addr target = uop.semantic ==
+                DVRInstructionRecorder::Uop::Semantic::JumpAndLink ?
+                static_cast<Addr>(static_cast<int64_t>(uop.pc) + uop.immediate) :
+                static_cast<Addr>((source0 + static_cast<RegVal>(uop.immediate)) & ~RegVal(1));
+            if (uop.destination > 0 &&
+                uop.destination < DVRLoopBoundDetector::MaxArchitecturalIntRegs) {
+                const RegVal link = static_cast<RegVal>(uop.pc + 4);
+                vrVectorRegs.write(state.group, uop.destination, state.lane, link);
+                regs[uop.destination] = link;
+            }
+            lane_state.nextUop = index + 1;
+            if (target == vrRound.triggerPC || target <= uop.pc) {
+                invalidateVRLane(state.lane, state.group);
+            } else {
+                lane_state.valid = false;
+                vrVectorRegs.invalidate(state.group, state.lane);
+            }
+            ++cpuStats.vrReconvergences;
+            return;
+        }
         if (!uop.evaluate(source0, source1, result))
             return;
 
@@ -3297,6 +3320,13 @@ CPU::exitVR()
     for (auto &mask : vrGroupLaneMasks)
         mask = 0;
     vrRound.activeLaneMask = 0;
+    // RDQ entries belong to the round, not to individual outstanding packets.
+    // Release them at the architectural termination point so a process exit
+    // cannot strand VRAT state while memory responses are still draining.
+    while (!vrRDQ.empty()) {
+        vrRDQ.pop_front();
+        ++cpuStats.vrRDQReleases;
+    }
     if (vrChain.size() != 0) {
         const auto vir = vrVIR.execute(vrChain, vrRound.lanes);
         cpuStats.vrVectorUopsIssued += vir.helperUops;
@@ -3323,10 +3353,6 @@ CPU::finalizeVRDrain()
         rat.reset();
     vrGroupAllocated.fill(0);
     vrVIR.reset();
-    while (!vrRDQ.empty()) {
-        vrRDQ.pop_front();
-        ++cpuStats.vrRDQReleases;
-    }
     for (auto &group_lanes : vrLaneStates)
         for (auto &lane : group_lanes)
             lane = VRLaneState{};

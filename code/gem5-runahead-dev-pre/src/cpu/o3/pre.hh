@@ -185,7 +185,9 @@ class DVRInstructionRecorder
             BranchLess,
             BranchGreaterEqual,
             BranchLessUnsigned,
-            BranchGreaterEqualUnsigned
+            BranchGreaterEqualUnsigned,
+            JumpAndLink,
+            JumpAndLinkRegister
         };
 
         Addr pc = 0;

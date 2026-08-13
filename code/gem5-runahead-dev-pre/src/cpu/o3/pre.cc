@@ -467,6 +467,26 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
         }
         return;
     }
+
+    if (opcode == 0x6f) { // JAL: J-immediate, target = pc + immediate.
+        const int64_t jump_imm = dvrSignExtend(
+            (((uop.encoding >> 31) & 1) << 20) |
+            (((uop.encoding >> 12) & 0xff) << 12) |
+            (((uop.encoding >> 20) & 1) << 11) |
+            (((uop.encoding >> 21) & 0x3ff) << 1), 21);
+        uop.semantic = Semantic::JumpAndLink;
+        uop.immediate = jump_imm;
+        uop.control = true;
+        uop.target = uop.pc + jump_imm;
+        return;
+    }
+
+    if (opcode == 0x67 && funct3 == 0) { // JALR: target = rs1 + imm.
+        uop.semantic = Semantic::JumpAndLinkRegister;
+        uop.immediate = dvrSignExtend(uop.encoding >> 20, 12);
+        uop.control = true;
+        return;
+    }
 }
 
 } // anonymous namespace
@@ -592,6 +612,9 @@ DVRInstructionRecorder::Uop::evaluate(
       case Semantic::BranchGreaterEqual:
       case Semantic::BranchLessUnsigned:
       case Semantic::BranchGreaterEqualUnsigned:
+        return false;
+      case Semantic::JumpAndLink:
+      case Semantic::JumpAndLinkRegister:
         return false;
       case Semantic::Unsupported:
         return false;
