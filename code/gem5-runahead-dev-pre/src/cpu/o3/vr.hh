@@ -140,6 +140,12 @@ struct VRRound
     uint64_t activeLaneMask = 0;
     bool draining = false;
     Addr terminator = 0;
+    // Architectural RVV state captured at round entry.
+    unsigned vl = 0;
+    unsigned vstart = 0;
+    unsigned sew = 64;
+    int lmul = 0;
+    uint64_t v0Mask = ~uint64_t(0);
 };
 
 /** One memory request in the VR prefetch queue. */

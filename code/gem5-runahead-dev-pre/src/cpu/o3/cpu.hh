@@ -959,6 +959,15 @@ class CPU : public BaseCPU
     bool vrDraining = false;
     std::array<int8_t, 8> vrBranchOutcome = {};
     std::array<bool, 8> vrBranchDiverged = {};
+    struct VRReconvergenceFrame
+    {
+        Addr branchPC = 0;
+        Addr reconvergePC = 0;
+        uint64_t takenMask = 0;
+        uint64_t fallthroughMask = 0;
+    };
+    std::array<std::array<VRReconvergenceFrame, 8>, 8> vrReconvergenceStack = {};
+    std::array<unsigned, 8> vrReconvergenceDepth = {};
 
     struct DVRPrefetchAddress
     {

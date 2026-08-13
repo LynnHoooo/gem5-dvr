@@ -45,6 +45,7 @@
 #include "mem/packet_access.hh"
 
 #include "config/the_isa.hh"
+#include "arch/riscv/regs/misc.hh"
 #include "cpu/activity.hh"
 #include "cpu/checker/cpu.hh"
 #include "cpu/checker/thread_context.hh"
@@ -2871,7 +2872,23 @@ CPU::enterVR(const DynInstPtr &inst, Addr address, int64_t stride)
     vrRound.triggerAddress = address;
     vrRound.triggerSequence = inst->seqNum;
     vrRound.stride = stride;
-    vrRound.lanes = std::min(vrVectorLanes, 64U);
+    const RegVal vl = readMiscRegNoEffect(RiscvISA::MISCREG_VL,
+                                          inst->threadNumber);
+    const RegVal vtype = readMiscRegNoEffect(RiscvISA::MISCREG_VTYPE,
+                                              inst->threadNumber);
+    const RegVal vstart = readMiscRegNoEffect(RiscvISA::MISCREG_VSTART,
+                                               inst->threadNumber);
+    vrRound.vl = vl == 0 ? vrVectorLanes : std::min<unsigned>(vl, 64);
+    vrRound.vstart = std::min<unsigned>(vstart, vrRound.vl);
+    vrRound.sew = 8U << ((vtype >> 3) & 0x7);
+    vrRound.lmul = static_cast<int>((vtype & 0x7) < 4 ?
+        (vtype & 0x7) : static_cast<int>((vtype & 0x7) - 8));
+    // v0 is a vector predicate register, not a scalar CSR.  The generic
+    // ThreadContext in this gem5 version exposes no predicate accessor, so
+    // the architectural reset value (all active) is used until the native
+    // predicate operand path is added to the RISC-V decoder.
+    vrRound.v0Mask = ~uint64_t(0);
+    vrRound.lanes = std::min(vrRound.vl, 64U);
     vrRound.instructions = 0;
     vrRound.terminator = vrStrideDetector.terminator(vrRound.triggerPC);
 
@@ -2883,6 +2900,9 @@ CPU::enterVR(const DynInstPtr &inst, Addr address, int64_t stride)
 
     vrActiveLaneMask = vrRound.lanes == 64 ? ~uint64_t(0) :
                         ((uint64_t(1) << vrRound.lanes) - 1);
+    vrActiveLaneMask &= vrRound.v0Mask;
+    if (vrRound.vstart != 0)
+        vrActiveLaneMask &= ~((uint64_t(1) << vrRound.vstart) - 1);
     const unsigned groups = std::max(1U, std::min(vrUnrollLength,
                                                    vrPipelineDepth));
     for (unsigned group = 0; group < groups; ++group)
@@ -2913,6 +2933,8 @@ CPU::enterVR(const DynInstPtr &inst, Addr address, int64_t stride)
         vrGroupLaneMasks[group] = 0;
     vrBranchOutcome.fill(-1);
     vrBranchDiverged.fill(false);
+    vrReconvergenceDepth.fill(0);
+    vrReconvergenceStack = {};
     for (unsigned group = 0; group < groups; ++group) {
         const unsigned allocations = vrGroupRAT[group].build(
             vrChain, vrRound.lanes);

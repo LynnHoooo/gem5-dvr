@@ -41,6 +41,7 @@
 #include "arch/riscv/regs/float.hh"
 #include "arch/riscv/regs/int.hh"
 #include "arch/riscv/regs/misc.hh"
+#include "arch/riscv/regs/vec.hh"
 #include "base/bitfield.hh"
 #include "base/compiler.hh"
 #include "base/logging.hh"
@@ -62,6 +63,11 @@ namespace gem5
 
 namespace RiscvISA
 {
+
+VecElemRegClassOps<RiscvISA::VecElem>
+    vecRegElemClassOps(NumVecElemPerVecReg);
+TypedRegClassOps<RiscvISA::VecRegContainer> vecRegClassOps;
+TypedRegClassOps<RiscvISA::VecPredRegContainer> vecPredRegClassOps;
 
 [[maybe_unused]] const std::array<const char *, NUM_MISCREGS> MiscRegNames = {{
     [MISCREG_PRV]           = "PRV",
@@ -192,16 +198,26 @@ namespace RiscvISA
     [MISCREG_NMIVEC]        = "NMIVEC",
     [MISCREG_NMIE]          = "NMIE",
     [MISCREG_NMIP]          = "NMIP",
+    [MISCREG_VSTART]        = "VSTART",
+    [MISCREG_VXSAT]         = "VXSAT",
+    [MISCREG_VXRM]          = "VXRM",
+    [MISCREG_VCSR]          = "VCSR",
+    [MISCREG_VL]            = "VL",
+    [MISCREG_VTYPE]         = "VTYPE",
+    [MISCREG_VLENB]         = "VLENB",
 }};
 
 ISA::ISA(const Params &p) : BaseISA(p)
 {
     _regClasses.emplace_back(NumIntRegs, debug::IntRegs);
     _regClasses.emplace_back(NumFloatRegs, debug::FloatRegs);
-    _regClasses.emplace_back(1, debug::IntRegs); // Not applicable to RISCV
-    _regClasses.emplace_back(2, debug::IntRegs); // Not applicable to RISCV
-    _regClasses.emplace_back(1, debug::IntRegs); // Not applicable to RISCV
-    _regClasses.emplace_back(0, debug::IntRegs); // Not applicable to RISCV
+    _regClasses.emplace_back(NumVecRegs, vecRegClassOps, debug::IntRegs,
+                             sizeof(VecRegContainer));
+    _regClasses.emplace_back(NumVecRegs * NumVecElemPerVecReg,
+                             vecRegElemClassOps, debug::IntRegs);
+    _regClasses.emplace_back(NumVecPredRegs, vecPredRegClassOps,
+                             debug::IntRegs, sizeof(VecPredRegContainer));
+    _regClasses.emplace_back(0, debug::IntRegs); // no condition-code registers
     _regClasses.emplace_back(NUM_MISCREGS, debug::MiscRegs);
 
     miscRegFile.resize(NUM_MISCREGS);
@@ -223,6 +239,9 @@ ISA::copyRegsFrom(ThreadContext *src)
     // Second loop through the float registers.
     for (int i = 0; i < NumFloatRegs; ++i)
         tc->setFloatReg(i, src->readFloatReg(i));
+
+    for (int i = 0; i < NumVecRegs; ++i)
+        tc->setVecRegFlat(i, src->readVecRegFlat(i));
 
     // Lastly copy PC/NPC
     tc->pcState(src->pcState());
@@ -246,6 +265,14 @@ void ISA::clear()
     miscRegFile[MISCREG_TSELECT] = 1;
     // NMI is always enabled.
     miscRegFile[MISCREG_NMIE] = 1;
+    miscRegFile[MISCREG_VSTART] = 0;
+    miscRegFile[MISCREG_VXSAT] = 0;
+    miscRegFile[MISCREG_VXRM] = 0;
+    miscRegFile[MISCREG_VCSR] = 0;
+    miscRegFile[MISCREG_VL] = 0;
+    // VLEN=256 bits, encoded in bytes by the vlenb CSR.
+    miscRegFile[MISCREG_VLENB] = 32;
+    miscRegFile[MISCREG_VTYPE] = 0;
 }
 
 bool
