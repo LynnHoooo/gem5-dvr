@@ -16,6 +16,7 @@ set -euo pipefail
 #   bash scripts/run_remote_vr_stage1_smoke.sh
 
 ROOT="${ROOT:-$HOME/dvr-repro/source/gem5-runahead-dev-pre}"
+GEM5="${GEM5:-$ROOT/build/RISCV/gem5.opt}"
 RESULT_ROOT="${RESULT_ROOT:-$HOME/dvr-repro/results/vr-stage1-smoke}"
 PYTHON_ROOT="${PYTHON_ROOT:-/nix/store/28wlfb25i3q4wq06ap0n9gb04qkjdjyn-python3-3.11.15}"
 
@@ -33,7 +34,7 @@ require_positive() {
     fi
 }
 
-gem5="$ROOT/build/RISCV/gem5.opt"
+gem5="$GEM5"
 source_file="$ROOT/benchmarks/vr_indirect.c"
 binary="$ROOT/benchmarks/vr_indirect.riscv"
 
