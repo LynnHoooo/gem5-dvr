@@ -2398,7 +2398,12 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                     dvrNestedContext.taint.observe(inst);
                 // Keep the child path decodable across an alternate branch;
                 // taint remains a separate dependency classification.
-                dvrNestedContext.recorder.record(inst);
+                // Preserve the child taint classification in the replay
+                // template.  Without this argument nested discovery records
+                // every uop as untainted, so the helper cannot distinguish
+                // the dependent load from address-materialization loads.
+                dvrNestedContext.recorder.record(
+                    inst, child_observation.taintedInstruction);
                 if (child_observation.taintedInstruction)
                     dvrTraceDependency("nested_tainted", curTick(),
                         dvrNestedContext.triggerPC,
@@ -3263,14 +3268,23 @@ CPU::completeDVRNestedContext(
             dvrNestedInvocationBatch.innerLanes[slot] = inference.lanes;
             dvrNestedInvocationBatch.innerStrides[slot] = inference.increment;
         }
-        // A single completed invocation is not Nested DVR.  Wait until at
-        // least two independently bounded invocations can be combined.
+        // A single CPU-observed invocation is not enough for the legacy
+        // batching path.  An NDM plan, however, already contains the
+        // independently bounded future outer invocations discovered after
+        // branch inversion.  Requiring two entries in the legacy batch in
+        // that case prevents the authoritative NDM plan from ever reaching
+        // launchDVRNestedPrefetches(): the child context is reset after each
+        // completion, leaving every generation stuck at count == 1.
+        const bool ndm_plan_ready =
+            dvrNestedDiscoveryMode.readyToVectorize() &&
+            dvrNestedDiscoveryMode.outerInvocationCount() != 0;
         const bool ndm_allows_flatten =
             !dvrNestedDiscoveryMode.active() ||
-            dvrNestedDiscoveryMode.readyToVectorize();
-        if (dvrNestedInvocationBatch.count >= 2 && ndm_allows_flatten) {
+            ndm_plan_ready;
+        if ((ndm_plan_ready || dvrNestedInvocationBatch.count >= 2) &&
+            ndm_allows_flatten) {
             launchDVRNestedPrefetches(finish_regs);
-            if (dvrNestedDiscoveryMode.readyToVectorize())
+            if (ndm_plan_ready)
                 dvrNestedDiscoveryMode.finishVectorization();
         }
     }
@@ -4040,7 +4054,11 @@ CPU::issueDVRReplayLanes(unsigned slots)
           seed->helperRegs->isVectorized(uop.source0)) ||
          (uop.source1 >= 0 &&
           seed->helperRegs->isVectorized(uop.source1)));
-    if (vector_destination) {
+    const uint64_t rename_key = (static_cast<uint64_t>(uop.pc) << 8) |
+        static_cast<uint64_t>(uop.destination & 0xff);
+    const bool first_vector_destination = vector_destination && reconvergence &&
+        reconvergence->renamedDestinations.insert(rename_key).second;
+    if (first_vector_destination) {
         if (!seed->helperRegs->renameVector(uop.destination)) {
             ++cpuStats.dvrVIRSourceValueSemanticFailures;
             for (Lane *lane : group)
@@ -4102,7 +4120,31 @@ CPU::issueDVRReplayLanes(unsigned slots)
         }
 
         const bool is_load = lane_uop.load;
-        if (is_load) {
+        // Only a load whose address is tainted by the trigger is a
+        // dependent replay target.  Earlier loads in the captured slice can
+        // be ordinary helper loads used to materialize the address; treating
+        // the first load as the target prematurely terminates every lane and
+        // collapses all requests onto that common base address.
+        if (is_load && !lane_uop.tainted) {
+            // This is a non-dependent helper load in the captured prefix.
+            // Its demand value is not available to the replay interpreter;
+            // skip it and continue through the recorded address chain.
+            lane->lanePC = lane->uopIndex + 1 < lane->program->count ?
+                lane->program->uops[lane->uopIndex + 1].pc : 0;
+            lane->uopIndex = findPC(lane->program, lane->lanePC);
+            ++lane->helperUops;
+            if (lane->lanePC == 0 || lane->helperUops >= dvrHelperMaxUops)
+                lane->active = false;
+            continue;
+        }
+        if (is_load && lane_uop.tainted) {
+            if (lane->nested) {
+                const Addr line = dvrPrefetchLine(result);
+                dvrTraceDependency("nested_replay_load", curTick(),
+                    lane->triggerPC, lane_uop.pc, result,
+                    static_cast<int>(lane->lane),
+                    static_cast<int>(line));
+            }
             if (result == 0 || result >= (Addr(1) << 47)) {
                 lane->active = false;
                 ++cpuStats.dvrPredicateMisses;
@@ -4237,6 +4279,12 @@ CPU::issueDVRReplayLanes(unsigned slots)
                     lane->predicate ? 1 : 0, lane->lane);
             } else {
                 ++cpuStats.dvrPrefetchesDeduplicated;
+                if (lane->nested) {
+                    dvrTraceDependency("nested_replay_dedup", curTick(),
+                        lane->triggerPC, lane_uop.pc, result,
+                        static_cast<int>(lane->lane),
+                        static_cast<int>(line));
+                }
             }
             if (lane_uop.alternatePath &&
                 lane_uop.alternateResumePC != 0)

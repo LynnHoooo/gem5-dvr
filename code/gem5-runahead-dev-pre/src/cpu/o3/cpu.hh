@@ -1665,6 +1665,11 @@ class CPU : public BaseCPU
         // 128-lane mask and the PC at which that path must be resumed.
         struct ReplayReconvergenceState
         {
+            // A vector destination must be renamed once per captured uop,
+            // not once per eight-lane VIR issue group.  Re-renaming for each
+            // group would copy only the already-issued lanes and make the
+            // remaining lanes read stale/zero values.
+            std::unordered_set<uint64_t> renamedDestinations;
             struct Frame
             {
                 Addr reconvergencePC = 0;
