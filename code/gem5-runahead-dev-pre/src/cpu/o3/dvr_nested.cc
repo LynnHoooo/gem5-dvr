@@ -275,6 +275,26 @@ DVRNestedDiscoveryMode::recordOuterInvocation(
         invocation.predicate = control.fallthroughMask;
         invocation.reconvergencePC = control.reconvergencePC;
         ++invocationCount;
+
+        // The stride detector already captured a bounded outer plan. A BFS
+        // generation can finish only one child before the NDM timeout, so
+        // materialize the remaining plan entries from the first child rather
+        // than waiting for a second dynamic child that may never arrive.
+        if (invocationCount == 1 && pendingOuterCount > 1) {
+            const OuterInvocation seed = invocations[0];
+            while (invocationCount < pendingOuterCount) {
+                auto &planned = invocations[invocationCount];
+                planned = seed;
+                planned.outerBase = pendingOuterBases[invocationCount];
+                const int64_t delta =
+                    static_cast<int64_t>(planned.outerBase) -
+                    static_cast<int64_t>(seed.outerBase);
+                planned.innerStart = static_cast<Addr>(
+                    static_cast<int64_t>(seed.innerStart) + delta);
+                ++invocationCount;
+            }
+            pendingOuterConsumed = pendingOuterCount;
+        }
     }
     // The confirmed outer-stride FIFO already supplies the outer invocation
     // plan.  One independently bounded child is therefore sufficient to

@@ -266,6 +266,19 @@ class DVRNestedDiscoveryMode
         return invocations;
     }
 
+    /** Number of invocations represented by the learned outer plan. */
+    unsigned plannedInvocationCount() const
+    {
+        return invocationCount > pendingOuterCount ?
+            invocationCount : pendingOuterCount;
+    }
+
+    /** Outer bases captured while confirming the NDM stride. */
+    const std::array<Addr, MaxOuterInvocations> &plannedOuterBases() const
+    {
+        return pendingOuterBases;
+    }
+
     /** Consume the current NDM plan after the nested vector is launched. */
     void finishVectorization();
 
