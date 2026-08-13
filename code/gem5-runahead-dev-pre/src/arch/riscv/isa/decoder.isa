@@ -1717,6 +1717,27 @@ decode QUADRANT default Unknown::unknown() {
             }
         }
 
+        0x15: decode FUNCT3 {
+            // RVV vsetvli rd, rs1, vtypei.  VLEN is 256 bits in the
+            // RISC-V vector register container used by this build.
+            format IOp {
+                0x7: vsetvli({{
+                    const uint64_t vtype = imm & 0xfff;
+                    const unsigned vsew = 8U << ((vtype >> 3) & 0x7);
+                    const unsigned vlmax = vsew == 0 ? 0 :
+                        (256U / vsew) * (1U << (vtype & 0x7));
+                    const uint64_t avl = Rs1;
+                    xc->setMiscReg(MISCREG_VTYPE, vtype);
+                    xc->setMiscReg(MISCREG_VSTART, 0);
+                    xc->setMiscReg(MISCREG_VL,
+                        avl == 0 ? 0 : std::min<uint64_t>(avl, vlmax));
+                    xc->setMiscReg(MISCREG_VLENB, 32);
+                    Rd = xc->readMiscReg(MISCREG_VL);
+                }}, uint64_t, {{ imm = FUNCT12; }},
+                    IsSerializeAfter, IsNonSpeculative, No_OpClass);
+            }
+        }
+
         0x18: decode FUNCT3 {
             format BOp {
                 0x0: beq({{
