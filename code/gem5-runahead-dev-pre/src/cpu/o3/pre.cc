@@ -12,7 +12,7 @@ namespace o3
 {
 
 DVRStrideDetector::DVRStrideDetector(unsigned num_entries)
-    : entries(num_entries)
+    : entries(num_entries), discoveryBits((num_entries + 63) / 64, 0)
 {
     assert(num_entries > 0);
 }
@@ -42,6 +42,12 @@ DVRStrideDetector::observe(Addr pc, Addr address)
             if (candidate.age < entry->age)
                 entry = &candidate;
         }
+        const unsigned entry_index = static_cast<unsigned>(
+            entry - entries.data());
+        // Reusing an RPT slot must also clear its independent Discovery bit;
+        // otherwise a newly installed PC inherits the old PC's innermost
+        // history.
+        setDiscoverySeen(entry_index, false);
         *entry = Entry{};
         entry->valid = true;
         entry->pc = pc;
@@ -53,8 +59,9 @@ DVRStrideDetector::observe(Addr pc, Addr address)
     const int64_t observed_stride = static_cast<int64_t>(address) -
                                     static_cast<int64_t>(entry->lastAddress);
     // 连续看到相同步幅时提高置信度，否则降低置信度并重新学习步幅。
+    const uint8_t old_confidence = entry->confidence;
     if (observed_stride != 0 && observed_stride == entry->stride) {
-        if (entry->confidence < 3)
+        if (entry->confidence < DVRStrideDetector::MaxConfidence)
             ++entry->confidence;
     } else {
         if (entry->confidence > 0)
@@ -63,12 +70,20 @@ DVRStrideDetector::observe(Addr pc, Addr address)
             entry->stride = observed_stride;
     }
 
+    if (entry->confidence < DVRStrideDetector::CandidateConfidence)
+        entry->candidatePending = false;
+    else if (old_confidence < DVRStrideDetector::CandidateConfidence &&
+             entry->confidence >= DVRStrideDetector::CandidateConfidence)
+        entry->candidatePending = true;
+
     entry->lastAddress = address;
     entry->age = timestamp;
 
-    if (entry->stride != 0 && entry->confidence >= 2)
-        // 置信度达到阈值后，报告一个可用于 Discovery 的候选。
+    if (entry->stride != 0 && entry->candidatePending) {
+        // The threshold crossing arms one candidate notification.  The
+        // dispatch-side path consumes it exactly once.
         return Candidate{pc, address, entry->stride};
+    }
     return std::nullopt;
 }
 
@@ -78,16 +93,31 @@ DVRStrideDetector::observeDispatch(Addr pc, bool discovery_active,
 {
     for (unsigned index = 0; index < entries.size(); ++index) {
         auto &entry = entries[index];
-        if (entry.valid && entry.pc == pc && entry.stride != 0 &&
-            entry.confidence >= 2) {
-            const bool repeated = discovery_active && entry.discoverySeen;
-            if (discovery_active && !entry.discoverySeen) {
+        if (!entry.valid || entry.pc != pc || entry.stride == 0 ||
+            entry.confidence < DVRStrideDetector::CandidateConfidence)
+            continue;
+
+        if (discovery_active) {
+            // Discovery's global bit vector is an edge detector: the first
+            // occurrence of a trained stride only sets its bit. A second
+            // occurrence identifies a more-inner stride and is reported once
+            // to the controller, which starts a fresh generation.
+            const bool repeated = discoverySeen(index);
+            if (!repeated) {
                 discoverySeenWrites.push_back({sequence, index});
-                entry.discoverySeen = true;
+                setDiscoverySeen(index, true);
+                continue;
             }
             return Candidate{pc, static_cast<Addr>(
                 static_cast<int64_t>(entry.lastAddress) + entry.stride),
-                entry.stride, repeated && pc != trigger_pc};
+                entry.stride, pc != trigger_pc};
+        }
+
+        if (entry.candidatePending) {
+            entry.candidatePending = false;
+            return Candidate{pc, static_cast<Addr>(
+                static_cast<int64_t>(entry.lastAddress) + entry.stride),
+                entry.stride};
         }
     }
     return std::nullopt;
@@ -100,12 +130,12 @@ DVRStrideDetector::beginDiscovery(Addr trigger_pc)
     // for a new Discovery generation, then the trigger entry is marked as
     // soon as Discovery opens.  A second observation of another striding PC
     // therefore identifies a more-inner candidate.
-    for (auto &entry : entries)
-        entry.discoverySeen = false;
+    std::fill(discoveryBits.begin(), discoveryBits.end(), 0);
     discoverySeenWrites.clear();
-    for (auto &entry : entries) {
+    for (unsigned index = 0; index < entries.size(); ++index) {
+        auto &entry = entries[index];
         if (entry.valid && entry.pc == trigger_pc) {
-            entry.discoverySeen = true;
+            setDiscoverySeen(index, true);
             break;
         }
     }
@@ -118,7 +148,7 @@ DVRStrideDetector::squashDiscovery(InstSeqNum squash_sequence)
     // earlier observation of the same RPT entry on the surviving path.
     while (!discoverySeenWrites.empty() &&
            discoverySeenWrites.back().sequence >= squash_sequence) {
-        entries[discoverySeenWrites.back().entry].discoverySeen = false;
+        setDiscoverySeen(discoverySeenWrites.back().entry, false);
         discoverySeenWrites.pop_back();
     }
 }
@@ -126,9 +156,15 @@ DVRStrideDetector::squashDiscovery(InstSeqNum squash_sequence)
 void
 DVRStrideDetector::endDiscovery()
 {
-    for (auto &entry : entries)
-        entry.discoverySeen = false;
+    std::fill(discoveryBits.begin(), discoveryBits.end(), 0);
     discoverySeenWrites.clear();
+    // Re-arm trained entries for one candidate notification in the next
+    // generation.  This permits a stable trigger PC to start Discovery again
+    // without reporting it on every dispatch in the same generation.
+    for (auto &entry : entries) {
+        entry.candidatePending = entry.valid && entry.stride != 0 &&
+            entry.confidence >= DVRStrideDetector::CandidateConfidence;
+    }
 }
 
 void
@@ -137,6 +173,7 @@ DVRStrideDetector::reset()
     // 清空所有训练状态。
     for (auto &entry : entries)
         entry = Entry{};
+    std::fill(discoveryBits.begin(), discoveryBits.end(), 0);
     discoverySeenWrites.clear();
     timestamp = 0;
 }
@@ -455,6 +492,32 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
             return;
         }
 
+        // C.ADDI4SPN rd', nzuimm -- stack-relative address materialization.
+        if (quadrant == 0 && funct3 == 0 &&
+            ((compressed >> 2) & 0x1f) != 0) {
+            uop.semantic = Semantic::AddImmediate;
+            uop.source0 = 2;
+            uop.immediate = (((compressed >> 11) & 0x3) << 4) |
+                (((compressed >> 7) & 0xf) << 6) |
+                (((compressed >> 6) & 0x1) << 2) |
+                (((compressed >> 5) & 0x1) << 3);
+            return;
+        }
+
+        // C.ADDI16SP rd=x2, nzimm -- signed stack adjustment.
+        if (quadrant == 1 && funct3 == 3 &&
+            ((compressed >> 7) & 0x1f) == 2) {
+            uop.semantic = Semantic::AddImmediate;
+            uop.source0 = 2;
+            const uint32_t imm = (((compressed >> 12) & 0x1) << 9) |
+                (((compressed >> 6) & 0x1) << 4) |
+                (((compressed >> 5) & 0x1) << 6) |
+                (((compressed >> 3) & 0x3) << 7) |
+                (((compressed >> 2) & 0x1) << 5);
+            uop.immediate = dvrSignExtend(imm, 10);
+            return;
+        }
+
         // C.LUI rd, imm -- model the upper immediate as x0 + imm.
         if (quadrant == 1 && funct3 == 3 &&
             ((compressed >> 7) & 0x1f) != 0 &&
@@ -486,6 +549,19 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
             uop.immediate =
                 ((compressed >> 10) & 0x7) << 3 |
                 ((compressed >> 6) & 0x1) << 2;
+            return;
+        }
+
+        // C.LWSP/C.LDSP rd, uimm(sp) -- quadrant 2 stack loads.
+        if (quadrant == 2 && (funct3 == 2 || funct3 == 3) &&
+            ((compressed >> 7) & 0x1f) != 0) {
+            uop.semantic = funct3 == 2 ? Semantic::LoadWordSigned :
+                                         Semantic::LoadDouble;
+            uop.loadBytes = funct3 == 2 ? 4 : 8;
+            uop.source0 = 2;
+            uop.immediate = (((compressed >> 12) & 0x1) << 5) |
+                (((compressed >> 4) & 0x7) << 2) |
+                (((compressed >> 2) & 0x3) << 6);
             return;
         }
 
@@ -538,6 +614,22 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
             uop.immediate =
                 ((compressed >> 12) & 0x1) << 5 |
                 ((compressed >> 2) & 0x1f);
+            return;
+        }
+
+        // C.JR rs1 -- an indirect return.  Do not guess its target.
+        if (quadrant == 2 && funct3 == 4 &&
+            ((compressed >> 12) & 1) == 0 &&
+            ((compressed >> 7) & 0x1f) != 0 &&
+            ((compressed >> 2) & 0x1f) == 0)
+            return;
+
+        // C.MV rd, rs2 -- quadrant 2, funct3 100, bit12=0, rd/rs2 != x0.
+        if (quadrant == 2 && funct3 == 4 &&
+            ((compressed >> 12) & 1) == 0 &&
+            ((compressed >> 7) & 0x1f) != 0 &&
+            ((compressed >> 2) & 0x1f) != 0) {
+            uop.semantic = Semantic::Move;
             return;
         }
 
@@ -606,6 +698,8 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
         else if (funct3 == 5 && funct7 == 0) uop.semantic = Semantic::ShiftRightLogical;
         else if (funct3 == 5 && funct7 == 0x20) uop.semantic = Semantic::ShiftRightArithmetic;
         else if (funct3 == 0 && funct7 == 1) uop.semantic = Semantic::Multiply;
+        else if (funct3 == 6 && funct7 == 1) uop.semantic = Semantic::Remainder;
+        else if (funct3 == 7 && funct7 == 1) uop.semantic = Semantic::RemainderUnsigned;
         return;
     }
 
@@ -616,6 +710,10 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
             uop.semantic = Semantic::SubWord;
         else if (funct3 == 0 && funct7 == 1)
             uop.semantic = Semantic::MultiplyWord;
+        else if (funct3 == 6 && funct7 == 1)
+            uop.semantic = Semantic::RemainderWord;
+        else if (funct3 == 7 && funct7 == 1)
+            uop.semantic = Semantic::RemainderUnsignedWord;
         return;
     }
 
@@ -731,6 +829,9 @@ DVRInstructionRecorder::Uop::evaluate(
 {
     // 只计算已解码的简单标量操作；不支持的语义返回 false。
     switch (semantic) {
+      case Semantic::Move:
+        result = source0_value;
+        return true;
       case Semantic::Add:
         result = source0_value + source1_value;
         return true;
@@ -764,6 +865,35 @@ DVRInstructionRecorder::Uop::evaluate(
             static_cast<uint32_t>(source0_value) *
             static_cast<uint32_t>(source1_value))));
         return true;
+      case Semantic::Remainder:
+        if (source1_value == 0)
+            result = source0_value;
+        else if (static_cast<int64_t>(source0_value) ==
+                 std::numeric_limits<int64_t>::min() &&
+                 static_cast<int64_t>(source1_value) == -1)
+            result = 0;
+        else
+            result = static_cast<RegVal>(static_cast<int64_t>(source0_value) %
+                                         static_cast<int64_t>(source1_value));
+        return true;
+      case Semantic::RemainderUnsigned:
+        result = source1_value == 0 ? source0_value : source0_value % source1_value;
+        return true;
+      case Semantic::RemainderWord: {
+        const int32_t lhs = static_cast<int32_t>(source0_value);
+        const int32_t rhs = static_cast<int32_t>(source1_value);
+        const int32_t rem = rhs == 0 ? lhs :
+            (lhs == std::numeric_limits<int32_t>::min() && rhs == -1 ? 0 : lhs % rhs);
+        result = static_cast<RegVal>(static_cast<int64_t>(rem));
+        return true;
+      }
+      case Semantic::RemainderUnsignedWord: {
+        const uint32_t lhs = static_cast<uint32_t>(source0_value);
+        const uint32_t rhs = static_cast<uint32_t>(source1_value);
+        const uint32_t rem = rhs == 0 ? lhs : lhs % rhs;
+        result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(rem)));
+        return true;
+      }
       case Semantic::AddWord:
         result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
             static_cast<uint32_t>(source0_value) +
@@ -1242,6 +1372,17 @@ DVRVectorInstructionRegister::executeLanePC(
                 continue;
             }
 
+            // An indirect return has no captured target.  It terminates the
+            // bounded helper slice; following an unknown external path would
+            // be less precise than stopping here.
+            if (op.control && !op.conditional && op.branchTargetPC == 0 &&
+                op.intDestinations == 0) {
+                ++result.normalTerminatedLanes;
+                lane_active[lane] = false;
+                activeMask[lane / 64] &= ~(uint64_t(1) << (lane % 64));
+                continue;
+            }
+
             if (op.semantic == DVRInstructionRecorder::Uop::Semantic::Unsupported &&
                 !op.control && op.intDestinations == 0) {
                 lanePC[lane] = op_index + 1 < program.size() ?
@@ -1665,6 +1806,14 @@ DVRVectorInstructionRegister::resumeSourceLane(
             continue;
         }
 
+        if (op.control && !op.conditional && op.branchTargetPC == 0 &&
+            op.intDestinations == 0) {
+            ++result.normalTerminatedLanes;
+            laneActive[lane] = false;
+            activeMask[lane / 64] &= ~(uint64_t(1) << (lane % 64));
+            break;
+        }
+
         if (op.semantic == DVRInstructionRecorder::Uop::Semantic::Unsupported &&
             !op.control && op.intDestinations == 0) {
             lanePC[lane] = op_index + 1 < size ? source[op_index + 1].pc : 0;
@@ -1941,6 +2090,16 @@ DVRVectorInstructionRegister::resumeSourceLanes(
                     activeMask[candidate_lane / 64] &=
                         ~(uint64_t(1) << (candidate_lane % 64));
                 }
+                continue;
+            }
+
+            if (op.control && !op.conditional && op.branchTargetPC == 0 &&
+                op.intDestinations == 0) {
+                ++result.normalTerminatedLanes;
+                laneActive[candidate_lane] = false;
+                laneReady[candidate_lane] = false;
+                activeMask[candidate_lane / 64] &=
+                    ~(uint64_t(1) << (candidate_lane % 64));
                 continue;
             }
 

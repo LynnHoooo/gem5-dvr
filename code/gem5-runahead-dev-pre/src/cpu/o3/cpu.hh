@@ -788,6 +788,9 @@ class CPU : public BaseCPU
         statistics::Scalar dvrTaintedInstructions;
         statistics::Scalar dvrDependentLoads;
         statistics::Scalar dvrDiscoveriesWithFLR;
+        statistics::Scalar dvrLoopBackBranchesSeen;
+        statistics::Scalar dvrLoopBackBranchesWithFLR;
+        statistics::Scalar dvrLoopBackBranchesWithoutFLR;
         statistics::Scalar dvrBackwardBranches;
         statistics::Scalar dvrLoopBoundsFound;
         statistics::Scalar dvrDiscoveriesWithBounds;
@@ -858,6 +861,12 @@ class CPU : public BaseCPU
         statistics::Scalar dvrAlternatePathLookups;
         statistics::Scalar dvrAlternatePathHits;
         statistics::Scalar dvrAlternatePathCompleteHits;
+        statistics::Scalar dvrAlternatePathCandidates;
+        statistics::Scalar dvrAlternatePathBackwardFiltered;
+        statistics::Scalar dvrAlternatePathTargetPresent;
+        statistics::Scalar dvrAlternatePathCompleteRecords;
+        statistics::Scalar dvrAlternatePathIncompleteRecords;
+        statistics::Scalar dvrAlternatePathInsertRejects;
         statistics::Scalar dvrAlternatePathLiveInRejects;
         statistics::Scalar dvrAlternatePathIncompleteRejects;
         statistics::Scalar dvrAlternatePathUnsupportedRejects;
@@ -1462,6 +1471,29 @@ class CPU : public BaseCPU
     DVRVectorRenameTable dvrVectorRenameTable;
     DVRVectorInstructionRegister dvrVectorInstructionRegister;
     DVRLoopBoundDetector::RegisterSnapshot dvrDiscoveryStartRegs = {};
+    struct DVRDiscoveryGenerationRecord
+    {
+        uint64_t id = 0;
+        Addr initialTriggerPC = 0;
+        Addr finalLoadPC = 0;
+        Addr loopBranchPC = 0;
+        Addr loopTargetPC = 0;
+        int64_t stride = 0;
+        int8_t boundSource0 = -1;
+        int8_t boundSource1 = -1;
+        uint8_t comparison = 0;
+        bool hasBound = false;
+        bool matched = false;
+        unsigned lanes = 0;
+        const char *reason = nullptr;
+    };
+    uint64_t dvrDiscoveryGeneration = 0;
+    std::vector<DVRDiscoveryGenerationRecord> dvrDiscoveryHistory;
+    void recordDVRDiscoveryGeneration(const char *reason,
+                                      const DVRLoopBoundDetector::Inference
+                                      *inference = nullptr,
+                                      Addr trigger_pc = 0,
+                                      int64_t stride = 0);
     std::set<InstSeqNum> dvrDispatchTainted;
     std::set<InstSeqNum> dvrDispatchDependentLoads;
     // Control-flow uops are retained in the replay metadata even when their
@@ -1471,6 +1503,8 @@ class CPU : public BaseCPU
     unsigned dvrMaxLanes;
     unsigned dvrHelperMaxUops;
     bool dvrEnableDependentPrefetch;
+    Addr dvrPCMin;
+    Addr dvrPCMax;
     bool dvrAllowBoundedFallback;
     bool dvrSharedPhysicalBank;
     bool oraclePrefetch;
@@ -1482,6 +1516,7 @@ class CPU : public BaseCPU
     void oracleOnCommittedLoad(Addr address, ThreadID tid);
     bool dvrVectorChunkModel;
     bool dvrVectorUnlimitedFU;
+    bool dvrDecoupledIssue;
     unsigned dvrVectorElementBits;
     unsigned dvrVectorIssueInterval;
     Tick dvrVectorNextIssueTick = 0;
@@ -1625,17 +1660,27 @@ class CPU : public BaseCPU
             unsigned unit = 0;
             unsigned uop = 0;
         };
-        struct ReplayLaneContext
+        // One SIMT reconvergence stack is shared by all lanes belonging to a
+        // helper generation.  A frame is a deferred PC plus its complete
+        // 128-lane mask and the PC at which that path must be resumed.
+        struct ReplayReconvergenceState
         {
-            struct ReconvergenceFrame
+            struct Frame
             {
+                Addr reconvergencePC = 0;
                 Addr pc = 0;
-                Addr deferredPC = 0;
+                std::array<uint64_t, 2> mask = {};
                 bool alternatePath = false;
             };
-            static constexpr unsigned ReconvergenceEntries = 8;
+            static constexpr unsigned Entries = 8;
+            std::array<Frame, Entries> stack = {};
+            unsigned depth = 0;
+        };
+        struct ReplayLaneContext
+        {
             std::shared_ptr<const DVRReplayTemplate> program;
             std::shared_ptr<DVRHelperVectorRegisterFile> helperRegs;
+            std::shared_ptr<ReplayReconvergenceState> reconvergence;
             std::array<RegVal, DVRLoopBoundDetector::MaxArchitecturalIntRegs>
                 regs = {};
             std::array<Tick, DVRLoopBoundDetector::MaxArchitecturalIntRegs>
@@ -1651,9 +1696,7 @@ class CPU : public BaseCPU
             Addr triggerPC = 0;
             unsigned uopIndex = 1;
             Addr lanePC = 0;
-            std::array<ReconvergenceFrame, ReconvergenceEntries>
-                reconvergenceStack = {};
-            unsigned reconvergenceDepth = 0;
+            bool reconvergenceBlocked = false;
             unsigned helperUops = 0;
             bool nested = false;
             bool active = true;
@@ -1673,6 +1716,9 @@ class CPU : public BaseCPU
         std::deque<IssueEntry> issueQueue;
         std::deque<ReplayGeneration> replayGenerations;
         std::deque<ReplayLaneContext> replayLanes;
+        std::unordered_map<DVRHelperVectorRegisterFile *,
+                           std::shared_ptr<ReplayReconvergenceState>>
+            replayReconvergenceContexts;
         std::deque<DVRDynUop> virBuffer;
         std::deque<FrontendEntry> frontendBuffer;
         std::array<VIRCopyState, VIRCopies> virCopies = {};
@@ -1709,6 +1755,7 @@ class CPU : public BaseCPU
             issueQueue.clear();
             replayGenerations.clear();
             replayLanes.clear();
+            replayReconvergenceContexts.clear();
             virBuffer.clear();
             frontendBuffer.clear();
             virCopies = {};
@@ -1750,6 +1797,7 @@ class CPU : public BaseCPU
             issueQueue.clear();
             replayGenerations.clear();
             replayLanes.clear();
+            replayReconvergenceContexts.clear();
             virBuffer.clear();
             frontendBuffer.clear();
             virCopies = {};
@@ -1895,6 +1943,11 @@ class CPU : public BaseCPU
             ReplayLaneContext lane_context;
             lane_context.program = sender.replay;
             lane_context.helperRegs = sender.helperRegs;
+            auto &reconvergence = replayReconvergenceContexts[
+                sender.helperRegs.get()];
+            if (!reconvergence)
+                reconvergence = std::make_shared<ReplayReconvergenceState>();
+            lane_context.reconvergence = reconvergence;
             lane_context.regs = sender.replay->initialRegs;
             lane_context.regs[0] = 0;
             lane_context.regs[sender.replay->triggerDestination] = source_value;
@@ -2213,6 +2266,7 @@ class CPU : public BaseCPU
     // Main O3 stages run first every cycle.  Helpers may consume at most one
     // residual issue/LSU slot after IEW has completed.
     unsigned dvrHelperIssuesThisCycle = 0;
+    unsigned dvrHelperLSUIssuesThisCycle = 0;
     unsigned dvrHelperComputeIssuesThisCycle = 0;
     unsigned dvrMainIssuesThisCycle = 0;
     unsigned dvrMainALUIssuesThisCycle = 0;
@@ -2356,10 +2410,6 @@ class CPU : public BaseCPU
     std::shared_ptr<DVRPredicateGeneration> dvrActivePredicateGeneration;
     Addr dvrCurrentTriggerPC = 0;
     Addr dvrCurrentTriggerAddress = 0;
-    // The paper permits one innermost-stride handoff per Discovery
-    // generation. Without this guard, repeated outer loads can restart the
-    // same Discovery and starve completion/replay.
-    bool dvrDiscoverySwitchedInnermost = false;
     uint8_t dvrSelectedRelationSlots = 0;
     RegVal dvrInitiatingLoadValue = 0;
     struct DVRPendingNestedCandidate
@@ -2464,6 +2514,7 @@ class CPU : public BaseCPU
     void launchDVRNestedPrefetches(
         const DVRLoopBoundDetector::RegisterSnapshot &finish_regs);
     void serviceDVRPrefetchQueue();
+    void serviceDVRPrefetchRequest();
 
   public:
     /** IEW reports demand execution before the lower-priority helper runs. */

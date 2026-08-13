@@ -185,6 +185,8 @@ class BaseO3CPU(BaseCPU):
         "Number of future load addresses exposed by the oracle")
     dvrMode = Param.String("nested",
         "DVR ablation mode: vr, offload, discovery, full, or nested")
+    dvrPCMin = Param.Addr(0, "Optional inclusive PC filter for DVR triggers")
+    dvrPCMax = Param.Addr(0, "Optional inclusive PC filter for DVR triggers")
     dvrRPTEntries = Param.Unsigned(32, "DVR 步幅检测表项数")
     dvrMaxLanes = Param.Unsigned(128, "DVR 最大等效标量通道数")
     dvrHelperMaxUops = Param.Unsigned(200,
@@ -197,6 +199,8 @@ class BaseO3CPU(BaseCPU):
         "Element width used to form 512-bit DVR chunks")
     dvrVectorIssueInterval = Param.Unsigned(1,
         "Minimum cycles between DVR vector-chunk issues")
+    dvrDecoupledIssue = Param.Bool(False,
+        "Give the DVR helper an independent issue budget")
     dvrEnableDependentPrefetch = Param.Bool(True,
         "Enable DVR dependent target prefetch generation")
     dvrAllowBoundedFallback = Param.Bool(True,
