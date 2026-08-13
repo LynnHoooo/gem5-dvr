@@ -152,14 +152,44 @@ class DVRInstructionRecorder
             Mul,
             Or,
             Xor,
+            And,
+            Slt,
+            Sltu,
+            Sll,
+            Srl,
+            Sra,
             AddImmediate,
+            SubImmediate,
+            OrImmediate,
+            XorImmediate,
+            SltImmediate,
+            SltuImmediate,
+            Lui,
+            Auipc,
             ShiftLeftImmediate,
             ShiftRightImmediate,
+            ShiftRightArithmeticImmediate,
             AndImmediate,
-            LoadAddress
+            AddWord,
+            SubWord,
+            ShiftLeftWord,
+            ShiftRightWord,
+            ShiftRightArithmeticWord,
+            AddWordImmediate,
+            ShiftLeftWordImmediate,
+            ShiftRightWordImmediate,
+            ShiftRightArithmeticWordImmediate,
+            LoadAddress,
+            BranchEqual,
+            BranchNotEqual,
+            BranchLess,
+            BranchGreaterEqual,
+            BranchLessUnsigned,
+            BranchGreaterEqualUnsigned
         };
 
         Addr pc = 0;
+        Addr target = 0;
         uint32_t intSources = 0;
         uint32_t intDestinations = 0;
         uint32_t encoding = 0;
@@ -173,6 +203,9 @@ class DVRInstructionRecorder
         bool control = false;
         bool conditional = false;
         bool branchTaken = false;
+        int8_t branchKind = -1;
+        uint8_t loadBytes = 8;
+        bool loadSigned = true;
 
         /**
          * 计算支持的标量地址生成操作。
@@ -180,6 +213,7 @@ class DVRInstructionRecorder
          */
         bool evaluate(RegVal source0_value, RegVal source1_value,
                       RegVal &result) const;
+        bool predicate(RegVal source0_value, RegVal source1_value) const;
     };
 
   private:
@@ -195,6 +229,7 @@ class DVRInstructionRecorder
     bool overflow() const { return overflowed; }
     const Uop &operator[](unsigned index) const { return uops[index]; }
 };
+
 
 /**
  * RISC-V 向量重命名表：32 个架构整数寄存器，

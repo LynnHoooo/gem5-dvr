@@ -2358,11 +2358,25 @@ CPU::replayDVRSource(const DVRPrefetchSenderState &state,
             return false;
         const RegVal source0 = regs[uop.source0];
         RegVal source1 = 0;
-        if (uop.semantic == DVRInstructionRecorder::Uop::Semantic::Add ||
-            uop.semantic == DVRInstructionRecorder::Uop::Semantic::Sub ||
-            uop.semantic == DVRInstructionRecorder::Uop::Semantic::Mul ||
-            uop.semantic == DVRInstructionRecorder::Uop::Semantic::Or ||
-            uop.semantic == DVRInstructionRecorder::Uop::Semantic::Xor) {
+        if (uop.source1 >= 0 &&
+            (uop.intSources & (uint32_t(1) << uop.source1)) &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::LoadAddress &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::AddImmediate &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::SubImmediate &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::OrImmediate &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::XorImmediate &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::SltImmediate &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::SltuImmediate &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::ShiftLeftImmediate &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::ShiftRightImmediate &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::ShiftRightArithmeticImmediate &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::AndImmediate &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::AddWordImmediate &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::ShiftLeftWordImmediate &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::ShiftRightWordImmediate &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::ShiftRightArithmeticWordImmediate &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::Lui &&
+            uop.semantic != DVRInstructionRecorder::Uop::Semantic::Auipc) {
             if (uop.source1 < 0 ||
                 uop.source1 >=
                     DVRLoopBoundDetector::MaxArchitecturalIntRegs)
@@ -2887,8 +2901,12 @@ CPU::enterVR(const DynInstPtr &inst, Addr address, int64_t stride)
             lane.regs = vrInitialRegs;
         }
     }
+    vrVectorRegs.reset();
+    for (unsigned group = 0; group < groups; ++group)
+        vrVectorRegs.seed(group, vrInitialRegs, vrRound.lanes);
     vrRAT.reset();
     vrVIR.reset();
+    vrVectorRegs.reset();
     vrGroupAllocated.fill(0);
     vrBranchOutcome.fill(-1);
     vrBranchDiverged.fill(false);
@@ -2998,6 +3016,10 @@ CPU::issueVRGather(Addr pc, Addr base, int64_t stride, unsigned lanes,
         entry.level = level;
         entry.lane = lane;
         entry.group = group;
+        if (source && vrChain.size() != 0) {
+            entry.loadBytes = vrChain[0].loadBytes;
+            entry.loadSigned = vrChain[0].loadSigned;
+        }
         vrPrefetchQueue.push_back(entry);
         ++cpuStats.vrGathersIssued;
     }
@@ -3023,13 +3045,13 @@ CPU::serviceVRPrefetchQueue()
 
     constexpr unsigned VRCacheBlockBytes = 64;
     const unsigned offset = prefetch.address & (VRCacheBlockBytes - 1);
-    if (offset > VRCacheBlockBytes - 8 && prefetch.source) {
+    if (offset >= VRCacheBlockBytes || prefetch.loadBytes == 0) {
         vrPrefetchQueue.pop_front();
         invalidateVRLane(prefetch.lane, prefetch.group);
         return;
     }
-    const unsigned requestSize =
-        (offset > VRCacheBlockBytes - 8) ? 1 : 8;
+    const unsigned requestSize = std::min<unsigned>(
+        prefetch.loadBytes, VRCacheBlockBytes - offset);
 
     Request::Flags flags;
     flags.set(Request::PREFETCH);
@@ -3055,7 +3077,8 @@ CPU::serviceVRPrefetchQueue()
     pkt->allocate();
     pkt->senderState = new VRPrefetchSenderState{
         prefetch.source, prefetch.level, prefetch.lane, prefetch.tid,
-        prefetch.nextUop, prefetch.valueReg, prefetch.group};
+        prefetch.nextUop, prefetch.valueReg, prefetch.group,
+        prefetch.loadBytes, prefetch.loadSigned};
 
     auto &port = iew.ldstQueue.getDataPort();
     if (!port.tryTiming(pkt)) {
@@ -3112,7 +3135,27 @@ CPU::completeVRPrefetch(PacketPtr pkt)
     // the dependent-chain replay for the next gather level.
     if (state->source && pkt->hasData()) {
         ++cpuStats.vrSourceResponsesWithData;
-        const RegVal value = pkt->getLE<RegVal>();
+        RegVal value = 0;
+        const unsigned bytes = std::min<unsigned>(state->loadBytes,
+                                                   pkt->getSize());
+        const uint8_t *raw = pkt->getConstPtr<uint8_t>();
+        for (unsigned byte = 0; byte < bytes; ++byte)
+            value |= RegVal(raw[byte]) << (byte * 8);
+        if (state->loadSigned) {
+            if (state->loadBytes == 1)
+                value = static_cast<RegVal>(static_cast<int64_t>(static_cast<int8_t>(value)));
+            else if (state->loadBytes == 2)
+                value = static_cast<RegVal>(static_cast<int64_t>(static_cast<int16_t>(value)));
+            else if (state->loadBytes == 4)
+                value = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(value)));
+        }
+        if (state->group < VRVectorRegisterFile::MaxGroups &&
+            state->lane < VRVectorRegisterFile::MaxLanes) {
+            const int dest = state->valueReg >= 0 ? state->valueReg :
+                             (vrChain.size() != 0 ? vrChain[0].destination : -1);
+            if (dest >= 0)
+                vrVectorRegs.write(state->group, dest, state->lane, value);
+        }
         if (state->nextUop < vrChain.size()) {
             replayVRChain(value, *state);
         } else if (inVR) {
@@ -3170,22 +3213,21 @@ CPU::replayVRChain(RegVal source_value,
         if (uop.source0 < 0 ||
             uop.source0 >= DVRLoopBoundDetector::MaxArchitecturalIntRegs)
             return;
-        const RegVal source0 = regs[uop.source0];
+        const RegVal source0 = vrVectorRegs.read(
+            state.group, uop.source0, state.lane);
         RegVal source1 = 0;
-        if (uop.semantic == DVRInstructionRecorder::Uop::Semantic::Add ||
-            uop.semantic == DVRInstructionRecorder::Uop::Semantic::Sub ||
-            uop.semantic == DVRInstructionRecorder::Uop::Semantic::Mul ||
-            uop.semantic == DVRInstructionRecorder::Uop::Semantic::Or ||
-            uop.semantic == DVRInstructionRecorder::Uop::Semantic::Xor) {
+        if (uop.source1 >= 0 &&
+            (uop.intSources & (uint32_t(1) << uop.source1))) {
             if (uop.source1 < 0 ||
                 uop.source1 >=
                     DVRLoopBoundDetector::MaxArchitecturalIntRegs)
                 return;
-            source1 = regs[uop.source1];
+            source1 = vrVectorRegs.read(state.group, uop.source1,
+                                        state.lane);
         }
         RegVal result = 0;
         if (uop.control && uop.conditional) {
-            const int8_t outcome = (source0 != 0) ? 1 : 0;
+            const int8_t outcome = uop.predicate(source0, source1) ? 1 : 0;
             const unsigned slot = state.group % vrBranchOutcome.size();
             if (vrBranchOutcome[slot] < 0)
                 vrBranchOutcome[slot] = outcome;
@@ -3197,6 +3239,7 @@ CPU::replayVRChain(RegVal source_value,
             if (vrBranchOutcome[slot] != outcome) {
                 ++cpuStats.vrReconvergences;
                 lane_state.valid = false;
+                vrVectorRegs.invalidate(state.group, state.lane);
                 return;
             }
             lane_state.nextUop = index + 1;
@@ -3220,6 +3263,8 @@ CPU::replayVRChain(RegVal source_value,
             dependent.lane = state.lane;
             dependent.nextUop = index + 1;
             dependent.valueReg = uop.destination;
+            dependent.loadBytes = uop.loadBytes;
+            dependent.loadSigned = uop.loadSigned;
             dependent.group = state.group;
             vrPrefetchQueue.push_back(dependent);
             lane_state.nextUop = index + 1;
@@ -3232,6 +3277,7 @@ CPU::replayVRChain(RegVal source_value,
         if (uop.destination <= 0 ||
             uop.destination >= DVRLoopBoundDetector::MaxArchitecturalIntRegs)
             return;
+        vrVectorRegs.write(state.group, uop.destination, state.lane, result);
         regs[uop.destination] = result;
         regs[0] = 0;
     }

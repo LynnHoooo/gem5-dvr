@@ -154,6 +154,8 @@ struct VRPrefetchEntry
     unsigned group = 0; // software-pipelined unroll group
     unsigned nextUop = 1; // next recorded uop to evaluate on a response
     int8_t valueReg = -1; // register receiving the previous load value
+    uint8_t loadBytes = 8;
+    bool loadSigned = true;
 };
 
 /** Sender state attached to each VR prefetch packet. */
@@ -162,10 +164,11 @@ struct VRPrefetchSenderState : public Packet::SenderState
     VRPrefetchSenderState(bool is_source, unsigned chain_level,
                           unsigned lane_index, ThreadID thread_id,
                           unsigned next_uop = 1, int8_t value_reg = -1,
-                          unsigned group_id = 0)
+                          unsigned group_id = 0, uint8_t load_bytes = 8,
+                          bool load_signed = true)
         : source(is_source), level(chain_level), lane(lane_index),
           tid(thread_id), nextUop(next_uop), valueReg(value_reg),
-          group(group_id)
+          group(group_id), loadBytes(load_bytes), loadSigned(load_signed)
     {}
 
     bool source;
@@ -175,6 +178,32 @@ struct VRPrefetchSenderState : public Packet::SenderState
     unsigned nextUop;
     int8_t valueReg;
     unsigned group;
+    uint8_t loadBytes;
+    bool loadSigned;
+};
+
+/** Explicit per-lane vector register file used by the VR helper engine. */
+class VRVectorRegisterFile
+{
+  public:
+    static constexpr unsigned MaxGroups = 8;
+    static constexpr unsigned MaxLanes = 64;
+    static constexpr unsigned NumRegs = 32;
+    using Register = std::array<std::array<RegVal, MaxLanes>, NumRegs>;
+
+  private:
+    std::array<Register, MaxGroups> values = {};
+    std::array<uint64_t, MaxGroups> validMask = {};
+
+  public:
+    void reset();
+    void seed(unsigned group,
+              const DVRLoopBoundDetector::RegisterSnapshot &regs,
+              unsigned lanes);
+    RegVal read(unsigned group, unsigned reg, unsigned lane) const;
+    void write(unsigned group, unsigned reg, unsigned lane, RegVal value);
+    void invalidate(unsigned group, unsigned lane);
+    uint64_t mask(unsigned group) const;
 };
 
 } // namespace o3

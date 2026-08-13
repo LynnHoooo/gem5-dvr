@@ -343,6 +343,33 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
             uop.semantic = Semantic::Or;
         else if (funct3 == 4 && funct7 == 0)
             uop.semantic = Semantic::Xor;
+        else if (funct3 == 7 && funct7 == 0)
+            uop.semantic = Semantic::And;
+        else if (funct3 == 2 && funct7 == 0)
+            uop.semantic = Semantic::Slt;
+        else if (funct3 == 3 && funct7 == 0)
+            uop.semantic = Semantic::Sltu;
+        else if (funct3 == 1 && funct7 == 0)
+            uop.semantic = Semantic::Sll;
+        else if (funct3 == 5 && funct7 == 0)
+            uop.semantic = Semantic::Srl;
+        else if (funct3 == 5 && funct7 == 0x20)
+            uop.semantic = Semantic::Sra;
+        return;
+    }
+
+    // RV64 W-form integer operations (results are sign-extended from 32 bits).
+    if (opcode == 0x3b) {
+        if (funct3 == 0 && funct7 == 0)
+            uop.semantic = Semantic::AddWord;
+        else if (funct3 == 0 && funct7 == 0x20)
+            uop.semantic = Semantic::SubWord;
+        else if (funct3 == 1 && funct7 == 0)
+            uop.semantic = Semantic::ShiftLeftWord;
+        else if (funct3 == 5 && funct7 == 0)
+            uop.semantic = Semantic::ShiftRightWord;
+        else if (funct3 == 5 && funct7 == 0x20)
+            uop.semantic = Semantic::ShiftRightArithmeticWord;
         return;
     }
 
@@ -356,6 +383,20 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
         } else if (funct3 == 5) {
             uop.semantic = Semantic::ShiftRightImmediate;
             uop.immediate = (uop.encoding >> 20) & 0x3f;
+            if ((uop.encoding >> 30) & 1)
+                uop.semantic = Semantic::ShiftRightArithmeticImmediate;
+        } else if (funct3 == 2) {
+            uop.semantic = Semantic::SltImmediate;
+            uop.immediate = dvrSignExtend(uop.encoding >> 20, 12);
+        } else if (funct3 == 3) {
+            uop.semantic = Semantic::SltuImmediate;
+            uop.immediate = dvrSignExtend(uop.encoding >> 20, 12);
+        } else if (funct3 == 6) {
+            uop.semantic = Semantic::OrImmediate;
+            uop.immediate = dvrSignExtend(uop.encoding >> 20, 12);
+        } else if (funct3 == 4) {
+            uop.semantic = Semantic::XorImmediate;
+            uop.immediate = dvrSignExtend(uop.encoding >> 20, 12);
         } else if (funct3 == 7) {
             uop.semantic = Semantic::AndImmediate;
             uop.immediate = dvrSignExtend(uop.encoding >> 20, 12);
@@ -363,9 +404,68 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
         return;
     }
 
+    if (opcode == 0x1b) {
+        const int64_t imm = dvrSignExtend(uop.encoding >> 20, 12);
+        if (funct3 == 0) {
+            uop.semantic = Semantic::AddWordImmediate;
+            uop.immediate = imm;
+        } else if (funct3 == 1) {
+            uop.semantic = Semantic::ShiftLeftWordImmediate;
+            uop.immediate = (uop.encoding >> 20) & 0x1f;
+        } else if (funct3 == 5) {
+            uop.immediate = (uop.encoding >> 20) & 0x1f;
+            uop.semantic = ((uop.encoding >> 30) & 1) ?
+                Semantic::ShiftRightArithmeticWordImmediate :
+                Semantic::ShiftRightWordImmediate;
+        }
+        return;
+    }
+
+    if (opcode == 0x37) {
+        uop.semantic = Semantic::Lui;
+        uop.immediate = static_cast<int64_t>(uop.encoding & 0xfffff000);
+        return;
+    }
+    if (opcode == 0x17) {
+        uop.semantic = Semantic::Auipc;
+        uop.immediate = static_cast<int64_t>(uop.encoding & 0xfffff000);
+        return;
+    }
+
     if (opcode == 0x03) {
         uop.semantic = Semantic::LoadAddress;
         uop.immediate = dvrSignExtend(uop.encoding >> 20, 12);
+        switch (funct3) {
+          case 0: uop.loadBytes = 1; uop.loadSigned = true; break; // LB
+          case 1: uop.loadBytes = 2; uop.loadSigned = true; break; // LH
+          case 2: uop.loadBytes = 4; uop.loadSigned = true; break; // LW
+          case 3: uop.loadBytes = 8; uop.loadSigned = true; break; // LD
+          case 4: uop.loadBytes = 1; uop.loadSigned = false; break; // LBU
+          case 5: uop.loadBytes = 2; uop.loadSigned = false; break; // LHU
+          case 6: uop.loadBytes = 4; uop.loadSigned = false; break; // LWU
+          default: uop.semantic = Semantic::Unsupported; break;
+        }
+        return;
+    }
+
+    if (opcode == 0x63) {
+        const int64_t branch_imm =
+            dvrSignExtend(((uop.encoding >> 31) << 12) |
+                          (((uop.encoding >> 7) & 1) << 11) |
+                          (((uop.encoding >> 25) & 0x3f) << 5) |
+                          (((uop.encoding >> 8) & 0xf) << 1), 13);
+        uop.immediate = branch_imm;
+        uop.conditional = true;
+        switch (funct3) {
+          case 0: uop.semantic = Semantic::BranchEqual; break;
+          case 1: uop.semantic = Semantic::BranchNotEqual; break;
+          case 4: uop.semantic = Semantic::BranchLess; break;
+          case 5: uop.semantic = Semantic::BranchGreaterEqual; break;
+          case 6: uop.semantic = Semantic::BranchLessUnsigned; break;
+          case 7: uop.semantic = Semantic::BranchGreaterEqualUnsigned; break;
+          default: break;
+        }
+        return;
     }
 }
 
@@ -392,9 +492,50 @@ DVRInstructionRecorder::Uop::evaluate(
       case Semantic::Xor:
         result = source0_value ^ source1_value;
         return true;
+      case Semantic::And:
+        result = source0_value & source1_value;
+        return true;
+      case Semantic::Slt:
+        result = static_cast<int64_t>(source0_value) <
+                 static_cast<int64_t>(source1_value);
+        return true;
+      case Semantic::Sltu:
+        result = source0_value < source1_value;
+        return true;
+      case Semantic::Sll:
+        result = source0_value << (source1_value & 0x3f);
+        return true;
+      case Semantic::Srl:
+        result = source0_value >> (source1_value & 0x3f);
+        return true;
+      case Semantic::Sra:
+        result = static_cast<RegVal>(static_cast<int64_t>(source0_value) >>
+                                     (source1_value & 0x3f));
+        return true;
       case Semantic::AddImmediate:
       case Semantic::LoadAddress:
         result = source0_value + static_cast<RegVal>(immediate);
+        return true;
+      case Semantic::SubImmediate:
+        result = source0_value - static_cast<RegVal>(immediate);
+        return true;
+      case Semantic::OrImmediate:
+        result = source0_value | static_cast<RegVal>(immediate);
+        return true;
+      case Semantic::XorImmediate:
+        result = source0_value ^ static_cast<RegVal>(immediate);
+        return true;
+      case Semantic::SltImmediate:
+        result = static_cast<int64_t>(source0_value) < immediate;
+        return true;
+      case Semantic::SltuImmediate:
+        result = source0_value < static_cast<RegVal>(immediate);
+        return true;
+      case Semantic::Lui:
+        result = static_cast<RegVal>(immediate);
+        return true;
+      case Semantic::Auipc:
+        result = static_cast<RegVal>(pc) + static_cast<RegVal>(immediate);
         return true;
       case Semantic::ShiftLeftImmediate:
         result = source0_value << (static_cast<unsigned>(immediate) & 0x3f);
@@ -402,13 +543,80 @@ DVRInstructionRecorder::Uop::evaluate(
       case Semantic::ShiftRightImmediate:
         result = source0_value >> (static_cast<unsigned>(immediate) & 0x3f);
         return true;
+      case Semantic::ShiftRightArithmeticImmediate:
+        result = static_cast<RegVal>(static_cast<int64_t>(source0_value) >>
+                                     (static_cast<unsigned>(immediate) & 0x3f));
+        return true;
       case Semantic::AndImmediate:
         result = source0_value & static_cast<RegVal>(immediate);
         return true;
+      case Semantic::AddWord:
+        result = static_cast<RegVal>(static_cast<int64_t>(
+            static_cast<int32_t>(source0_value + source1_value)));
+        return true;
+      case Semantic::SubWord:
+        result = static_cast<RegVal>(static_cast<int64_t>(
+            static_cast<int32_t>(source0_value - source1_value)));
+        return true;
+      case Semantic::ShiftLeftWord:
+        result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
+            static_cast<uint32_t>(source0_value) << (source1_value & 0x1f))));
+        return true;
+      case Semantic::ShiftRightWord:
+        result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
+            static_cast<uint32_t>(source0_value) >> (source1_value & 0x1f))));
+        return true;
+      case Semantic::ShiftRightArithmeticWord:
+        result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
+            static_cast<int32_t>(source0_value) >> (source1_value & 0x1f))));
+        return true;
+      case Semantic::AddWordImmediate:
+        result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
+            static_cast<uint32_t>(source0_value) + static_cast<int32_t>(immediate))));
+        return true;
+      case Semantic::ShiftLeftWordImmediate:
+        result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
+            static_cast<uint32_t>(source0_value) << (immediate & 0x1f))));
+        return true;
+      case Semantic::ShiftRightWordImmediate:
+        result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
+            static_cast<uint32_t>(source0_value) >> (immediate & 0x1f))));
+        return true;
+      case Semantic::ShiftRightArithmeticWordImmediate:
+        result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
+            static_cast<int32_t>(source0_value) >> (immediate & 0x1f))));
+        return true;
+      case Semantic::BranchEqual:
+      case Semantic::BranchNotEqual:
+      case Semantic::BranchLess:
+      case Semantic::BranchGreaterEqual:
+      case Semantic::BranchLessUnsigned:
+      case Semantic::BranchGreaterEqualUnsigned:
+        return false;
       case Semantic::Unsupported:
         return false;
     }
     return false;
+}
+
+bool
+DVRInstructionRecorder::Uop::predicate(RegVal source0_value,
+                                       RegVal source1_value) const
+{
+    switch (semantic) {
+      case Semantic::BranchEqual: return source0_value == source1_value;
+      case Semantic::BranchNotEqual: return source0_value != source1_value;
+      case Semantic::BranchLess:
+        return static_cast<int64_t>(source0_value) <
+               static_cast<int64_t>(source1_value);
+      case Semantic::BranchGreaterEqual:
+        return static_cast<int64_t>(source0_value) >=
+               static_cast<int64_t>(source1_value);
+      case Semantic::BranchLessUnsigned: return source0_value < source1_value;
+      case Semantic::BranchGreaterEqualUnsigned:
+        return source0_value >= source1_value;
+      default: return source0_value != 0;
+    }
 }
 
 void
@@ -429,6 +637,10 @@ DVRInstructionRecorder::record(const DynInstPtr &inst)
 
     Uop &uop = uops[count++];
     uop.pc = inst->pcState().instAddr();
+    if (inst->isDirectCtrl()) {
+        auto branch_target = inst->branchTarget();
+        uop.target = branch_target ? branch_target->instAddr() : 0;
+    }
     uop.intSources = dvrIntRegisterMask(inst, true);
     uop.intDestinations = dvrIntRegisterMask(inst, false);
     uop.source0 = dvrFirstIntRegister(inst, true, 0);

@@ -154,5 +154,57 @@ VRVectorTaintTracker::reset()
     invalid = 0;
 }
 
+void
+VRVectorRegisterFile::reset()
+{
+    values = {};
+    validMask = {};
+}
+
+void
+VRVectorRegisterFile::seed(
+    unsigned group, const DVRLoopBoundDetector::RegisterSnapshot &regs,
+    unsigned lanes)
+{
+    if (group >= MaxGroups)
+        return;
+    lanes = std::min(lanes, MaxLanes);
+    validMask[group] = lanes == 64 ? ~uint64_t(0) :
+                       ((uint64_t(1) << lanes) - 1);
+    for (unsigned reg = 0; reg < NumRegs; ++reg)
+        for (unsigned lane = 0; lane < lanes; ++lane)
+            values[group][reg][lane] = regs[reg];
+}
+
+RegVal
+VRVectorRegisterFile::read(unsigned group, unsigned reg, unsigned lane) const
+{
+    if (group >= MaxGroups || reg >= NumRegs || lane >= MaxLanes)
+        return 0;
+    return values[group][reg][lane];
+}
+
+void
+VRVectorRegisterFile::write(unsigned group, unsigned reg, unsigned lane,
+                             RegVal value)
+{
+    if (group >= MaxGroups || reg >= NumRegs || lane >= MaxLanes || reg == 0)
+        return;
+    values[group][reg][lane] = value;
+}
+
+void
+VRVectorRegisterFile::invalidate(unsigned group, unsigned lane)
+{
+    if (group < MaxGroups && lane < MaxLanes)
+        validMask[group] &= ~(uint64_t(1) << lane);
+}
+
+uint64_t
+VRVectorRegisterFile::mask(unsigned group) const
+{
+    return group < MaxGroups ? validMask[group] : 0;
+}
+
 } // namespace o3
 } // namespace gem5

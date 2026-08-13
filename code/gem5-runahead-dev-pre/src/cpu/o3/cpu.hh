@@ -919,6 +919,7 @@ class CPU : public BaseCPU
     std::array<DVRVectorRenameTable, 8> vrGroupRAT;
     std::array<unsigned, 8> vrGroupAllocated = {};
     DVRVectorInstructionRegister vrVIR;
+    VRVectorRegisterFile vrVectorRegs;
     DVRLoopBoundDetector::RegisterSnapshot vrInitialRegs = {};
     unsigned vrVectorLanes;
     unsigned vrUnrollLength;
