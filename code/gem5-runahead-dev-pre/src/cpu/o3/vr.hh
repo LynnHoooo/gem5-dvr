@@ -131,6 +131,7 @@ struct VRRound
     Addr triggerPC = 0;
     Addr triggerAddress = 0;
     InstSeqNum triggerSequence = 0;
+    ThreadID tid = 0;
     int64_t stride = 0;
     unsigned lanes = 0;
     unsigned instructions = 0;

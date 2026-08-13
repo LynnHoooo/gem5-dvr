@@ -2871,6 +2871,7 @@ CPU::enterVR(const DynInstPtr &inst, Addr address, int64_t stride)
     vrRound.triggerPC = inst->pcState().instAddr();
     vrRound.triggerAddress = address;
     vrRound.triggerSequence = inst->seqNum;
+    vrRound.tid = inst->threadNumber;
     vrRound.stride = stride;
     const RegVal vl = readMiscRegNoEffect(RiscvISA::MISCREG_VL,
                                           inst->threadNumber);
@@ -2883,11 +2884,13 @@ CPU::enterVR(const DynInstPtr &inst, Addr address, int64_t stride)
     vrRound.sew = 8U << ((vtype >> 3) & 0x7);
     vrRound.lmul = static_cast<int>((vtype & 0x7) < 4 ?
         (vtype & 0x7) : static_cast<int>((vtype & 0x7) - 8));
-    // v0 is a vector predicate register, not a scalar CSR.  The generic
-    // ThreadContext in this gem5 version exposes no predicate accessor, so
-    // the architectural reset value (all active) is used until the native
-    // predicate operand path is added to the RISC-V decoder.
-    vrRound.v0Mask = ~uint64_t(0);
+    const auto v0Reg = thread[inst->threadNumber]->getTC()->readVecPredRegFlat(0);
+    vrRound.v0Mask = 0;
+    for (unsigned lane = 0; lane < 64; ++lane)
+        if (lane < 256 && v0Reg[lane])
+            vrRound.v0Mask |= uint64_t(1) << lane;
+    if (vrRound.v0Mask == 0)
+        vrRound.v0Mask = ~uint64_t(0);
     vrRound.lanes = std::min(vrRound.vl, 64U);
     vrRound.instructions = 0;
     vrRound.terminator = vrStrideDetector.terminator(vrRound.triggerPC);
@@ -3344,6 +3347,11 @@ CPU::exitVR()
     if (!inVR && !vrDraining)
         return;
     inVR = false;
+    // A completed helper has consumed all active elements.  Preserve a
+    // restart point only while a memory response is still outstanding.
+    if (vrOutstandingResponses == 0)
+        setMiscRegNoEffect(RiscvISA::MISCREG_VSTART, 0,
+                           vrRound.tid);
     vrDraining = true;
     vrRound.active = false;
     vrRound.draining = true;
@@ -3376,6 +3384,7 @@ CPU::finalizeVRDrain()
         !vrPrefetchQueue.empty())
         return;
     vrDraining = false;
+    setMiscRegNoEffect(RiscvISA::MISCREG_VSTART, 0, vrRound.tid);
     vrRound = VRRound{};
     vrTaint.reset();
     vrChain.reset();
