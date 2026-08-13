@@ -65,6 +65,8 @@ ir="$(read_stat "$normal" system.cpu.dvrNDMIRCaptures)"
 ilr="$(read_stat "$normal" system.cpu.dvrNDMILRCaptures)"
 lcr="$(read_stat "$normal" system.cpu.dvrNDMLCRCaptures)"
 outer_invocations="$(read_stat "$normal" system.cpu.dvrNDMOuterInvocations)"
+flatten_batches="$(read_stat "$normal" system.cpu.dvrNestedFlattenBatches)"
+outer_instances="$(read_stat "$normal" system.cpu.dvrNestedOuterInstances)"
 helper_fetch="$(read_stat "$normal" system.cpu.dvrHelperFetchCycles)"
 require_nonzero ndm_attempts "$attempts"
 require_nonzero ndm_outer_found "$outer"
@@ -73,15 +75,21 @@ require_nonzero ndm_ir_captures "$ir"
 require_nonzero ndm_ilr_captures "$ilr"
 require_nonzero ndm_lcr_captures "$lcr"
 require_nonzero ndm_outer_invocations "$outer_invocations"
+require_nonzero ndm_flatten_batches "$flatten_batches"
+require_nonzero flattened_outer_instances "$outer_instances"
 require_nonzero helper_fetch_cycles "$helper_fetch"
 if [[ -z "$fallbacks" || "$fallbacks" -ne 0 ]]; then
     printf 'error: expected successful NDM fallbacks=0, got %s\n' \
         "${fallbacks:-<missing>}" >&2
     exit 1
 fi
-if (( outer_invocations < 2 )); then
-    printf 'error: expected at least two NDM outer invocations, got %s\n' \
-        "$outer_invocations" >&2
+# The NDM plan may be materialized from one dynamic child.  In that case
+# dvrNDMOuterInvocations is one while the flattened plan still contains
+# multiple outer instances; validate the latter instead of requiring a
+# second child to arrive before the timeout.
+if (( outer_instances < 2 )); then
+    printf 'error: expected at least two flattened outer instances, got %s\n' \
+        "$outer_instances" >&2
     exit 1
 fi
 
@@ -101,7 +109,7 @@ timeout_fallbacks="$(read_stat "$timeout" system.cpu.dvrNDMFallbacks)"
 require_nonzero ndm_timeouts "$timeouts"
 require_nonzero ndm_timeout_fallbacks "$timeout_fallbacks"
 
-printf 'DVR_STAGE14_NDM_CONTROL_PASSED attempts=%s outer=%s fallbacks=%s helpers=%s ir=%s ilr=%s lcr=%s outer_invocations=%s helper_fetch=%s disabled_attempts=%s timeouts=%s timeout_fallbacks=%s\n' \
+printf 'DVR_STAGE14_NDM_CONTROL_PASSED attempts=%s outer=%s fallbacks=%s helpers=%s ir=%s ilr=%s lcr=%s outer_invocations=%s flatten_batches=%s outer_instances=%s helper_fetch=%s disabled_attempts=%s timeouts=%s timeout_fallbacks=%s\n' \
     "$attempts" "$outer" "$fallbacks" "$helpers" "$ir" "$ilr" \
-    "$lcr" "$outer_invocations" "$helper_fetch" \
-    "$disabled_attempts" "$timeouts" "$timeout_fallbacks"
+    "$lcr" "$outer_invocations" "$flatten_batches" "$outer_instances" \
+    "$helper_fetch" "$disabled_attempts" "$timeouts" "$timeout_fallbacks"
