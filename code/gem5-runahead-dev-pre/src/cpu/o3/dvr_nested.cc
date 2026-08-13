@@ -255,10 +255,11 @@ DVRNestedDiscoveryMode::recordOuterInvocation(
         invocation.reconvergencePC = control.reconvergencePC;
         ++invocationCount;
     }
-    // NDM needs at least two distinct outer invocations before flattening;
-    // the CPU-side invocation batch remains bounded by the same eight-entry
-    // hardware structure.
-    if (invocationCount >= 2)
+    // The confirmed outer-stride FIFO already supplies the outer invocation
+    // plan.  One independently bounded child is therefore sufficient to
+    // consume and flatten one plan entry; waiting for a second child lets
+    // short/irregular BFS generations time out with count == 1.
+    if (invocationCount >= 1)
         currentState = State::Vectorizing;
     return true;
 }

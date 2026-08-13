@@ -167,6 +167,10 @@ def parse_args():
         choices=("vr", "offload", "discovery", "full", "nested"),
         default="nested",
     )
+    parser.add_argument("--dvr-pc-min", type=lambda value: int(value, 0),
+                        default=0)
+    parser.add_argument("--dvr-pc-max", type=lambda value: int(value, 0),
+                        default=0)
     parser.add_argument("--dvr-helper-max-uops", type=int, default=200)
     parser.add_argument(
         "--dvr-vector-chunks",
@@ -177,6 +181,10 @@ def parse_args():
         "--dvr-unlimited-vector-fu",
         action="store_true",
         help="Run vector chunks without shared vector FU constraints",
+    )
+    parser.add_argument(
+        "--dvr-decoupled-issue", action="store_true",
+        help="Give the DVR helper an independent issue budget",
     )
     parser.add_argument(
         "--dvr-vector-element-bits",
@@ -236,6 +244,7 @@ def main():
         numPhysIntRegs=256, numPhysFloatRegs=256, numPhysVecRegs=128,
         branchPred=TAGE_SC_L_8KB(), fuPool=DVRFUPool(),
         enableDVR=args.dvr, dvrMode=args.dvr_mode,
+        dvrPCMin=args.dvr_pc_min, dvrPCMax=args.dvr_pc_max,
         enablePRE=args.pre,
         enablePREBranch=args.pre_branch,
         enablePREEarlyRecycle=args.pre_early_recycle,
@@ -250,6 +259,7 @@ def main():
         dvrHelperMaxUops=args.dvr_helper_max_uops,
         dvrVectorChunkModel=args.dvr_vector_chunks,
         dvrVectorUnlimitedFU=args.dvr_unlimited_vector_fu,
+        dvrDecoupledIssue=args.dvr_decoupled_issue,
         dvrVectorElementBits=args.dvr_vector_element_bits,
         dvrEnableDependentPrefetch=not args.dvr_no_dependent_prefetch,
         dvrAllowBoundedFallback=not args.dvr_no_bounded_fallback,

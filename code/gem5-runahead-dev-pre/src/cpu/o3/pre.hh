@@ -34,6 +34,11 @@ class CPU;
 class DVRStrideDetector
 {
   public:
+    // The paper uses a 2-bit saturating confidence counter (0..3).  A
+    // counter value of two is enough to admit a stable stride; three is the
+    // saturated state, not an extra confidence width.
+    static constexpr uint8_t CandidateConfidence = 2;
+    static constexpr uint8_t MaxConfidence = 3;
     struct Candidate
     {
         Addr pc;
@@ -54,7 +59,10 @@ class DVRStrideDetector
         int64_t stride = 0;
         uint8_t confidence = 0;
         uint64_t age = 0;
-        bool discoverySeen = false;
+        // A candidate is emitted once when confidence enters the admitted
+        // range.  It is re-armed after confidence falls below the threshold
+        // or after a Discovery generation ends.
+        bool candidatePending = false;
     };
 
     // Discovery starts at dispatch, therefore these one-bit RPT updates are
@@ -66,8 +74,27 @@ class DVRStrideDetector
     };
 
     std::vector<Entry> entries;
+    // One bit per RPT entry, matching the paper's global innermost-detection
+    // register.  It is separate from Entry so resetting Discovery state does
+    // not alter stride training or confidence.
+    std::vector<uint64_t> discoveryBits;
     std::vector<DiscoverySeenWrite> discoverySeenWrites;
     uint64_t timestamp = 0;
+
+    bool discoverySeen(unsigned entry) const
+    {
+        return (discoveryBits[entry / 64] &
+                (uint64_t(1) << (entry % 64))) != 0;
+    }
+
+    void setDiscoverySeen(unsigned entry, bool value)
+    {
+        const uint64_t bit = uint64_t(1) << (entry % 64);
+        if (value)
+            discoveryBits[entry / 64] |= bit;
+        else
+            discoveryBits[entry / 64] &= ~bit;
+    }
 
   public:
     explicit DVRStrideDetector(unsigned num_entries);
@@ -135,7 +162,26 @@ class DVRDiscoveryController
     Result observeCommit(Addr pc, InstSeqNum sequence);
     bool rollback(InstSeqNum squash_sequence);
     bool isDiscovering() const { return state == State::Discovering; }
+    // Discovery's observation window closes when the trigger is dispatched
+    // for the next iteration.  Completion is still committed in order, but
+    // younger speculative loads must not participate in innermost detection.
+    bool stopPending() const
+    {
+        return state == State::Discovering && stopSequence != 0;
+    }
+    // Commit-side Discovery body membership is sequence based.  A repeated
+    // trigger may already be dispatched while older body instructions are
+    // still waiting to commit; those older instructions remain part of the
+    // generation, while the terminating trigger itself does not.
+    bool inDiscoveryBody(InstSeqNum sequence) const
+    {
+        return state == State::Discovering &&
+            sequence > triggerSequence &&
+            (stopSequence == 0 || sequence < stopSequence);
+    }
     InstSeqNum triggerSeq() const { return triggerSequence; }
+    Addr currentTriggerPC() const { return triggerPC; }
+    int64_t currentStride() const { return triggerStride; }
     void reset();
 };
 
@@ -206,6 +252,7 @@ class DVRInstructionRecorder
         enum class Semantic : uint8_t
         {
             Unsupported,
+            Move,
             Add,
             Sub,
             And,
@@ -216,6 +263,10 @@ class DVRInstructionRecorder
             ShiftRightArithmetic,
             Multiply,
             MultiplyWord,
+            Remainder,
+            RemainderUnsigned,
+            RemainderWord,
+            RemainderUnsignedWord,
             AddWord,
             SubWord,
             AddImmediate,

@@ -34,15 +34,11 @@ main()
     auto outer = ndm.observeOuterLoad(0x200, 0x8080);
     assert(outer.event == DVRNestedDiscoveryMode::Event::OuterAccepted);
     assert(ndm.recordOuterInvocation(0xa000, 16, 0x100, 0x130, 8));
-    assert(!ndm.readyToVectorize());
-    assert(ndm.recordOuterInvocation(0xb000, 12, 0x100, 0x130, 8));
     assert(ndm.readyToVectorize());
-    assert(ndm.outerInvocationCount() == 2);
+    assert(ndm.outerInvocationCount() == 1);
     assert(ndm.outerInvocations()[0].outerBase == 0x8000);
-    assert(ndm.outerInvocations()[1].outerBase == 0x8040);
     assert(ndm.outerInvocations()[0].innerStart == 0xa000);
     assert(ndm.outerInvocations()[0].innerLanes == 16);
-    assert(ndm.outerInvocations()[1].innerLanes == 12);
     ndm.finishVectorization();
     assert(!ndm.active());
 
