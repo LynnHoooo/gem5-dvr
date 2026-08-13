@@ -161,10 +161,31 @@ DVRNestedDiscoveryMode::Result
 DVRNestedDiscoveryMode::start(
     Addr inner_load_pc, int64_t loop_increment, unsigned inner_lanes)
 {
-    if (active() || inner_load_pc == 0 || inner_lanes == 0 ||
+    if (inner_load_pc == 0 || inner_lanes == 0 ||
         inner_lanes >= laneThreshold) {
         return snapshot(Event::None);
     }
+
+    // Preserve the NDM outer plan while the next invocation of the same
+    // inner loop is discovered. Resetting on every start leaves batches at
+    // outerInvocationCount()==1.
+    if (active() && currentState == State::Vectorizing) {
+        if (inner_load_pc != innerLoadPC) {
+            reset();
+        } else {
+            committedInstructions = 0;
+            innerLoadPC = inner_load_pc;
+            increment = loop_increment;
+            innerLanes = inner_lanes;
+            control = {};
+            control.inductionIncrement = loop_increment;
+            ++counters.attempts;
+            return snapshot(Event::Started);
+        }
+    }
+
+    if (active())
+        return snapshot(Event::None);
 
     reset();
     currentState = State::SeekingOuter;

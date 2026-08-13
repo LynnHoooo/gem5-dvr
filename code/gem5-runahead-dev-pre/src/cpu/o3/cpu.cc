@@ -2508,8 +2508,10 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 // invocation with its own start address and bound.  Once NDM
                 // has found the outer stride, pair that exact data with the
                 // next committed outer base from its FIFO.
-                if (dvrNestedDiscoveryMode.state() ==
-                        DVRNestedDiscoveryMode::State::OuterFound &&
+                if ((dvrNestedDiscoveryMode.state() ==
+                         DVRNestedDiscoveryMode::State::OuterFound ||
+                     dvrNestedDiscoveryMode.state() ==
+                         DVRNestedDiscoveryMode::State::Vectorizing) &&
                     inference.matched && inference.lanes != 0 &&
                     dvrCurrentTriggerAddress != 0 &&
                     committed_flr != 0 &&
@@ -2698,6 +2700,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 const bool ndm_capture_valid =
                     dvrMode == "nested" &&
                     dvrNestedDiscoveryMode.readyToVectorize() &&
+                    dvrNestedDiscoveryMode.outerInvocationCount() >= 2 &&
                     inference.matched && inference.lanes != 0 &&
                     committed_flr != 0 &&
                     dvrInstructionRecorder.size() > 1 &&
@@ -3148,8 +3151,10 @@ CPU::completeDVRNestedContext(
     // old prototype copied the initiating short-loop bound here, which paired
     // one invocation's bound with another invocation's base.
     const unsigned ndm_invocation_lanes = inference.matched ? inference.lanes : 0;
-    if (dvrNestedDiscoveryMode.state() ==
-            DVRNestedDiscoveryMode::State::OuterFound &&
+    if ((dvrNestedDiscoveryMode.state() ==
+             DVRNestedDiscoveryMode::State::OuterFound ||
+         dvrNestedDiscoveryMode.state() ==
+             DVRNestedDiscoveryMode::State::Vectorizing) &&
         ndm_invocation_lanes != 0 && dvrNestedContext.taint.flr() != 0 &&
         dvrNestedDiscoveryMode.recordOuterInvocation(
             dvrNestedContext.triggerAddress, ndm_invocation_lanes,
@@ -3237,7 +3242,7 @@ CPU::completeDVRNestedContext(
         // completion, leaving every generation stuck at count == 1.
         const bool ndm_plan_ready =
             dvrNestedDiscoveryMode.readyToVectorize() &&
-            dvrNestedDiscoveryMode.outerInvocationCount() != 0;
+            dvrNestedDiscoveryMode.outerInvocationCount() >= 2;
         const bool ndm_allows_flatten =
             !dvrNestedDiscoveryMode.active() ||
             ndm_plan_ready;
