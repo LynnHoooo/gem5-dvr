@@ -828,6 +828,9 @@ class CPU : public BaseCPU
         statistics::Scalar dvrSIMTNotTakenDependentLoads;
         statistics::Scalar dvrSIMTTakenPathTerminations;
         statistics::Scalar dvrSIMTNotTakenPathTerminations;
+        statistics::Scalar dvrSIMTFLRTerminations;
+        statistics::Scalar dvrSIMTStridePCTerminations;
+        statistics::Scalar dvrSIMTTimeoutTerminations;
         statistics::Scalar dvrSIMTStackOverflowDroppedLanes;
         statistics::Scalar dvrVIRUnsupportedControlFlow;
         statistics::Scalar dvrVIRNormalTerminatedLanes;
@@ -1388,6 +1391,11 @@ class CPU : public BaseCPU
     struct DVRReplayTemplate
     {
         Addr triggerPC = 0;
+        // The stride PC is the loop-iteration boundary used when a
+        // divergent path reaches the next iteration before the FLR.
+        Addr stridePC = 0;
+        // The final dependent load is the ordinary DVR termination point.
+        Addr finalLoadPC = 0;
         // Complete captured stream consumed by the persistent VIR.  The
         // scalar replay prefix ends at the final dependent load so post-FLR
         // loop-control state cannot invalidate a valid address chain.
@@ -1696,6 +1704,11 @@ class CPU : public BaseCPU
             std::unordered_set<uint64_t> renamedDestinations;
             struct Frame
             {
+                // Snapshot of the selected path at the split.  Keeping this
+                // explicitly makes nested/partial-lane recovery auditable;
+                // the deferred path follows below.
+                Addr currentPC = 0;
+                std::array<uint64_t, 2> currentMask = {};
                 Addr reconvergencePC = 0;
                 Addr pc = 0;
                 std::array<uint64_t, 2> mask = {};
@@ -1705,6 +1718,12 @@ class CPU : public BaseCPU
             static constexpr unsigned Entries = 8;
             std::array<Frame, Entries> stack = {};
             unsigned depth = 0;
+            // Current SIMT group state.  Lane contexts remain the source of
+            // truth for values, while this state records the group PC/mask
+            // that the scheduler is currently issuing.
+            Addr currentPC = 0;
+            std::array<uint64_t, 2> currentMask = {};
+            bool currentValid = false;
         };
         struct ReplayLaneContext
         {
@@ -1724,6 +1743,8 @@ class CPU : public BaseCPU
             unsigned lane = 0;
             ThreadID tid = 0;
             Addr triggerPC = 0;
+            Addr stridePC = 0;
+            Addr finalLoadPC = 0;
             unsigned uopIndex = 1;
             Addr lanePC = 0;
             bool reconvergenceBlocked = false;
@@ -1732,6 +1753,13 @@ class CPU : public BaseCPU
             // so dependent loads can be attributed to both paths.
             uint8_t simtPath = 0;
             bool simtDivergent = false;
+            enum class TerminationReason : uint8_t {
+                None,
+                FLR,
+                StridePC,
+                Timeout,
+                External
+            } termination = TerminationReason::None;
             unsigned helperUops = 0;
             bool nested = false;
             bool active = true;
@@ -1995,6 +2023,9 @@ class CPU : public BaseCPU
             lane_context.lane = sender.lane;
             lane_context.tid = sender.tid;
             lane_context.triggerPC = sender.replay->triggerPC;
+            lane_context.stridePC = sender.replay->stridePC != 0 ?
+                sender.replay->stridePC : sender.replay->triggerPC;
+            lane_context.finalLoadPC = sender.replay->finalLoadPC;
             lane_context.lanePC = sender.replay->count > 1 ?
                 sender.replay->uops[1].pc : 0;
             lane_context.nested = sender.nested;

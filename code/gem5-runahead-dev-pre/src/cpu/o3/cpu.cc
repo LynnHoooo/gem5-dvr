@@ -1117,6 +1117,12 @@ CPU::CPUStats::CPUStats(CPU *cpu)
       ADD_STAT(dvrSIMTNotTakenPathTerminations,
                statistics::units::Count::get(),
                "Not-taken-path lanes terminated during helper replay"),
+      ADD_STAT(dvrSIMTFLRTerminations, statistics::units::Count::get(),
+               "Helper lanes terminated at the final dependent load (FLR)"),
+      ADD_STAT(dvrSIMTStridePCTerminations, statistics::units::Count::get(),
+               "Divergent helper lanes terminated at the next stride PC"),
+      ADD_STAT(dvrSIMTTimeoutTerminations, statistics::units::Count::get(),
+               "Helper lanes terminated at the 200-uop timeout"),
       ADD_STAT(dvrSIMTStackOverflowDroppedLanes,
                statistics::units::Count::get(),
                "Deferred lanes dropped when the SIMT stack was full"),
@@ -3079,6 +3085,7 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
 
     auto replay = std::make_shared<DVRReplayTemplate>();
     replay->triggerPC = pc;
+    replay->stridePC = pc;
     /*
      * Keep the complete captured stream in the replay template.  The FLR is
      * still the discovery marker and the first dependent target, but a
@@ -3128,6 +3135,8 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
         // on representable register IDs and unsupported semantics below.
         for (unsigned index = 0; index < replay->count; ++index)
             replay->uops[index] = dvrInstructionRecorder[index];
+        if (replay->scalarCount > 1)
+            replay->finalLoadPC = replay->uops[replay->scalarCount - 1].pc;
         for (unsigned index = 0; index < replay->scalarCount; ++index) {
             if (index == 0)
                 continue;
@@ -3403,6 +3412,7 @@ CPU::launchDVRNestedPrefetches(
 {
     auto replay = std::make_shared<DVRReplayTemplate>();
     replay->triggerPC = dvrNestedContext.triggerPC;
+    replay->stridePC = dvrNestedContext.triggerPC;
     // Keep branches after FLR in the persistent template for the same
     // divergent-path rule used by ordinary DVR replay.
     replay->count = dvrNestedContext.recorder.size();
@@ -3436,6 +3446,8 @@ CPU::launchDVRNestedPrefetches(
         }
         for (unsigned index = 0; index < replay->count; ++index)
             replay->uops[index] = dvrNestedContext.recorder[index];
+        if (replay->scalarCount > 1)
+            replay->finalLoadPC = replay->uops[replay->scalarCount - 1].pc;
         for (unsigned index = 0; index < replay->scalarCount; ++index) {
             if (index == 0)
                 continue;
@@ -3788,6 +3800,50 @@ CPU::issueDVRReplayLanes(unsigned slots)
         };
         return ready(uop.source0) && ready(uop.source1);
     };
+    const auto refreshCurrentGroup =
+        [&](const std::shared_ptr<CPU::DVRHelperThread::ReplayReconvergenceState>
+                &state) {
+            if (!state)
+                return;
+            state->currentPC = 0;
+            state->currentMask = {};
+            state->currentValid = false;
+            for (const auto &lane : dvrHelperThread.replayLanes) {
+                if (!lane.active || lane.reconvergence != state ||
+                    lane.reconvergenceBlocked || lane.lanePC == 0)
+                    continue;
+                if (state->currentPC == 0)
+                    state->currentPC = lane.lanePC;
+                if (lane.lanePC != state->currentPC)
+                    continue;
+                state->currentMask[lane.lane / 64] |=
+                    uint64_t(1) << (lane.lane % 64);
+            }
+            state->currentValid = state->currentPC != 0;
+        };
+    const auto retireTerminatedLanes = [&]() {
+        for (auto it = dvrHelperThread.replayLanes.begin();
+             it != dvrHelperThread.replayLanes.end();) {
+            if (it->active) {
+                ++it;
+                continue;
+            }
+            switch (it->termination) {
+              case Lane::TerminationReason::FLR:
+                ++cpuStats.dvrSIMTFLRTerminations;
+                break;
+              case Lane::TerminationReason::StridePC:
+                ++cpuStats.dvrSIMTStridePCTerminations;
+                break;
+              case Lane::TerminationReason::Timeout:
+                ++cpuStats.dvrSIMTTimeoutTerminations;
+                break;
+              default:
+                break;
+            }
+            it = dvrHelperThread.replayLanes.erase(it);
+        }
+    };
     // Reconvergence is group state.  At the termination PC, pop one frame
     // and reactivate exactly the lanes named by its 128-bit mask.
     std::shared_ptr<CPU::DVRHelperThread::ReplayReconvergenceState>
@@ -3830,6 +3886,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
         }
     }
     if (reconvergence) {
+        refreshCurrentGroup(reconvergence);
         while (reconvergence->depth != 0) {
             const auto frame = reconvergence->stack[
                 reconvergence->depth - 1];
@@ -3873,6 +3930,9 @@ CPU::issueDVRReplayLanes(unsigned slots)
                     lane.reconvergenceBlocked = true;
                 }
             }
+            reconvergence->currentPC = frame.pc;
+            reconvergence->currentMask = frame.mask;
+            reconvergence->currentValid = frame.pc != 0;
             ++cpuStats.dvrReconvergences;
             if (frame.alternatePath)
                 ++cpuStats.dvrReconvergenceResumeSuccesses;
@@ -3882,9 +3942,13 @@ CPU::issueDVRReplayLanes(unsigned slots)
     std::vector<Lane *> group;
     for (auto &lane : dvrHelperThread.replayLanes) {
         if (!lane.active || !lane.program ||
-            lane.uopIndex >= lane.program->count ||
-            lane.helperUops >= dvrHelperMaxUops)
+            lane.uopIndex >= lane.program->count)
             continue;
+        if (lane.helperUops >= dvrHelperMaxUops) {
+            lane.active = false;
+            lane.termination = Lane::TerminationReason::Timeout;
+            continue;
+        }
         if (lane.reconvergenceBlocked)
             continue;
         // A VIR issue group and its SIMT stack are one helper-generation
@@ -3952,8 +4016,10 @@ CPU::issueDVRReplayLanes(unsigned slots)
         if (group.size() == DVRHelperThread::LanesPerVIRCopy)
             break;
     }
-    if (group.empty())
+    if (group.empty()) {
+        retireTerminatedLanes();
         return 0;
+    }
 
     const auto &uop = seed->program->uops[seed->uopIndex];
     const Addr branch_reconvergence = uop.reconvergencePC;
@@ -3971,6 +4037,23 @@ CPU::issueDVRReplayLanes(unsigned slots)
     if (uop.conditional) {
         // Branch grouping is over the whole helper generation, not merely
         // the eight-lane AVX issue chunk selected for this cycle.
+        unsigned active_branch_lanes = 0;
+        bool all_branch_lanes_ready = true;
+        for (const auto &candidate : dvrHelperThread.replayLanes) {
+            if (!candidate.active || candidate.reconvergenceBlocked ||
+                candidate.reconvergence != reconvergence ||
+                candidate.program != seed->program ||
+                candidate.uopIndex != seed->uopIndex ||
+                candidate.lanePC != uop.pc)
+                continue;
+            ++active_branch_lanes;
+            all_branch_lanes_ready &= laneSourcesReady(candidate);
+        }
+        // SIMT branch grouping is atomic over the active group.  Waiting for
+        // all operands prevents a partial ready mask from being committed as
+        // if it represented the whole vector.
+        if (active_branch_lanes == 0 || !all_branch_lanes_ready)
+            return 0;
         for (auto &candidate : dvrHelperThread.replayLanes) {
             if (!candidate.active || candidate.reconvergenceBlocked ||
                 candidate.reconvergence != reconvergence ||
@@ -3990,13 +4073,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
                 (lane->helperRegs ?
                  lane->helperRegs->read(lane_uop.source1, lane->lane) :
                  lane->regs[lane_uop.source1]) : 0;
-            const bool source0_ready = lane_uop.source0 < 0 ||
-                lane_uop.source0 >= DVRLoopBoundDetector::MaxArchitecturalIntRegs ||
-                lane->helperRegs->readyAt(lane_uop.source0, lane->lane) <= curTick();
-            const bool source1_ready = lane_uop.source1 < 0 ||
-                lane_uop.source1 >= DVRLoopBoundDetector::MaxArchitecturalIntRegs ||
-                lane->helperRegs->readyAt(lane_uop.source1, lane->lane) <= curTick();
-            if (!source0_ready || !source1_ready)
+            if (!laneSourcesReady(*lane))
                 continue;
             bool taken = lane_uop.branchTaken;
             const bool evaluated = !lane_uop.tainted ||
@@ -4029,7 +4106,19 @@ CPU::issueDVRReplayLanes(unsigned slots)
             if (lane == seed)
                 selected_branch_group = path;
         }
-        branch_outcomes_complete = branch_next_valid[seed->lane];
+        unsigned evaluated_branch_lanes = 0;
+        for (const auto &candidate : dvrHelperThread.replayLanes) {
+            if (!candidate.active || candidate.reconvergenceBlocked ||
+                candidate.reconvergence != reconvergence ||
+                candidate.program != seed->program ||
+                candidate.uopIndex != seed->uopIndex ||
+                candidate.lanePC != uop.pc)
+                continue;
+            if (branch_next_valid[candidate.lane])
+                ++evaluated_branch_lanes;
+        }
+        branch_outcomes_complete = evaluated_branch_lanes ==
+            active_branch_lanes;
         const unsigned taken_lanes =
             __builtin_popcountll(branch_taken_mask[0]) +
             __builtin_popcountll(branch_taken_mask[1]);
@@ -4106,6 +4195,50 @@ CPU::issueDVRReplayLanes(unsigned slots)
         return 0;
     }
 
+    // Commit next PCs for every active lane in the complete branch group,
+    // rather than only for the eight lanes selected for this VIR copy.
+    if (uop.conditional && branch_outcomes_complete) {
+        for (auto &candidate : dvrHelperThread.replayLanes) {
+            if (!candidate.active || candidate.reconvergenceBlocked ||
+                candidate.reconvergence != reconvergence ||
+                candidate.program != seed->program ||
+                candidate.uopIndex != seed->uopIndex ||
+                candidate.lanePC != uop.pc ||
+                !branch_next_valid[candidate.lane])
+                continue;
+            const Addr next_pc = branch_next_pc[candidate.lane];
+            candidate.lanePC = next_pc;
+            ++candidate.helperUops;
+            if (next_pc == 0) {
+                candidate.active = false;
+                candidate.termination =
+                    Lane::TerminationReason::External;
+                continue;
+            }
+            if (next_pc == candidate.stridePC &&
+                (candidate.simtDivergent || branch_groups > 1)) {
+                candidate.active = false;
+                candidate.termination =
+                    Lane::TerminationReason::StridePC;
+                continue;
+            }
+            const unsigned next_index = findPC(candidate.program, next_pc);
+            if (next_index == std::numeric_limits<unsigned>::max()) {
+                candidate.active = false;
+                candidate.termination =
+                    Lane::TerminationReason::External;
+                ++cpuStats.dvrVIRExternalPathLanes;
+                continue;
+            }
+            candidate.uopIndex = next_index;
+            if (candidate.helperUops >= dvrHelperMaxUops) {
+                candidate.active = false;
+                candidate.termination =
+                    Lane::TerminationReason::Timeout;
+            }
+        }
+    }
+
     // Commit the SIMT split only after this branch instruction has actually
     // been admitted to the VIR. Deferred groups are stored in reverse order,
     // making the stack head the next path resumed at the common termination
@@ -4126,6 +4259,8 @@ CPU::issueDVRReplayLanes(unsigned slots)
                 break;
             }
             auto &frame = reconvergence->stack[reconvergence->depth++];
+            frame.currentPC = branch_group_pc[selected_branch_group];
+            frame.currentMask = branch_masks[selected_branch_group];
             frame.reconvergencePC = branch_reconvergence;
             frame.pc = branch_group_pc[path];
             frame.mask = branch_masks[path];
@@ -4146,6 +4281,10 @@ CPU::issueDVRReplayLanes(unsigned slots)
                     lane.reconvergenceBlocked = true;
             }
         }
+        // Deferred lanes are blocked by the frames above; rebuild the
+        // explicit current mask so lanes terminated at a stride PC or an
+        // external target are not retained in the selected group.
+        refreshCurrentGroup(reconvergence);
         ++cpuStats.dvrDivergentBranches;
     }
     if (uop.conditional && branch_outcomes_complete && branch_groups != 0) {
@@ -4300,38 +4439,16 @@ CPU::issueDVRReplayLanes(unsigned slots)
         RegVal result = 0;
         bool valid = true;
         if (lane_uop.conditional) {
-            const Addr next_pc = branch_next_pc[lane->lane];
-            const bool have_grouped_branch = branch_next_valid[lane->lane];
-            if (!have_grouped_branch)
-                valid = false;
-            if (!valid) {
-                lane->active = false;
-                ++cpuStats.dvrVIRSourceValueSemanticFailures;
-                continue;
-            }
-            if (next_pc == 0 || next_pc == lane->triggerPC) {
-                lane->active = false;
-                ++cpuStats.dvrVIRNormalTerminatedLanes;
-                ++lane->helperUops;
-                continue;
-            }
-            const unsigned next_index = findPC(lane->program, next_pc);
-            if (next_index == std::numeric_limits<unsigned>::max()) {
-                lane->active = false;
-                ++cpuStats.dvrVIRExternalPathLanes;
-                ++lane->helperUops;
-                continue;
-            }
-            lane->lanePC = next_pc;
-            lane->uopIndex = next_index;
-            ++lane->helperUops;
-            if (lane->helperUops >= dvrHelperMaxUops)
-                lane->active = false;
+            // The full branch group was committed after FU admission above.
+            // Its helper-uop budget was charged once for every lane during
+            // the group-wide commit; charging the selected VIR copy again
+            // would make the budget depend on the eight-lane issue grouping.
             continue;
         }
         valid = lane_uop.evaluate(source0, source1, result);
         if (!valid) {
             lane->active = false;
+            lane->termination = Lane::TerminationReason::External;
             ++cpuStats.dvrVIRSourceValueSemanticFailures;
             continue;
         }
@@ -4350,8 +4467,12 @@ CPU::issueDVRReplayLanes(unsigned slots)
                 lane->program->uops[lane->uopIndex + 1].pc : 0;
             lane->uopIndex = findPC(lane->program, lane->lanePC);
             ++lane->helperUops;
-            if (lane->lanePC == 0 || lane->helperUops >= dvrHelperMaxUops)
+            if (lane->lanePC == 0 || lane->helperUops >= dvrHelperMaxUops) {
                 lane->active = false;
+                lane->termination = lane->helperUops >= dvrHelperMaxUops ?
+                    Lane::TerminationReason::Timeout :
+                    Lane::TerminationReason::External;
+            }
             continue;
         }
         if (is_load && lane_uop.tainted) {
@@ -4364,6 +4485,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
             }
             if (result == 0 || result >= (Addr(1) << 47)) {
                 lane->active = false;
+                lane->termination = Lane::TerminationReason::External;
                 ++cpuStats.dvrPredicateMisses;
                 continue;
             }
@@ -4443,15 +4565,18 @@ CPU::issueDVRReplayLanes(unsigned slots)
             }
             if (!relation_match) {
                 lane->active = false;
+                lane->termination = Lane::TerminationReason::External;
                 ++cpuStats.dvrPredicateMisses;
                 continue;
             }
             if (!dvrEnableDependentPrefetch) {
                 lane->active = false;
+                lane->termination = Lane::TerminationReason::FLR;
                 continue;
             }
             if (result < 4096 || result >= (Addr(1) << 47)) {
                 lane->active = false;
+                lane->termination = Lane::TerminationReason::External;
                 ++cpuStats.dvrPredicateMisses;
                 continue;
             }
@@ -4518,6 +4643,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
                 lane_uop.alternateResumePC != 0)
                 ++cpuStats.dvrReconvergenceResumeSuccesses;
             lane->active = false;
+            lane->termination = Lane::TerminationReason::FLR;
             continue;
         }
 
@@ -4545,9 +4671,12 @@ CPU::issueDVRReplayLanes(unsigned slots)
             (lane->uopIndex + 1 < lane->program->count ?
              lane->program->uops[lane->uopIndex + 1].pc : 0);
         }
-        if (lane->lanePC == 0 || lane->helperUops >= dvrHelperMaxUops)
+        if (lane->lanePC == 0 || lane->helperUops >= dvrHelperMaxUops) {
             lane->active = false;
-        else
+            lane->termination = lane->helperUops >= dvrHelperMaxUops ?
+                Lane::TerminationReason::Timeout :
+                Lane::TerminationReason::External;
+        } else
             lane->uopIndex = findPC(lane->program, lane->lanePC);
     }
     issued_dyn_uop.completeCycle = ready_tick;
@@ -4564,13 +4693,8 @@ CPU::issueDVRReplayLanes(unsigned slots)
         else if (lane->simtPath == 2)
             ++cpuStats.dvrSIMTNotTakenPathTerminations;
     }
-    for (auto it = dvrHelperThread.replayLanes.begin();
-         it != dvrHelperThread.replayLanes.end();) {
-        if (!it->active)
-            it = dvrHelperThread.replayLanes.erase(it);
-        else
-            ++it;
-    }
+    retireTerminatedLanes();
+    refreshCurrentGroup(reconvergence);
     return 1;
 }
 

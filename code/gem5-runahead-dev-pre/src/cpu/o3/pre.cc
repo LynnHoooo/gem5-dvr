@@ -2008,6 +2008,24 @@ DVRVectorInstructionRegister::resumeSourceLanes(
         }
 
         const auto &op = source[op_index];
+        if (op.conditional) {
+            // Branch outcomes are a group-level operation.  Do not split a
+            // ready subset while another active lane at the same PC is still
+            // waiting for its source response.
+            unsigned active_branch_lanes = 0;
+            bool all_branch_lanes_ready = true;
+            for (unsigned candidate_lane = 0;
+                 candidate_lane < continuationLanes; ++candidate_lane) {
+                if (!laneActive[candidate_lane] ||
+                    laneBlocked[candidate_lane] ||
+                    lanePC[candidate_lane] != group_pc)
+                    continue;
+                ++active_branch_lanes;
+                all_branch_lanes_ready &= laneReady[candidate_lane];
+            }
+            if (active_branch_lanes == 0 || !all_branch_lanes_ready)
+                return result;
+        }
         if (op.alternatePath)
             ++result.alternatePathUops;
         for (unsigned candidate_lane = 0;
