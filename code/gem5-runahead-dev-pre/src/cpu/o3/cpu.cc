@@ -2872,12 +2872,10 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                     dvrNestedContext.reset();
                     ndm_launched = true;
                 }
-                // Nested mode is an NDM collection/execution mode.  Letting
-                // ordinary single-loop DVR launches run concurrently fills
-                // the bounded helper queue before two outer invocations can
-                // flatten, so the actual NDM source->replay path never gets
-                // a request.  Users who need the single-loop fallback select
-                // full/discovery mode explicitly.
+                // While a short-loop NDM plan is active, defer ordinary
+                // single-loop launches so the bounded helper queue can form
+                // the outer x inner batch.  When NDM is ineligible or has
+                // fallen back, nested mode uses ordinary DVR directly.
                 const bool ordinary_dvr_allowed = dvrMode != "nested" ||
                     !dvrNestedDiscoveryMode.active();
                 if (ordinary_dvr_allowed && !ndm_launched &&
