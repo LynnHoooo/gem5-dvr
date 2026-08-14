@@ -860,6 +860,10 @@ class CPU : public BaseCPU
         statistics::Scalar dvrPredicateSelections;
         statistics::Scalar dvrDistinctPredicatePaths;
         statistics::Scalar dvrPredicateMisses;
+        statistics::Scalar dvrDebugReached14598;
+        statistics::Scalar dvrDebugContinuedPastFLR;
+        statistics::Scalar dvrDebugExecuted1459cConditional;
+        statistics::Scalar dvrDebug1459cMixedLaneResults;
         statistics::Scalar dvrSourcePrefetchesIssued;
         statistics::Scalar dvrSourcePrefetchesCompleted;
         statistics::Scalar dvrPrefetchQueuePeak;
@@ -939,6 +943,11 @@ class CPU : public BaseCPU
     void observeDVRLoad(const DynInstPtr &inst, Addr address);
     /** IEW dispatch 阶段观察指令并启动/推进 DVR Discovery。 */
     void observeDVRDispatch(const DynInstPtr &inst);
+    /** Compatibility callback for the classic VR stall path. */
+    void launchDVRVectorRunaheadOnStall(ThreadID tid);
+    /** Front-end callbacks used by the shared instruction-fetch port. */
+    void completeDVRInstructionFetch(PacketPtr pkt);
+    bool isDVRInstructionFetch(PacketPtr pkt) const;
 
     /**
      * Private vector register file for one helper program.  It is deliberately
@@ -2845,7 +2854,6 @@ class CPU : public BaseCPU
         ThreadID tid = 0;
         StaticInstPtr captured;
     };
-    void completeDVRInstructionFetch(PacketPtr pkt);
     void retryDVRInstructionFetch();
     bool requestDVRInstructionFetch(ThreadID tid, Addr pc,
                                     const StaticInstPtr &captured);

@@ -469,6 +469,13 @@ CPU::DVRInstructionFetchPort::recvTimingResp(PacketPtr pkt)
     return true;
 }
 
+bool
+CPU::isDVRInstructionFetch(PacketPtr pkt) const
+{
+    return pkt && dynamic_cast<DVRInstructionFetchState *>(
+        pkt->senderState) != nullptr;
+}
+
 void
 CPU::DVRInstructionFetchPort::recvReqRetry()
 {
@@ -1203,6 +1210,16 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Distinct predicate relation slots exercised"),
       ADD_STAT(dvrPredicateMisses, statistics::units::Count::get(),
                "Source values that matched no learned dependent path"),
+      ADD_STAT(dvrDebugReached14598, statistics::units::Count::get(),
+               "BFS debug generations reaching dependent FLR PC 0x14598"),
+      ADD_STAT(dvrDebugContinuedPastFLR, statistics::units::Count::get(),
+               "BFS debug lanes continuing past FLR PC 0x14598"),
+      ADD_STAT(dvrDebugExecuted1459cConditional,
+               statistics::units::Count::get(),
+               "BFS debug executions of conditional predicate PC 0x1459c"),
+      ADD_STAT(dvrDebug1459cMixedLaneResults,
+               statistics::units::Count::get(),
+               "BFS debug mixed taken/not-taken results at PC 0x1459c"),
       ADD_STAT(dvrSourcePrefetchesIssued, statistics::units::Count::get(),
                "DVR source (stride-lane) prefetches accepted by L1D"),
       ADD_STAT(dvrSourcePrefetchesCompleted, statistics::units::Count::get(),
@@ -2321,6 +2338,35 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                     dvrDispatchDependentLoads.erase(inst->seqNum) != 0;
                 if (dispatch_recorded) {
                     dvrInstructionRecorder.record(inst, dispatch_tainted);
+                    if (dvrCurrentTriggerPC == 0x1458a &&
+                        dvrInstructionRecorder.size() != 0 &&
+                        dvrInstructionRecorder[
+                            dvrInstructionRecorder.size() - 1].pc == 0x1459c) {
+                        const auto &predicate =
+                            dvrInstructionRecorder[
+                                dvrInstructionRecorder.size() - 1];
+                        const uint32_t flags =
+                            (predicate.control ? 1u : 0u) |
+                            (predicate.conditional ? 2u : 0u) |
+                            (dispatch_tainted ? 4u : 0u);
+                        DPRINTF(O3CPU,
+                            "DVR predicate record trigger=%#x pc=%#x "
+                            "encoding=%#x semantic=%u control=%d "
+                            "conditional=%d tainted=%d src0=%d src1=%d "
+                            "dst=%d intSources=%#x intDestinations=%#x\n",
+                            dvrCurrentTriggerPC, predicate.pc,
+                            predicate.encoding,
+                            static_cast<unsigned>(predicate.semantic),
+                            predicate.control, predicate.conditional,
+                            dispatch_tainted, predicate.source0,
+                            predicate.source1, predicate.destination,
+                            predicate.intSources, predicate.intDestinations);
+                        dvrTraceDependency(
+                            "predicate_record", curTick(),
+                            dvrCurrentTriggerPC, predicate.pc,
+                            predicate.encoding, flags,
+                            static_cast<int>(predicate.semantic));
+                    }
                     if (dispatch_tainted)
                         dvrTraceDependency("tainted", curTick(),
                             dvrCurrentTriggerPC,
@@ -4096,6 +4142,14 @@ CPU::issueDVRReplayLanes(unsigned slots)
     }
 
     const auto &uop = seed->program->uops[seed->uopIndex];
+    const bool bfs_debug_generation = seed->nested &&
+        seed->triggerPC == 0x1458a;
+    if (bfs_debug_generation && uop.pc == 0x14598) {
+        ++cpuStats.dvrDebugReached14598;
+        dvrTraceVector("debug_reached_14598", curTick(), uop.pc, 0,
+                       static_cast<int>(group.size()),
+                       static_cast<int>(seed->lane));
+    }
     const Addr branch_reconvergence = uop.reconvergencePC;
     std::array<Addr, 128> branch_next_pc = {};
     std::array<bool, 128> branch_next_valid = {};
@@ -4170,6 +4224,27 @@ CPU::issueDVRReplayLanes(unsigned slots)
             }
             branch_next_pc[lane->lane] = next;
             branch_next_valid[lane->lane] = true;
+            if (bfs_debug_generation && uop.pc == 0x1459c) {
+                const uint32_t predicate_flags =
+                    (lane_uop.control ? 1u : 0u) |
+                    (lane_uop.conditional ? 2u : 0u) |
+                    (lane_uop.tainted ? 4u : 0u);
+                DPRINTF(O3CPU,
+                    "DVR predicate lane trigger=%#x pc=%#x lane=%u "
+                    "src0=r%d:%#llx src1=r%d:%#llx tainted=%d "
+                    "taken=%d next=%#x active=%#llx:%#llx\n",
+                    seed->triggerPC, uop.pc, lane->lane,
+                    lane_uop.source0,
+                    static_cast<unsigned long long>(source0),
+                    lane_uop.source1,
+                    static_cast<unsigned long long>(source1),
+                    lane_uop.tainted, taken, next,
+                    static_cast<unsigned long long>(branch_active_mask[1]),
+                    static_cast<unsigned long long>(branch_active_mask[0]));
+                dvrTraceDependency("predicate_lane", curTick(),
+                    seed->triggerPC, uop.pc, source0, predicate_flags,
+                    static_cast<int>(lane->lane));
+            }
             unsigned path = 0;
             while (path < branch_groups && branch_group_pc[path] != next)
                 ++path;
@@ -4200,6 +4275,21 @@ CPU::issueDVRReplayLanes(unsigned slots)
         const unsigned not_taken_lanes =
             __builtin_popcountll(branch_not_taken_mask[0]) +
             __builtin_popcountll(branch_not_taken_mask[1]);
+        if (bfs_debug_generation && uop.pc == 0x1459c &&
+            uop.conditional) {
+            ++cpuStats.dvrDebugExecuted1459cConditional;
+            dvrTraceVector("debug_executed_1459c", curTick(), uop.pc,
+                           branch_reconvergence,
+                           static_cast<int>(evaluated_branch_lanes),
+                           static_cast<int>(branch_groups));
+            if (taken_lanes != 0 && not_taken_lanes != 0) {
+                ++cpuStats.dvrDebug1459cMixedLaneResults;
+                dvrTraceVector("debug_1459c_mixed", curTick(), uop.pc,
+                               branch_reconvergence,
+                               static_cast<int>(taken_lanes),
+                               static_cast<int>(not_taken_lanes));
+            }
+        }
         dvrTraceVector("replay_branch_evaluated", curTick(), uop.pc,
                        branch_reconvergence, evaluated_branch_lanes,
                        static_cast<int>(branch_groups));
@@ -4757,6 +4847,13 @@ CPU::issueDVRReplayLanes(unsigned slots)
             }
             const Addr line = dvrPrefetchLine(result);
             const bool value_response = lane->continuePastFLR;
+            if (bfs_debug_generation && lane_uop.pc == 0x14598 &&
+                value_response) {
+                ++cpuStats.dvrDebugContinuedPastFLR;
+                dvrTraceVector("debug_continued_past_flr", curTick(),
+                               lane_uop.pc, result, 1,
+                               static_cast<int>(lane->lane));
+            }
             if ((value_response ||
                  (dvrQueuedDependentLines.count(line) == 0 &&
                   dvrDependentOutstandingLines.count(line) == 0 &&
