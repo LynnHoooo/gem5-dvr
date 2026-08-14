@@ -143,10 +143,17 @@ DVRNestedController::clear()
 
 DVRNestedDiscoveryMode::DVRNestedDiscoveryMode(
     unsigned lane_threshold, unsigned max_instructions)
-    : laneThreshold(lane_threshold), maxInstructions(max_instructions)
+    : laneThreshold(lane_threshold),
+      outerSearchMaxInstructions(
+          std::min(max_instructions, PaperOuterSearchInstructions)),
+      outerCollectionMaxInstructions(
+          std::max(max_instructions, PaperOuterSearchInstructions) *
+          MaxOuterInvocations)
 {
     assert(laneThreshold > 0);
-    assert(maxInstructions > 0);
+    assert(max_instructions > 0);
+    assert(outerSearchMaxInstructions > 0);
+    assert(outerCollectionMaxInstructions >= outerSearchMaxInstructions);
 }
 
 DVRNestedDiscoveryMode::Result
@@ -302,6 +309,10 @@ DVRNestedDiscoveryMode::recordOuterInvocation(
     // short/irregular BFS generations time out with count == 1.
     if (invocationCount >= 1)
         currentState = State::Vectorizing;
+    // A completed invocation is progress in the independent outer-plan
+    // window.  Do not let the ordinary discovery budget age out the plan
+    // between two short inner-loop generations.
+    committedInstructions = 0;
     return true;
 }
 
@@ -318,6 +329,10 @@ DVRNestedDiscoveryMode::observeOuterLoad(Addr pc, Addr address)
             outerAddress = address;
             if (pendingOuterCount < pendingOuterBases.size())
                 pendingOuterBases[pendingOuterCount++] = address;
+            // An observed outer stride is forward progress.  Refresh the
+            // collection window rather than charging it against the initial
+            // 200-instruction outer-stride search window.
+            committedInstructions = 0;
         }
         return snapshot(Event::None);
     }
@@ -394,8 +409,7 @@ DVRNestedDiscoveryMode::observeCommit()
 
     ++committedInstructions;
     const uint64_t budget = currentState == State::SeekingOuter ?
-        maxInstructions :
-        static_cast<uint64_t>(maxInstructions) * MaxOuterInvocations;
+        outerSearchMaxInstructions : outerCollectionMaxInstructions;
     if (committedInstructions < budget)
         return snapshot(Event::None);
 
