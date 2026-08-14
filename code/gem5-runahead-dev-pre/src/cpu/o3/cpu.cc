@@ -856,6 +856,10 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Nested batches containing independently different bounds"),
       ADD_STAT(dvrNDMAttempts, statistics::units::Count::get(),
                "Completed short inner loops entering NDM control"),
+      ADD_STAT(dvrNDMThresholdBypasses, statistics::units::Count::get(),
+               "Nested discoveries bypassing NDM because inner lanes reach the threshold"),
+      ADD_STAT(dvrNestedOrdinaryDVRLaunches, statistics::units::Count::get(),
+               "Ordinary DVR launches selected for nested mode when NDM is unnecessary"),
       ADD_STAT(dvrNDMOuterFound, statistics::units::Count::get(),
                "Committed distinct outer strides accepted by NDM"),
       ADD_STAT(dvrNDMFallbacks, statistics::units::Count::get(),
@@ -2663,7 +2667,9 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                         result.triggerPC, dvrCurrentTriggerAddress,
                         inference.lanes);
                 }
-                if (dvrMode == "nested" &&
+                const bool ndm_eligible = dvrMode == "nested" &&
+                    dvrNestedDiscoveryMode.eligible(inference.lanes);
+                if (ndm_eligible &&
                     dvrNestedDiscoveryMode.start(
                         result.triggerPC, inference.increment,
                         inference.lanes).event ==
@@ -2699,6 +2705,16 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                         ++cpuStats.dvrNDMILRCaptures;
                     if (bound_reg >= 0)
                         ++cpuStats.dvrNDMLCRCaptures;
+                } else if (dvrMode == "nested" && !ndm_eligible &&
+                           dvrNestedDiscoveryMode.active()) {
+                    // A large inner invocation already provides enough
+                    // scalar-equivalent lanes; discard any stale short-loop
+                    // NDM plan and use ordinary DVR for this generation.
+                    dvrNestedDiscoveryMode.reset();
+                }
+                if (dvrMode == "nested" && inference.matched &&
+                    inference.lanes != 0 && !ndm_eligible) {
+                    ++cpuStats.dvrNDMThresholdBypasses;
                 }
                 ++cpuStats.dvrLaneCountSamples;
                 cpuStats.dvrTotalActiveLanes += inference.lanes;
@@ -2862,7 +2878,9 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 // flatten, so the actual NDM source->replay path never gets
                 // a request.  Users who need the single-loop fallback select
                 // full/discovery mode explicitly.
-                if (dvrMode != "nested" && !ndm_launched &&
+                const bool ordinary_dvr_allowed = dvrMode != "nested" ||
+                    !dvrNestedDiscoveryMode.active();
+                if (ordinary_dvr_allowed && !ndm_launched &&
                     (helper_allowed || fallback_allowed ||
                      launch_source_fallback ||
                      alternate_continuation_allowed) &&
@@ -2877,6 +2895,8 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                         dvrTraceVector("alternate_path_continuation_launch",
                             curTick(), result.triggerPC, inst->effAddr,
                             alternate_continuation_lanes);
+                    if (dvrMode == "nested")
+                        ++cpuStats.dvrNestedOrdinaryDVRLaunches;
                     launchDVRStridePrefetches(
                         tid, inst->effAddr, result.triggerPC,
                         result.stride,

@@ -242,6 +242,12 @@ class DVRNestedDiscoveryMode
     Result start(Addr inner_load_pc, int64_t loop_increment,
                  unsigned inner_lanes);
 
+    /** Paper policy: NDM is useful only when the inner loop has < 64 lanes. */
+    bool eligible(unsigned inner_lanes) const
+    {
+        return inner_lanes != 0 && inner_lanes < laneThreshold;
+    }
+
     /** Capture IR/ILR/LCR after the inner loop bound is inferred. */
     void captureLoopRegisters(int8_t induction_register,
                               int8_t bound_register,

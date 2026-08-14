@@ -707,6 +707,8 @@ class CPU : public BaseCPU
         statistics::Scalar dvrNestedFlattenExpectedLanes;
         statistics::Scalar dvrNestedVariableLaneBatches;
         statistics::Scalar dvrNDMAttempts;
+        statistics::Scalar dvrNDMThresholdBypasses;
+        statistics::Scalar dvrNestedOrdinaryDVRLaunches;
         statistics::Scalar dvrNDMOuterFound;
         statistics::Scalar dvrNDMFallbacks;
         statistics::Scalar dvrNDMTimeouts;
