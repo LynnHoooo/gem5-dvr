@@ -132,6 +132,11 @@ BaseCache::BaseCache(const BaseCacheParams &p, unsigned blk_size)
         });
         registerExitCallback([this]() { dumpPCAccessSummary(); });
     }
+    if (const char *trace = std::getenv("DVR_CACHE_MISS_TRACE")) {
+        pcMissTrace.open(trace, std::ios::out | std::ios::trunc);
+        if (pcMissTrace)
+            pcMissTrace << "tick,cache,pc,address,requestor,demand,source,dependent\n";
+    }
     // the MSHR queue has no reserve entries as we check the MSHR
     // queue on every single allocation, whereas the write queue has
     // as many reserve entries as we have MSHRs, since every MSHR may
@@ -166,8 +171,16 @@ void
 BaseCache::accountPCAccess(PacketPtr pkt, bool hit, bool demand,
                            bool source, bool dependent)
 {
-    if (!pcAccessSummaryEnabled || pcAccessSummaryFrozen || !pkt->req ||
-        !pkt->req->hasPC())
+    if (!pkt->req || !pkt->req->hasPC())
+        return;
+    if (!hit && pcMissTrace && pkt->req->hasPC()) {
+        pcMissTrace << curTick() << ',' << name() << ",0x" << std::hex
+                    << pkt->req->getPC() << ",0x" << pkt->getAddr()
+                    << std::dec << ',' << pkt->req->requestorId() << ','
+                    << (demand ? 1 : 0) << ',' << (source ? 1 : 0) << ','
+                    << (dependent ? 1 : 0) << '\n';
+    }
+    if (!pcAccessSummaryEnabled || pcAccessSummaryFrozen)
         return;
     auto &counts = pcAccessCounts[pkt->req->getPC()];
     if (demand)

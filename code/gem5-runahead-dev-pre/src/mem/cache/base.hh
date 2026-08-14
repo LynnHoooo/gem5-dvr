@@ -48,6 +48,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <fstream>
 #include <string>
 #include <unordered_map>
 
@@ -393,6 +394,7 @@ class BaseCache : public ClockedObject
     bool pcAccessSummaryEnabled = false;
     bool pcAccessSummaryFrozen = false;
     std::string pcAccessSummaryDir;
+    std::ofstream pcMissTrace;
     void accountPCAccess(PacketPtr pkt, bool hit, bool demand,
                          bool source, bool dependent);
     void dumpPCAccessSummary() const;

@@ -1136,7 +1136,7 @@ bool
 DVRInstructionRecorder::hasConditionalBetween(Addr flr_pc,
                                                Addr loop_branch_pc) const
 {
-    if (flr_pc == 0 || loop_branch_pc == 0)
+    if (flr_pc == 0)
         return false;
 
     int flr_index = -1;
@@ -1148,15 +1148,21 @@ DVRInstructionRecorder::hasConditionalBetween(Addr flr_pc,
         return false;
 
     unsigned lcr_index = count;
-    for (unsigned index = static_cast<unsigned>(flr_index + 1);
-         index < count; ++index) {
-        if (uops[index].conditional &&
-            uops[index].pc == loop_branch_pc) {
-            lcr_index = index;
-            break;
+    if (loop_branch_pc != 0) {
+        for (unsigned index = static_cast<unsigned>(flr_index + 1);
+             index < count; ++index) {
+            if (uops[index].conditional &&
+                uops[index].pc == loop_branch_pc) {
+                lcr_index = index;
+                break;
+            }
         }
     }
-    if (lcr_index == count)
+    // When LCR inference fails, the paper still has to preserve a branch
+    // after FLR: the helper is bounded by the next stride/timeout rather than
+    // incorrectly terminating at the FLR.  Treat the captured suffix as the
+    // conservative search window in that case.
+    if (loop_branch_pc != 0 && lcr_index == count)
         return false;
 
     for (unsigned index = static_cast<unsigned>(flr_index + 1);

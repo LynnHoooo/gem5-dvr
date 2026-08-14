@@ -943,6 +943,8 @@ class CPU : public BaseCPU
     void observeDVRLoad(const DynInstPtr &inst, Addr address);
     /** IEW dispatch 阶段观察指令并启动/推进 DVR Discovery。 */
     void observeDVRDispatch(const DynInstPtr &inst);
+    /** Compatibility callback for the classic VR stall path. */
+    void launchDVRVectorRunaheadOnStall(ThreadID tid);
     /** Front-end callbacks used by the shared instruction-fetch port. */
     void completeDVRInstructionFetch(PacketPtr pkt);
     bool isDVRInstructionFetch(PacketPtr pkt) const;
@@ -1713,6 +1715,8 @@ class CPU : public BaseCPU
         FILE *vectorization = nullptr;
         FILE *loopBounds = nullptr;
         FILE *events = nullptr;
+        bool narrow = false;
+        bool branchCensus = false;
         bool enabled() const { return workload != nullptr; }
     } dvrTrace;
     void dvrTraceWorkload(const char *kind, Tick tick, InstSeqNum seq,
@@ -1957,7 +1961,19 @@ class CPU : public BaseCPU
         static constexpr unsigned ScoreboardRegisters = 32;
         std::deque<IssueEntry> issueQueue;
         std::deque<ReplayGeneration> replayGenerations;
-        std::deque<ReplayLaneContext> replayLanes;
+        // list keeps lane object addresses stable so each generation can
+        // maintain a direct ready-lane index without scanning all lanes.
+        std::list<ReplayLaneContext> replayLanes;
+        std::unordered_map<ReplayReconvergenceState *,
+                           std::vector<ReplayLaneContext *>>
+            replayContextLanes;
+        // One queue entry per replay generation, rather than one entry per
+        // lane.  This is the scheduler's fairness unit.
+        std::deque<std::shared_ptr<ReplayReconvergenceState>>
+            replayReadyContexts;
+        std::unordered_set<ReplayReconvergenceState *>
+            replayReadyContextSet;
+        std::shared_ptr<ReplayReconvergenceState> debugBfsContext;
         std::unordered_map<DVRHelperVectorRegisterFile *,
                            std::shared_ptr<ReplayReconvergenceState>>
             replayReconvergenceContexts;
@@ -1968,6 +1984,28 @@ class CPU : public BaseCPU
         // the main O3 fetch queue.
         std::unordered_map<Addr, StaticInstPtr> decodedUopCache;
         std::array<Tick, ScoreboardRegisters> readyCycle = {};
+
+        void activateReplayContext(
+            const std::shared_ptr<ReplayReconvergenceState> &context)
+        {
+            if (!context)
+                return;
+            if (replayReadyContextSet.insert(context.get()).second)
+                replayReadyContexts.push_back(context);
+            // A completed VIR copy consumes the helper's ready credit.  A
+            // live context re-entering the queue must wake the in-order
+            // helper even when no memory response is involved.
+            if (readyUops == 0) {
+                readyUops = 1;
+                state = State::Running;
+            }
+        }
+
+        void registerReplayLane(ReplayLaneContext *lane)
+        {
+            if (lane && lane->reconvergence)
+                replayContextLanes[lane->reconvergence.get()].push_back(lane);
+        }
 
         void reset()
         {
@@ -1997,6 +2035,10 @@ class CPU : public BaseCPU
             issueQueue.clear();
             replayGenerations.clear();
             replayLanes.clear();
+            replayReadyContexts.clear();
+            replayReadyContextSet.clear();
+            replayContextLanes.clear();
+            debugBfsContext.reset();
             replayReconvergenceContexts.clear();
             virBuffer.clear();
             frontendBuffer.clear();
@@ -2039,6 +2081,10 @@ class CPU : public BaseCPU
             issueQueue.clear();
             replayGenerations.clear();
             replayLanes.clear();
+            replayReadyContexts.clear();
+            replayReadyContextSet.clear();
+            replayContextLanes.clear();
+            debugBfsContext.reset();
             replayReconvergenceContexts.clear();
             virBuffer.clear();
             frontendBuffer.clear();
@@ -2168,7 +2214,7 @@ class CPU : public BaseCPU
         {
             return aluRemaining != 0 || shiftRemaining != 0 ||
                    multiplyRemaining != 0 || !issueQueue.empty() ||
-                   !replayGenerations.empty() || !replayLanes.empty();
+                   !replayGenerations.empty() || !replayReadyContexts.empty();
         }
 
         bool enqueueReplayLane(const DVRPrefetchSenderState &sender,
@@ -2189,6 +2235,8 @@ class CPU : public BaseCPU
                 sender.helperRegs.get()];
             if (!reconvergence)
                 reconvergence = std::make_shared<ReplayReconvergenceState>();
+            if (sender.replay->triggerPC == 0x11970)
+                debugBfsContext = reconvergence;
             lane_context.reconvergence = reconvergence;
             lane_context.regs = sender.replay->initialRegs;
             lane_context.regs[0] = 0;
@@ -2229,6 +2277,8 @@ class CPU : public BaseCPU
                 sender.replay->triggerDestination, sender.lane,
                 source_value, 0);
             replayLanes.push_back(std::move(lane_context));
+            registerReplayLane(&replayLanes.back());
+            activateReplayContext(reconvergence);
             became_ready = readyUops == 0 ? 1 : 0;
             if (became_ready != 0) {
                 readyUops = 1;
@@ -2275,6 +2325,7 @@ class CPU : public BaseCPU
                     lane.termination = ReplayLaneContext::TerminationReason::
                         External;
                 }
+                activateReplayContext(lane.reconvergence);
                 became_ready = readyUops == 0 ? 1 : 0;
                 if (became_ready != 0) {
                     readyUops = 1;
@@ -2283,6 +2334,25 @@ class CPU : public BaseCPU
                 return true;
             }
             return false;
+        }
+
+        // Narrow diagnostics need to inspect the same lane after a value
+        // response advances its replay cursor.  Keep this lookup keyed by
+        // the immutable helper generation identity; unlike the load-PC
+        // matching used by resumeDependentLane(), it remains valid after the
+        // lane has moved to the successor uop.
+        ReplayLaneContext *findReplayLane(
+            const DVRPrefetchSenderState &sender)
+        {
+            if (!sender.replay || !sender.helperRegs)
+                return nullptr;
+            for (auto &lane : replayLanes) {
+                if (lane.helperRegs == sender.helperRegs &&
+                    lane.program == sender.replay &&
+                    lane.lane == sender.lane)
+                    return &lane;
+            }
+            return nullptr;
         }
 
         unsigned retireCompletedVIR(Tick now)
@@ -2572,7 +2642,7 @@ class CPU : public BaseCPU
             computeReadyTick = std::max(computeReadyTick, ready_tick);
             if (issuedUops >= maxUops && readyUops == 0 &&
                 fetchRemaining == 0 && decodeRemaining == 0 &&
-                outstanding == 0 && replayLanes.empty())
+                outstanding == 0 && replayReadyContexts.empty())
                 state = State::Draining;
         }
 
