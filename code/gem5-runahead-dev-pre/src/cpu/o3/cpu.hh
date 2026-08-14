@@ -982,7 +982,20 @@ class CPU : public BaseCPU
             std::array<int16_t, VectorCopies> vector = {};
             bool vectorized = false;
 
-            Mapping() { vector.fill(-1); }
+            // The architectural mapping is logically lane-private.  The
+            // vector[] bundle remains the allocation unit, but these fields
+            // identify the physical name observed by each lane.
+            std::array<int16_t, MaxLanes> lanePhysical = {};
+            std::array<uint8_t, MaxLanes> laneElement = {};
+            std::array<bool, MaxLanes> laneVectorized = {};
+
+            Mapping()
+            {
+                vector.fill(-1);
+                lanePhysical.fill(-1);
+                laneElement.fill(0);
+                laneVectorized.fill(false);
+            }
         };
 
         std::array<Mapping, NumArchitecturalRegs> vrat = {};
@@ -1136,7 +1149,9 @@ class CPU : public BaseCPU
             return result;
         }
 
-        void release(int16_t phys)
+        // VRAT overwrite: the old mapping becomes a dead source.  It may
+        // remain allocated while issued VIR copies still retain it.
+        void markDead(int16_t phys)
         {
             if (phys < 0 || phys >= NumPhysicalRegs)
                 return;
@@ -1160,6 +1175,11 @@ class CPU : public BaseCPU
             }
             allocated[phys] = false;
             entry = PhysicalRegister();
+        }
+
+        void release(int16_t phys)
+        {
+            markDead(phys);
         }
 
         void retainPhysical(int16_t phys)
@@ -1189,13 +1209,69 @@ class CPU : public BaseCPU
             }
         }
 
+        std::array<int16_t, VectorCopies> vectorMapping(
+            unsigned arch) const
+        {
+            std::array<int16_t, VectorCopies> result;
+            result.fill(-1);
+            if (arch < NumArchitecturalRegs && vrat[arch].vectorized)
+                result = vrat[arch].vector;
+            return result;
+        }
+
+        std::vector<int16_t> physicalMappings(unsigned arch) const
+        {
+            std::vector<int16_t> result;
+            if (arch >= NumArchitecturalRegs)
+                return result;
+            const auto &mapping = vrat[arch];
+            for (const auto phys : mapping.lanePhysical) {
+                if (phys < 0 ||
+                    std::find(result.begin(), result.end(), phys) !=
+                    result.end())
+                    continue;
+                result.push_back(phys);
+            }
+            if (result.empty()) {
+                if (mapping.vectorized) {
+                    for (const auto phys : mapping.vector)
+                        if (phys >= 0 &&
+                            std::find(result.begin(), result.end(), phys) ==
+                            result.end())
+                            result.push_back(phys);
+                } else if (mapping.scalar >= 0) {
+                    result.push_back(mapping.scalar);
+                }
+            }
+            return result;
+        }
+
+        int16_t scalarMapping(unsigned arch) const
+        {
+            if (arch >= NumArchitecturalRegs || vrat[arch].vectorized)
+                return -1;
+            return vrat[arch].scalar;
+        }
+
         int16_t physicalIndex(unsigned arch, unsigned lane) const
         {
             if (arch >= NumArchitecturalRegs || lane >= MaxLanes)
                 return -1;
+            if (vrat[arch].lanePhysical[lane] >= 0)
+                return vrat[arch].lanePhysical[lane];
             const unsigned copy = lane / LanesPerVectorCopy;
             return vrat[arch].vectorized ? vrat[arch].vector[copy] :
                 vrat[arch].scalar;
+        }
+
+        unsigned physicalLane(unsigned arch, unsigned lane) const
+        {
+            if (arch >= NumArchitecturalRegs || lane >= MaxLanes)
+                return lane;
+            if (vrat[arch].lanePhysical[lane] >= 0)
+                return vrat[arch].laneVectorized[lane] ?
+                    vrat[arch].laneElement[lane] : lane;
+            return vrat[arch].vectorized ? lane % LanesPerVectorCopy : lane;
         }
 
         void reset()
@@ -1225,6 +1301,9 @@ class CPU : public BaseCPU
                 if (phys < 0)
                     break;
                 vrat[arch].scalar = phys;
+                vrat[arch].lanePhysical.fill(phys);
+                vrat[arch].laneElement.fill(0);
+                vrat[arch].laneVectorized.fill(false);
                 auto &entry = physical[phys];
                 for (unsigned lane = 0; lane < MaxLanes; ++lane) {
                     writePhysical(phys, lane, regs[arch]);
@@ -1258,6 +1337,13 @@ class CPU : public BaseCPU
                 }
             }
             vrat[arch].vectorized = true;
+            vrat[arch].scalar = -1;
+            for (unsigned lane = 0; lane < MaxLanes; ++lane) {
+                const unsigned copy = lane / LanesPerVectorCopy;
+                vrat[arch].lanePhysical[lane] = bundle[copy];
+                vrat[arch].laneElement[lane] = lane % LanesPerVectorCopy;
+                vrat[arch].laneVectorized[lane] = true;
+            }
             // The scalar mapping is no longer current, but may still be a
             // source of an already-issued VIR copy. Defer reclamation until
             // that copy retires.
@@ -1266,37 +1352,102 @@ class CPU : public BaseCPU
             return true;
         }
 
-        // Allocate a fresh vector destination for every dynamic WAW.  Copy
-        // the old mapping first so inactive SIMT lanes retain their value;
-        // issued readers keep the old physical names through users[].
-        bool renameVector(unsigned arch)
+        // Allocate a fresh vector destination for the active lane mask.
+        // Inactive lanes retain their old mapping, which is the key SIMT
+        // invariant needed while a deferred reconvergence path is parked.
+        bool renameVectorMasked(unsigned arch,
+                                const std::array<uint64_t, 2> &active_mask)
         {
             if (arch >= NumArchitecturalRegs)
                 return false;
-            if (!vrat[arch].vectorized)
-                return vectorize(arch);
-
-            const auto old_bundle = vrat[arch].vector;
+            const auto old_phys = physicalMappings(arch);
             const auto new_bundle = allocateVectorBundle();
             if (new_bundle[0] < 0)
                 return false;
-            for (unsigned copy = 0; copy < VectorCopies; ++copy) {
-                auto &dst = physical[new_bundle[copy]];
-                const auto &src = physical[old_bundle[copy]];
-                for (unsigned lane = 0; lane < LanesPerVectorCopy; ++lane) {
-                    writePhysical(new_bundle[copy], lane,
-                        readPhysical(old_bundle[copy], lane));
-                    dst.ready[lane] = src.ready[lane];
-                    if (src.valid[lane / 64] &
-                        (uint64_t(1) << (lane % 64))) {
-                        dst.valid[lane / 64] |=
-                            uint64_t(1) << (lane % 64);
-                    }
+            for (unsigned lane = 0; lane < MaxLanes; ++lane) {
+                const unsigned word = lane / 64;
+                const uint64_t bit = uint64_t(1) << (lane % 64);
+                const unsigned copy = lane / LanesPerVectorCopy;
+                const unsigned element = lane % LanesPerVectorCopy;
+                const RegVal value = read(arch, lane);
+                const Tick ready = readyAt(arch, lane);
+                writePhysical(new_bundle[copy], element, value);
+                physical[new_bundle[copy]].ready[element] = ready;
+                physical[new_bundle[copy]].valid[element / 64] |=
+                    uint64_t(1) << (element % 64);
+                if (active_mask[word] & bit) {
+                    vrat[arch].lanePhysical[lane] = new_bundle[copy];
+                    vrat[arch].laneElement[lane] = element;
+                    vrat[arch].laneVectorized[lane] = true;
                 }
-                vrat[arch].vector[copy] = new_bundle[copy];
-                release(old_bundle[copy]);
             }
+            vrat[arch].vector = new_bundle;
+            vrat[arch].scalar = -1;
+            vrat[arch].vectorized = true;
+            for (unsigned lane = 0; lane < MaxLanes; ++lane)
+                vrat[arch].vectorized &= vrat[arch].laneVectorized[lane];
+            const auto current_phys = physicalMappings(arch);
+            for (const auto phys : old_phys)
+                if (std::find(current_phys.begin(), current_phys.end(), phys) ==
+                    current_phys.end())
+                    release(phys);
             return true;
+        }
+
+        bool renameVector(unsigned arch)
+        {
+            std::array<uint64_t, 2> all = {
+                ~uint64_t(0), ~uint64_t(0)
+            };
+            return renameVectorMasked(arch, all);
+        }
+
+        // Scalar overwrite is also masked.  A path that overwrites only a
+        // subset of lanes gets a scalar physical name for those lanes; the
+        // deferred path keeps the previous vector mapping.
+        int16_t renameScalarMasked(
+            unsigned arch, const std::array<uint64_t, 2> &active_mask)
+        {
+            if (arch >= NumArchitecturalRegs)
+                return -1;
+            const auto old_phys = physicalMappings(arch);
+            const int16_t phys = allocateScalar();
+            if (phys < 0)
+                return -1;
+            for (unsigned lane = 0; lane < MaxLanes; ++lane) {
+                const uint64_t bit = uint64_t(1) << (lane % 64);
+                if (!(active_mask[lane / 64] & bit))
+                    continue;
+                writePhysical(phys, lane, read(arch, lane));
+                physical[phys].ready[lane] = readyAt(arch, lane);
+                physical[phys].valid[lane / 64] |= bit;
+                vrat[arch].lanePhysical[lane] = phys;
+                vrat[arch].laneElement[lane] = 0;
+                vrat[arch].laneVectorized[lane] = false;
+            }
+            vrat[arch].vector.fill(-1);
+            vrat[arch].vectorized = false;
+            int16_t summary = -1;
+            bool same_scalar = true;
+            for (unsigned lane = 0; lane < MaxLanes; ++lane) {
+                if (vrat[arch].laneVectorized[lane]) {
+                    same_scalar = false;
+                    break;
+                }
+                if (summary < 0)
+                    summary = vrat[arch].lanePhysical[lane];
+                else if (summary != vrat[arch].lanePhysical[lane]) {
+                    same_scalar = false;
+                    break;
+                }
+            }
+            vrat[arch].scalar = same_scalar ? summary : -1;
+            const auto current_phys = physicalMappings(arch);
+            for (const auto old : old_phys)
+                if (std::find(current_phys.begin(), current_phys.end(), old) ==
+                    current_phys.end())
+                    release(old);
+            return phys;
         }
 
         bool conservationValid() const
@@ -1310,9 +1461,12 @@ class CPU : public BaseCPU
                     return false;
             }
             for (const auto &mapping : vrat) {
+                for (const auto phys : mapping.lanePhysical)
+                    if (phys >= 0 && !allocated[phys])
+                        return false;
                 if (mapping.vectorized) {
                     for (const auto phys : mapping.vector)
-                        if (phys < 0 || !allocated[phys])
+                        if (phys >= 0 && !allocated[phys])
                             return false;
                 } else if (mapping.scalar >= 0 &&
                            !allocated[mapping.scalar]) {
@@ -1324,63 +1478,57 @@ class CPU : public BaseCPU
 
         bool isVectorized(unsigned arch) const
         {
-            return arch < NumArchitecturalRegs && vrat[arch].vectorized;
+            if (arch >= NumArchitecturalRegs)
+                return false;
+            for (const bool lane_vectorized : vrat[arch].laneVectorized)
+                if (lane_vectorized)
+                    return true;
+            return vrat[arch].vectorized;
+        }
+
+        bool isVectorized(unsigned arch, unsigned lane) const
+        {
+            return arch < NumArchitecturalRegs && lane < MaxLanes &&
+                (vrat[arch].laneVectorized[lane] ||
+                 (vrat[arch].lanePhysical[lane] < 0 &&
+                  vrat[arch].vectorized));
         }
 
         int16_t rename(unsigned arch)
         {
-            if (arch >= NumArchitecturalRegs)
-                return -1;
-            const int16_t phys = allocateScalar();
-            if (phys < 0)
-                return -1;
-            if (vrat[arch].vectorized) {
-                for (const auto old : vrat[arch].vector)
-                    release(old);
-            } else {
-                release(vrat[arch].scalar);
-            }
-            vrat[arch] = Mapping();
-            vrat[arch].scalar = phys;
-            return phys;
+            std::array<uint64_t, 2> all = {
+                ~uint64_t(0), ~uint64_t(0)
+            };
+            return renameScalarMasked(arch, all);
         }
 
         RegVal read(unsigned arch, unsigned lane) const
         {
             if (arch >= NumArchitecturalRegs || lane >= MaxLanes)
                 return 0;
-            const unsigned copy = lane / LanesPerVectorCopy;
-            const unsigned element = lane % LanesPerVectorCopy;
-            const int16_t phys = vrat[arch].vectorized ?
-                vrat[arch].vector[copy] : vrat[arch].scalar;
+            const int16_t phys = physicalIndex(arch, lane);
             return phys < 0 ? 0 : readPhysical(phys,
-                vrat[arch].vectorized ? element : lane);
+                physicalLane(arch, lane));
         }
 
         Tick readyAt(unsigned arch, unsigned lane) const
         {
             if (arch >= NumArchitecturalRegs || lane >= MaxLanes)
                 return 0;
-            const unsigned copy = lane / LanesPerVectorCopy;
-            const unsigned element = lane % LanesPerVectorCopy;
-            const int16_t phys = vrat[arch].vectorized ?
-                vrat[arch].vector[copy] : vrat[arch].scalar;
+            const int16_t phys = physicalIndex(arch, lane);
             return phys < 0 ? 0 : physical[phys].ready[
-                vrat[arch].vectorized ? element : lane];
+                physicalLane(arch, lane)];
         }
 
         void write(unsigned arch, unsigned lane, RegVal value, Tick ready_tick)
         {
             if (arch >= NumArchitecturalRegs || lane >= MaxLanes)
                 return;
-            const unsigned copy = lane / LanesPerVectorCopy;
-            const unsigned element = lane % LanesPerVectorCopy;
-            const int16_t phys = vrat[arch].vectorized ?
-                vrat[arch].vector[copy] : vrat[arch].scalar;
+            const int16_t phys = physicalIndex(arch, lane);
             if (phys < 0)
                 return;
             auto &entry = physical[phys];
-            const unsigned stored_lane = vrat[arch].vectorized ? element : lane;
+            const unsigned stored_lane = physicalLane(arch, lane);
             writePhysical(phys, stored_lane, value);
             entry.ready[stored_lane] = ready_tick;
             entry.valid[stored_lane / 64] |=
@@ -1647,6 +1795,11 @@ class CPU : public BaseCPU
             // must release these names rather than re-resolving arch regs.
             std::vector<int16_t> source0Physical;
             std::vector<int16_t> source1Physical;
+            // Set when a later VRAT overwrite makes the corresponding source
+            // mapping dead.  The masks are lane-granular because a divergent
+            // VIR copy may retire only an active subset.
+            std::array<uint64_t, 2> source0DeadMask = {};
+            std::array<uint64_t, 2> source1DeadMask = {};
             unsigned chunksRemaining = 1;
             Tick issueCycle = 0;
             Tick completeCycle = 0;
@@ -1665,6 +1818,8 @@ class CPU : public BaseCPU
             std::array<uint64_t, 2> executedMask = {};
             std::array<uint64_t, 2> completedMask = {};
             std::array<uint64_t, 2> deadSourceMask = {};
+            std::array<uint64_t, 2> deadSource0Mask = {};
+            std::array<uint64_t, 2> deadSource1Mask = {};
             Addr pc = 0;
             unsigned uopIndex = 0;
             unsigned inFlight = 0;
@@ -2055,14 +2210,21 @@ class CPU : public BaseCPU
                         copy.executedMask[word] |= it->activeMask[word];
                         copy.completedMask[word] |= it->activeMask[word];
                         copy.issuedMask[word] &= ~it->activeMask[word];
+                        copy.deadSource0Mask[word] |=
+                            it->source0DeadMask[word];
+                        copy.deadSource1Mask[word] |=
+                            it->source1DeadMask[word];
+                        copy.deadSourceMask[word] |=
+                            it->source0DeadMask[word] |
+                            it->source1DeadMask[word];
                     }
                     if (copy.inFlight != 0)
                         --copy.inFlight;
-                    copy.deadSource = it->destination >= 0 &&
-                        (it->destination == it->source0 ||
-                         it->destination == it->source1);
-                    copy.deadSourceMask = copy.deadSource ?
-                        it->activeMask : std::array<uint64_t, 2>{};
+                    copy.deadSource = false;
+                    for (unsigned word = 0; word < 2; ++word)
+                        copy.deadSource |=
+                            it->source0DeadMask[word] != 0 ||
+                            it->source1DeadMask[word] != 0;
                     if (it->helperRegs) {
                         for (const auto phys : it->source0Physical)
                             it->helperRegs->releasePhysical(phys);
@@ -2077,6 +2239,40 @@ class CPU : public BaseCPU
                 }
             }
             return retired;
+        }
+
+        // Record the paper's dead-source bits when VRAT overwrites a
+        // mapping.  Already-issued VIR copies retain physical names in
+        // source{0,1}Physical; future copies resolve the new VRAT mapping and
+        // therefore do not need to be marked.
+        void markDeadSources(
+            const std::shared_ptr<DVRHelperVectorRegisterFile> &regs,
+            const std::vector<int16_t> &old_physical)
+        {
+            auto matches = [&](int16_t phys) {
+                if (phys < 0)
+                    return false;
+                return std::find(old_physical.begin(), old_physical.end(),
+                                 phys) != old_physical.end();
+            };
+            for (auto &pending : virBuffer) {
+                if (pending.helperRegs != regs)
+                    continue;
+                const unsigned count = std::min(
+                    pending.lanes.size(), pending.source0Physical.size());
+                for (unsigned index = 0; index < count; ++index) {
+                    const unsigned lane = pending.lanes[index];
+                    if (lane >= DVRHelperVectorRegisterFile::MaxLanes)
+                        continue;
+                    const uint64_t bit = uint64_t(1) << (lane % 64);
+                    const unsigned word = lane / 64;
+                    if (matches(pending.source0Physical[index]))
+                        pending.source0DeadMask[word] |= bit;
+                    if (index < pending.source1Physical.size() &&
+                        matches(pending.source1Physical[index]))
+                        pending.source1DeadMask[word] |= bit;
+                }
+            }
         }
 
         void refillIssueQueue()

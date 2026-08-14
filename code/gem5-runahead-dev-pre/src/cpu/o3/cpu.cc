@@ -2613,14 +2613,14 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 dvrTraceVector("discovery_complete", curTick(),
                     result.triggerPC, committed_flr,
                     inference.matched ? inference.lanes : 0);
-                // DVR follows the paper's reconvergence policy: all
-                // divergent paths are deferred until the final indirect
-                // load (FLR), which is the vector-runahead termination PC.
-                // The recorder's first-observed successor is only a fallback
-                // for incomplete control metadata and must not be used when
-                // a real FLR is known.
+                // DVR follows the paper's two-case reconvergence policy:
+                // branches at or before FLR use FLR as the termination/join
+                // point, while a branch strictly between FLR and the loop
+                // back-edge (LCR) uses the loop boundary.  The latter case
+                // lets divergent lanes continue to the next stride PC
+                // instead of waiting for an already-consumed FLR.
                 dvrInstructionRecorder.setReconvergencePC(
-                    committed_flr);
+                    committed_flr, dvrLoopBoundDetector.branchPC());
                 // Publish this complete dynamic path before looking up its
                 // opposite direction.  A later discovery can then splice
                 // the cached suffix into the same reconvergence point.
@@ -2765,15 +2765,9 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                             initial_vir_size = index + 1;
                     }
                     const Addr lcr_pc = dvrLoopBoundDetector.branchPC();
-                    bool continue_past_flr = false;
-                    for (unsigned index = initial_vir_size;
-                         index < vir_program.size(); ++index) {
-                        if (vir_program[index].conditional &&
-                            vir_program[index].pc != lcr_pc) {
-                            continue_past_flr = true;
-                            break;
-                        }
-                    }
+                    const bool continue_past_flr =
+                        vir_program.hasConditionalBetween(
+                            committed_flr, lcr_pc);
                     if (!continue_past_flr && initial_vir_size > 1)
                         vir_program.truncate(initial_vir_size);
                     const auto vir_result =
@@ -3101,14 +3095,8 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
             replay->scalarCount = index + 1;
     }
     const Addr lcr_pc = dvrLoopBoundDetector.branchPC();
-    for (unsigned index = replay->scalarCount; index < replay->count;
-         ++index) {
-        if (dvrInstructionRecorder[index].conditional &&
-            dvrInstructionRecorder[index].pc != lcr_pc) {
-            replay->continuePastFLR = true;
-            break;
-        }
-    }
+    replay->continuePastFLR = dvrInstructionRecorder.hasConditionalBetween(
+        dvrCommittedFinalLoadPC, lcr_pc);
     // Source lanes begin at the next committed trigger occurrence.  The
     // replay register image must come from that same occurrence, otherwise
     // the source address and the non-trigger inputs belong to different
@@ -3281,7 +3269,8 @@ CPU::completeDVRNestedContext(
         return;
 
     dvrNestedContext.recorder.setReconvergencePC(
-        dvrNestedContext.taint.flr());
+        dvrNestedContext.taint.flr(),
+        dvrNestedContext.loopBound.branchPC());
     recordDVRAlternatePaths(dvrNestedContext.recorder,
                             committing_inst->contextId());
     augmentDVRAlternatePaths(dvrNestedContext.recorder,
@@ -3422,14 +3411,8 @@ CPU::launchDVRNestedPrefetches(
             replay->scalarCount = index + 1;
     }
     const Addr lcr_pc = dvrNestedContext.loopBound.branchPC();
-    for (unsigned index = replay->scalarCount; index < replay->count;
-         ++index) {
-        if (dvrNestedContext.recorder[index].conditional &&
-            dvrNestedContext.recorder[index].pc != lcr_pc) {
-            replay->continuePastFLR = true;
-            break;
-        }
-    }
+    replay->continuePastFLR = dvrNestedContext.recorder.hasConditionalBetween(
+        dvrNestedContext.taint.flr(), lcr_pc);
     replay->initialRegs = finish_regs;
     if (replay->count != 0) {
         replay->triggerDestination =
@@ -3937,6 +3920,19 @@ CPU::issueDVRReplayLanes(unsigned slots)
             if (frame.alternatePath)
                 ++cpuStats.dvrReconvergenceResumeSuccesses;
         }
+        // Once the final frame is popped, all surviving lanes are at a
+        // common control-flow point.  Divergence is a property of the active
+        // SIMT path, not a lifetime bit on the lane object.
+        if (reconvergence->depth == 0) {
+            reconvergence->renamedDestinations.clear();
+            for (auto &lane : dvrHelperThread.replayLanes) {
+                if (lane.active && lane.reconvergence == reconvergence &&
+                    !lane.reconvergenceBlocked) {
+                    lane.simtDivergent = false;
+                    lane.simtPath = 0;
+                }
+            }
+        }
     }
     const Lane *seed = nullptr;
     std::vector<Lane *> group;
@@ -4252,11 +4248,24 @@ CPU::issueDVRReplayLanes(unsigned slots)
                 continue;
             if (reconvergence->depth >=
                 DVRHelperThread::ReplayReconvergenceState::Entries) {
-                ++cpuStats.dvrReconvergenceStackOverflows;
-                cpuStats.dvrSIMTStackOverflowDroppedLanes +=
+                const unsigned dropped =
                     __builtin_popcountll(branch_masks[path][0]) +
                     __builtin_popcountll(branch_masks[path][1]);
-                break;
+                ++cpuStats.dvrReconvergenceStackOverflows;
+                cpuStats.dvrSIMTStackOverflowDroppedLanes += dropped;
+                dvrTraceVector("reconvergence_overflow", curTick(),
+                               uop.pc, branch_reconvergence, dropped,
+                               static_cast<int>(reconvergence->depth));
+                // An unrepresented path cannot be executed correctly: its
+                // mask and resume PC would be lost.  Abort this helper
+                // generation and let the scalar main thread continue.
+                for (auto &lane : dvrHelperThread.replayLanes) {
+                    if (lane.reconvergence == reconvergence)
+                        lane.active = false;
+                }
+                reconvergence->depth = 0;
+                reconvergence->renamedDestinations.clear();
+                return 1;
             }
             auto &frame = reconvergence->stack[reconvergence->depth++];
             frame.currentPC = branch_group_pc[selected_branch_group];
@@ -4288,11 +4297,17 @@ CPU::issueDVRReplayLanes(unsigned slots)
         ++cpuStats.dvrDivergentBranches;
     }
     if (uop.conditional && branch_outcomes_complete && branch_groups != 0) {
-        const bool selected_taken = branch_group_taken[selected_branch_group];
-        for (Lane *lane : group) {
-            lane->simtPath = selected_taken ? 1 : 2;
+        for (auto &lane : dvrHelperThread.replayLanes) {
+            if (!lane.active || lane.reconvergence != reconvergence ||
+                !branch_next_valid[lane.lane])
+                continue;
+            lane.simtPath = branch_group_taken[
+                std::find(branch_group_pc.begin(),
+                          branch_group_pc.begin() + branch_groups,
+                          branch_next_pc[lane.lane]) -
+                branch_group_pc.begin()] ? 1 : 2;
             if (branch_divergent)
-                lane->simtDivergent = true;
+                lane.simtDivergent = true;
         }
     }
     // This is the helper's actual same-PC vector issue group.  Keep the
@@ -4360,6 +4375,8 @@ CPU::issueDVRReplayLanes(unsigned slots)
     copy.executedMask = {};
     copy.completedMask = {};
     copy.deadSourceMask = {};
+    copy.deadSource0Mask = {};
+    copy.deadSource1Mask = {};
     copy.pc = uop.pc;
     copy.uopIndex = seed->uopIndex;
     copy.inFlight = 1;
@@ -4394,11 +4411,15 @@ CPU::issueDVRReplayLanes(unsigned slots)
     // Rename a vector destination exactly once for this dynamic uop.  The
     // old source names were retained above, so destination==source and WAW
     // cases preserve the old values until this VIR copy retires.
-    const bool source_vectorized = seed->helperRegs &&
-        ((uop.source0 >= 0 &&
-          seed->helperRegs->isVectorized(uop.source0)) ||
-         (uop.source1 >= 0 &&
-          seed->helperRegs->isVectorized(uop.source1)));
+    bool source_vectorized = false;
+    if (seed->helperRegs) {
+        for (Lane *lane : group) {
+            source_vectorized |= uop.source0 >= 0 &&
+                seed->helperRegs->isVectorized(uop.source0, lane->lane);
+            source_vectorized |= uop.source1 >= 0 &&
+                seed->helperRegs->isVectorized(uop.source1, lane->lane);
+        }
+    }
     // Paper 4.2.1 requires a vector destination when either a source is
     // already vectorized or the current lane group is on a divergent path.
     // The latter matters for control-only diamonds whose arithmetic inputs
@@ -4409,21 +4430,75 @@ CPU::issueDVRReplayLanes(unsigned slots)
     const bool vector_destination = uop.destination > 0 &&
         uop.destination < DVRLoopBoundDetector::MaxArchitecturalIntRegs &&
         seed->helperRegs && (source_vectorized || control_divergence);
-    const uint64_t rename_key = (static_cast<uint64_t>(uop.pc) << 8) |
-        static_cast<uint64_t>(uop.destination & 0xff);
-    const bool first_vector_destination = vector_destination && reconvergence &&
+    // A scalar instruction that overwrites a vectorized architectural
+    // register must demote it to a fresh scalar mapping.  Otherwise the
+    // scalar result would overwrite the vector bundle in VRAT.
+    const bool scalar_overwrite = uop.destination > 0 &&
+        uop.destination < DVRLoopBoundDetector::MaxArchitecturalIntRegs &&
+        seed->helperRegs && !vector_destination &&
+        seed->helperRegs->isVectorized(uop.destination);
+    // Rename once for the complete active path, not once per eight-lane
+    // VIR copy.  Different paths receive different keys and therefore get
+    // independent masked mappings.
+    std::array<uint64_t, 2> rename_mask = {};
+    for (auto &candidate : dvrHelperThread.replayLanes) {
+        if (!candidate.active || candidate.reconvergence != reconvergence ||
+            candidate.program != seed->program ||
+            candidate.uopIndex != seed->uopIndex ||
+            candidate.lanePC != uop.pc ||
+            candidate.reconvergenceBlocked ||
+            candidate.simtPath != seed->simtPath)
+            continue;
+        rename_mask[candidate.lane / 64] |=
+            uint64_t(1) << (candidate.lane % 64);
+    }
+    if (rename_mask[0] == 0 && rename_mask[1] == 0) {
+        for (Lane *lane : group)
+            rename_mask[lane->lane / 64] |=
+                uint64_t(1) << (lane->lane % 64);
+    }
+    const uint64_t mask_hash = rename_mask[0] ^
+        ((rename_mask[1] << 17) | (rename_mask[1] >> 47));
+    const uint64_t rename_key = (static_cast<uint64_t>(uop.pc) << 8) ^
+        static_cast<uint64_t>(uop.destination & 0xff) ^
+        mask_hash ^ (static_cast<uint64_t>(seed->simtPath) << 56);
+    const bool first_destination_rename =
+        (vector_destination || scalar_overwrite) && reconvergence &&
         reconvergence->renamedDestinations.insert(rename_key).second;
-    if (first_vector_destination) {
-        if (control_divergence && !source_vectorized)
-            ++cpuStats.dvrVRATControlDivergenceAllocations;
-        if (!seed->helperRegs->renameVector(uop.destination)) {
+    if (first_destination_rename) {
+        const auto old_physical =
+            seed->helperRegs->physicalMappings(uop.destination);
+        bool renamed = false;
+        if (vector_destination) {
+            if (control_divergence && !source_vectorized)
+                ++cpuStats.dvrVRATControlDivergenceAllocations;
+            renamed = seed->helperRegs->renameVectorMasked(
+                uop.destination, rename_mask);
+        } else {
+            renamed = seed->helperRegs->renameScalarMasked(
+                uop.destination, rename_mask) >= 0;
+        }
+        if (!renamed) {
             ++cpuStats.dvrVIRSourceValueSemanticFailures;
             for (Lane *lane : group)
                 lane->active = false;
+        } else {
+            // Only names no longer referenced by any lane are dead.  A
+            // deferred path may still legitimately retain part of the old
+            // mapping after this masked rename.
+            const auto current_physical =
+                seed->helperRegs->physicalMappings(uop.destination);
+            std::vector<int16_t> dead_physical;
+            for (const auto old : old_physical)
+                if (std::find(current_physical.begin(),
+                              current_physical.end(), old) ==
+                    current_physical.end())
+                    dead_physical.push_back(old);
+            dvrHelperThread.markDeadSources(
+                seed->helperRegs, dead_physical);
         }
         assert(seed->helperRegs->conservationValid());
     }
-
     for (Lane *lane : group) {
         const auto &lane_uop = lane->program->uops[lane->uopIndex];
         const RegVal source0 = lane_uop.source0 >= 0 &&
