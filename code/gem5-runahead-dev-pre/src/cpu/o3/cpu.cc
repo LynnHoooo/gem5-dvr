@@ -1046,7 +1046,10 @@ CPU::CPUStats::CPUStats(CPU *cpu)
       ADD_STAT(dvrVectorProgramsBuilt, statistics::units::Count::get(),
                "Recorded slices materialized as DVR vector programs"),
       ADD_STAT(dvrVRATAllocations, statistics::units::Count::get(),
-               "16-lane physical mappings allocated by the DVR VRAT"),
+               "16-copy (128 scalar-lane) physical mappings allocated by the DVR VRAT"),
+      ADD_STAT(dvrVRATControlDivergenceAllocations,
+               statistics::units::Count::get(),
+               "VRAT vector bundles allocated solely because control-flow diverged"),
       ADD_STAT(dvrVIRChunkIssues, statistics::units::Count::get(),
                "Recorded uop chunks issued through the DVR VIR"),
       ADD_STAT(dvrVIRChunkExecutions, statistics::units::Count::get(),
@@ -3827,6 +3830,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
                     lane.reconvergenceBlocked = false;
                     lane.lanePC = frame.pc;
                     lane.simtPath = frame.takenPath ? 1 : 2;
+                    lane.simtDivergent = true;
                 } else if (lane.lanePC == frame.reconvergencePC) {
                     // The SIMT stack selects the deferred mask after a
                     // reconvergence point. Lanes from the path just
@@ -4111,8 +4115,11 @@ CPU::issueDVRReplayLanes(unsigned slots)
     }
     if (uop.conditional && branch_outcomes_complete && branch_groups != 0) {
         const bool selected_taken = branch_group_taken[selected_branch_group];
-        for (Lane *lane : group)
+        for (Lane *lane : group) {
             lane->simtPath = selected_taken ? 1 : 2;
+            if (branch_divergent)
+                lane->simtDivergent = true;
+        }
     }
     // This is the helper's actual same-PC vector issue group.  Keep the
     // continuation counters tied to the execution-driven lane path rather
@@ -4213,18 +4220,28 @@ CPU::issueDVRReplayLanes(unsigned slots)
     // Rename a vector destination exactly once for this dynamic uop.  The
     // old source names were retained above, so destination==source and WAW
     // cases preserve the old values until this VIR copy retires.
-    const bool vector_destination = uop.destination > 0 &&
-        uop.destination < DVRLoopBoundDetector::MaxArchitecturalIntRegs &&
-        seed->helperRegs &&
+    const bool source_vectorized = seed->helperRegs &&
         ((uop.source0 >= 0 &&
           seed->helperRegs->isVectorized(uop.source0)) ||
          (uop.source1 >= 0 &&
           seed->helperRegs->isVectorized(uop.source1)));
+    // Paper 4.2.1 requires a vector destination when either a source is
+    // already vectorized or the current lane group is on a divergent path.
+    // The latter matters for control-only diamonds whose arithmetic inputs
+    // remain scalar but whose results differ by lane.
+    bool control_divergence = false;
+    for (Lane *lane : group)
+        control_divergence |= lane->simtDivergent;
+    const bool vector_destination = uop.destination > 0 &&
+        uop.destination < DVRLoopBoundDetector::MaxArchitecturalIntRegs &&
+        seed->helperRegs && (source_vectorized || control_divergence);
     const uint64_t rename_key = (static_cast<uint64_t>(uop.pc) << 8) |
         static_cast<uint64_t>(uop.destination & 0xff);
     const bool first_vector_destination = vector_destination && reconvergence &&
         reconvergence->renamedDestinations.insert(rename_key).second;
     if (first_vector_destination) {
+        if (control_divergence && !source_vectorized)
+            ++cpuStats.dvrVRATControlDivergenceAllocations;
         if (!seed->helperRegs->renameVector(uop.destination)) {
             ++cpuStats.dvrVIRSourceValueSemanticFailures;
             for (Lane *lane : group)

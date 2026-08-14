@@ -813,6 +813,7 @@ class CPU : public BaseCPU
         statistics::Scalar dvrRecorderOverflows;
         statistics::Scalar dvrVectorProgramsBuilt;
         statistics::Scalar dvrVRATAllocations;
+        statistics::Scalar dvrVRATControlDivergenceAllocations;
         statistics::Scalar dvrVIRChunkIssues;
         statistics::Scalar dvrVIRChunkExecutions;
         statistics::Scalar dvrDivergentBranches;
@@ -1724,6 +1725,7 @@ class CPU : public BaseCPU
             // not-taken SIMT paths.  The tag is restored with a stack frame
             // so dependent loads can be attributed to both paths.
             uint8_t simtPath = 0;
+            bool simtDivergent = false;
             unsigned helperUops = 0;
             bool nested = false;
             bool active = true;
