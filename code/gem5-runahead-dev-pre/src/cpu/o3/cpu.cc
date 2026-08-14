@@ -3788,9 +3788,33 @@ CPU::issueDVRReplayLanes(unsigned slots)
                 &state) {
             if (!state)
                 return;
+            const Addr preferred_pc = state->currentValid ?
+                state->currentPC : 0;
+            const auto preferred_mask = state->currentMask;
             state->currentPC = 0;
             state->currentMask = {};
             state->currentValid = false;
+            // The stack head is the architectural SIMT scheduler state.  At
+            // a pop, preserve its PC/mask and only remove lanes that have
+            // terminated while the deferred path was parked.
+            if (preferred_pc != 0) {
+                for (const auto &lane : dvrHelperThread.replayLanes) {
+                    if (!lane.active || lane.reconvergence != state ||
+                        lane.reconvergenceBlocked ||
+                        lane.lanePC != preferred_pc)
+                        continue;
+                    const uint64_t bit = uint64_t(1) << (lane.lane % 64);
+                    if (!(preferred_mask[lane.lane / 64] & bit))
+                        continue;
+                    state->currentMask[lane.lane / 64] |= bit;
+                }
+                if (state->currentMask[0] != 0 ||
+                    state->currentMask[1] != 0) {
+                    state->currentPC = preferred_pc;
+                    state->currentValid = true;
+                    return;
+                }
+            }
             for (const auto &lane : dvrHelperThread.replayLanes) {
                 if (!lane.active || lane.reconvergence != state ||
                     lane.reconvergenceBlocked || lane.lanePC == 0)
@@ -3934,6 +3958,15 @@ CPU::issueDVRReplayLanes(unsigned slots)
             }
         }
     }
+    const auto inCurrentGroup = [&](const Lane &lane) {
+        if (!reconvergence || !reconvergence->currentValid ||
+            !lane.active || lane.reconvergence != reconvergence ||
+            lane.reconvergenceBlocked ||
+            lane.lanePC != reconvergence->currentPC)
+            return false;
+        const uint64_t bit = uint64_t(1) << (lane.lane % 64);
+        return (reconvergence->currentMask[lane.lane / 64] & bit) != 0;
+    };
     const Lane *seed = nullptr;
     std::vector<Lane *> group;
     for (auto &lane : dvrHelperThread.replayLanes) {
@@ -3945,7 +3978,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
             lane.termination = Lane::TerminationReason::Timeout;
             continue;
         }
-        if (lane.reconvergenceBlocked)
+        if (!inCurrentGroup(lane))
             continue;
         // A VIR issue group and its SIMT stack are one helper-generation
         // context.  Without this guard, the first active generation supplies
@@ -4036,11 +4069,9 @@ CPU::issueDVRReplayLanes(unsigned slots)
         unsigned active_branch_lanes = 0;
         bool all_branch_lanes_ready = true;
         for (const auto &candidate : dvrHelperThread.replayLanes) {
-            if (!candidate.active || candidate.reconvergenceBlocked ||
-                candidate.reconvergence != reconvergence ||
+            if (!inCurrentGroup(candidate) ||
                 candidate.program != seed->program ||
-                candidate.uopIndex != seed->uopIndex ||
-                candidate.lanePC != uop.pc)
+                candidate.uopIndex != seed->uopIndex)
                 continue;
             ++active_branch_lanes;
             all_branch_lanes_ready &= laneSourcesReady(candidate);
@@ -4051,11 +4082,9 @@ CPU::issueDVRReplayLanes(unsigned slots)
         if (active_branch_lanes == 0 || !all_branch_lanes_ready)
             return 0;
         for (auto &candidate : dvrHelperThread.replayLanes) {
-            if (!candidate.active || candidate.reconvergenceBlocked ||
-                candidate.reconvergence != reconvergence ||
+            if (!inCurrentGroup(candidate) ||
                 candidate.program != seed->program ||
-                candidate.uopIndex != seed->uopIndex ||
-                candidate.lanePC != uop.pc)
+                candidate.uopIndex != seed->uopIndex)
                 continue;
             Lane *lane = &candidate;
             const auto &lane_uop = lane->program->uops[lane->uopIndex];
@@ -4104,11 +4133,9 @@ CPU::issueDVRReplayLanes(unsigned slots)
         }
         unsigned evaluated_branch_lanes = 0;
         for (const auto &candidate : dvrHelperThread.replayLanes) {
-            if (!candidate.active || candidate.reconvergenceBlocked ||
-                candidate.reconvergence != reconvergence ||
+            if (!inCurrentGroup(candidate) ||
                 candidate.program != seed->program ||
-                candidate.uopIndex != seed->uopIndex ||
-                candidate.lanePC != uop.pc)
+                candidate.uopIndex != seed->uopIndex)
                 continue;
             if (branch_next_valid[candidate.lane])
                 ++evaluated_branch_lanes;
@@ -4195,11 +4222,9 @@ CPU::issueDVRReplayLanes(unsigned slots)
     // rather than only for the eight lanes selected for this VIR copy.
     if (uop.conditional && branch_outcomes_complete) {
         for (auto &candidate : dvrHelperThread.replayLanes) {
-            if (!candidate.active || candidate.reconvergenceBlocked ||
-                candidate.reconvergence != reconvergence ||
+            if (!candidate.active || candidate.reconvergence != reconvergence ||
                 candidate.program != seed->program ||
                 candidate.uopIndex != seed->uopIndex ||
-                candidate.lanePC != uop.pc ||
                 !branch_next_valid[candidate.lane])
                 continue;
             const Addr next_pc = branch_next_pc[candidate.lane];
@@ -4256,16 +4281,23 @@ CPU::issueDVRReplayLanes(unsigned slots)
                 dvrTraceVector("reconvergence_overflow", curTick(),
                                uop.pc, branch_reconvergence, dropped,
                                static_cast<int>(reconvergence->depth));
-                // An unrepresented path cannot be executed correctly: its
-                // mask and resume PC would be lost.  Abort this helper
-                // generation and let the scalar main thread continue.
+                // The paper bounds the hardware stack at eight entries but
+                // does not define an architectural overflow protocol.  DVR
+                // is speculative, so preserve the current path and all
+                // already-represented frames, while masking off only the
+                // deferred lanes for this unrepresentable path.  This is the
+                // bounded recovery used by the helper; the main thread is
+                // unaffected and remains the correctness fallback.
                 for (auto &lane : dvrHelperThread.replayLanes) {
-                    if (lane.reconvergence == reconvergence)
+                    if (lane.reconvergence != reconvergence)
+                        continue;
+                    const uint64_t bit = uint64_t(1) << (lane.lane % 64);
+                    if (branch_masks[path][lane.lane / 64] & bit) {
                         lane.active = false;
+                        lane.termination = Lane::TerminationReason::External;
+                    }
                 }
-                reconvergence->depth = 0;
-                reconvergence->renamedDestinations.clear();
-                return 1;
+                continue;
             }
             auto &frame = reconvergence->stack[reconvergence->depth++];
             frame.currentPC = branch_group_pc[selected_branch_group];

@@ -2184,6 +2184,21 @@ class CPU : public BaseCPU
             lane_context.lanePC = sender.replay->count > 1 ?
                 sender.replay->uops[1].pc : 0;
             lane_context.nested = sender.nested;
+            // The current SIMT group is explicit state, including lanes that
+            // arrive from later source responses.  They may join the head
+            // group only when their entry PC matches the current PC; lanes
+            // for another PC remain pending until the current mask drains.
+            if (lane_context.lanePC != 0) {
+                if (!reconvergence->currentValid) {
+                    reconvergence->currentPC = lane_context.lanePC;
+                    reconvergence->currentMask = {};
+                    reconvergence->currentValid = true;
+                }
+                if (reconvergence->currentPC == lane_context.lanePC) {
+                    reconvergence->currentMask[lane_context.lane / 64] |=
+                        uint64_t(1) << (lane_context.lane % 64);
+                }
+            }
             sender.helperRegs->write(
                 sender.replay->triggerDestination, sender.lane,
                 source_value, 0);
