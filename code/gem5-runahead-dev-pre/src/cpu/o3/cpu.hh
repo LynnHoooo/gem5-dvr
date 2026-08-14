@@ -1537,6 +1537,7 @@ class CPU : public BaseCPU
         FILE *workload = nullptr;
         FILE *dependency = nullptr;
         FILE *vectorization = nullptr;
+        FILE *loopBounds = nullptr;
         FILE *events = nullptr;
         bool enabled() const { return workload != nullptr; }
     } dvrTrace;
@@ -1547,6 +1548,11 @@ class CPU : public BaseCPU
                             int lanes = 0);
     void dvrTraceVector(const char *kind, Tick tick, Addr pc, Addr address,
                         int lanes, int invocation = -1);
+    void dvrTraceLoopBound(
+        Tick tick, const char *reason, Addr trigger_pc, Addr final_load_pc,
+        Addr branch_pc, Addr target_pc, int source0, int source1,
+        uint8_t comparison, bool has_bound,
+        const DVRLoopBoundDetector::Inference *inference);
     void dvrTraceSIMTBranch(
         Tick tick, Addr branch_pc, Addr reconvergence_pc,
         const std::array<uint64_t, 2> &active_mask,

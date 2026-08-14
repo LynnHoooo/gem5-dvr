@@ -225,6 +225,7 @@ CPU::CPU(const BaseO3CPUParams &params)
         dvrTrace.workload = open_trace("workload.csv");
         dvrTrace.dependency = open_trace("dependency_chain.csv");
         dvrTrace.vectorization = open_trace("vectorization.csv");
+        dvrTrace.loopBounds = open_trace("loop_bounds.csv");
         dvrTrace.events = open_trace("events.jsonl");
         if (dvrTrace.workload)
             std::fprintf(dvrTrace.workload, "tick,seq,kind,pc,address\n");
@@ -234,6 +235,11 @@ CPU::CPU(const BaseO3CPUParams &params)
         if (dvrTrace.vectorization)
             std::fprintf(dvrTrace.vectorization,
                 "tick,kind,pc,address,lanes,invocation\n");
+        if (dvrTrace.loopBounds)
+            std::fprintf(dvrTrace.loopBounds,
+                "tick,reason,trigger_pc,flr,branch_pc,target_pc,source0,"
+                "source1,comparison,has_bound,matched,fallback,bound,"
+                "increment,remaining,lanes\n");
     }
     dvrIssueWidth = params.issueWidth;
     dvrFetchWidth = params.fetchWidth;
@@ -577,6 +583,7 @@ CPU::~CPU()
     if (dvrTrace.workload) std::fclose(dvrTrace.workload);
     if (dvrTrace.dependency) std::fclose(dvrTrace.dependency);
     if (dvrTrace.vectorization) std::fclose(dvrTrace.vectorization);
+    if (dvrTrace.loopBounds) std::fclose(dvrTrace.loopBounds);
     if (dvrTrace.events) std::fclose(dvrTrace.events);
 }
 
@@ -630,6 +637,34 @@ CPU::dvrTraceVector(const char *kind, Tick tick, Addr pc, Addr address,
         static_cast<unsigned long long>(tick), kind,
         static_cast<unsigned long long>(pc),
         static_cast<unsigned long long>(address), lanes, invocation);
+}
+
+void
+CPU::dvrTraceLoopBound(
+    Tick tick, const char *reason, Addr trigger_pc, Addr final_load_pc,
+    Addr branch_pc, Addr target_pc, int source0, int source1,
+    uint8_t comparison, bool has_bound,
+    const DVRLoopBoundDetector::Inference *inference)
+{
+    if (!dvrTrace.enabled() || !dvrTrace.loopBounds)
+        return;
+    const bool matched = inference && inference->matched;
+    const bool fallback = inference && inference->fallback;
+    const uint64_t bound = matched ? inference->bound : 0;
+    const int64_t increment = matched ? inference->increment : 0;
+    const uint64_t remaining = matched ? inference->remaining : 0;
+    const unsigned lanes = inference ? inference->lanes : 0;
+    std::fprintf(dvrTrace.loopBounds,
+        "%llu,%s,%#llx,%#llx,%#llx,%#llx,%d,%d,%u,%d,%d,%d,%llu,%lld,%llu,%u\n",
+        static_cast<unsigned long long>(tick), reason ? reason : "unknown",
+        static_cast<unsigned long long>(trigger_pc),
+        static_cast<unsigned long long>(final_load_pc),
+        static_cast<unsigned long long>(branch_pc),
+        static_cast<unsigned long long>(target_pc), source0, source1,
+        comparison, has_bound ? 1 : 0, matched ? 1 : 0, fallback ? 1 : 0,
+        static_cast<unsigned long long>(bound),
+        static_cast<long long>(increment),
+        static_cast<unsigned long long>(remaining), lanes);
 }
 
 void
@@ -6337,6 +6372,11 @@ CPU::recordDVRDiscoveryGeneration(
         record.matched = inference->matched;
         record.lanes = inference->lanes;
     }
+    dvrTraceLoopBound(curTick(), reason, record.initialTriggerPC,
+                      record.finalLoadPC, record.loopBranchPC,
+                      record.loopTargetPC, record.boundSource0,
+                      record.boundSource1, record.comparison,
+                      record.hasBound, inference);
     dvrDiscoveryHistory.push_back(record);
     dvrTraceVector("discovery_generation_record", curTick(),
                    record.initialTriggerPC, record.finalLoadPC,

@@ -195,9 +195,15 @@ class DVRNestedDiscoveryMode
     };
 
   private:
+    // The paper gives NDM a short, local search window: if no outer stride
+    // appears within 200 NDM instructions, it falls back to the inner-loop
+    // plan.  This is not the lifetime of the outer invocation plan after an
+    // outer stride has been found.
+    static constexpr unsigned PaperOuterSearchInstructions = 200;
     State currentState = State::Idle;
     unsigned laneThreshold;
-    unsigned maxInstructions;
+    unsigned outerSearchMaxInstructions;
+    unsigned outerCollectionMaxInstructions;
     unsigned committedInstructions = 0;
     Addr innerLoadPC = 0;
     int64_t increment = 0;
