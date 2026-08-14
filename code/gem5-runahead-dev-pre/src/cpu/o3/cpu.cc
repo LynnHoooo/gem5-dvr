@@ -1115,6 +1115,12 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Dependent loads executed on taken SIMT paths"),
       ADD_STAT(dvrSIMTNotTakenDependentLoads, statistics::units::Count::get(),
                "Dependent loads executed on not-taken SIMT paths"),
+      ADD_STAT(dvrReplayContinuePastFLRTemplates,
+               statistics::units::Count::get(),
+               "Replay templates that continue past FLR to the loop boundary"),
+      ADD_STAT(dvrReplayContinuePastFLRLanes,
+               statistics::units::Count::get(),
+               "Replay lanes admitted to templates that continue past FLR"),
       ADD_STAT(dvrSIMTTakenPathTerminations,
                statistics::units::Count::get(),
                "Taken-path lanes terminated during helper replay"),
@@ -3097,7 +3103,13 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
 
     auto replay = std::make_shared<DVRReplayTemplate>();
     replay->triggerPC = pc;
-    replay->stridePC = pc;
+    // The next iteration boundary is the loop back-edge target, not
+    // necessarily the trigger load itself.  CC commonly enters its loop
+    // body through a header before reaching the stride load; matching only
+    // the trigger PC would miss every stride-PC termination.
+    replay->stridePC = dvrLoopBoundDetector.targetPC() != 0 ?
+        dvrLoopBoundDetector.targetPC() : pc;
+    replay->loopControlPC = dvrLoopBoundDetector.branchPC();
     /*
      * Keep the complete captured stream in the replay template.  The FLR is
      * still the discovery marker and the first dependent target, but a
@@ -3115,6 +3127,8 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
     const Addr lcr_pc = dvrLoopBoundDetector.branchPC();
     replay->continuePastFLR = dvrInstructionRecorder.hasConditionalBetween(
         dvrCommittedFinalLoadPC, lcr_pc);
+    if (replay->continuePastFLR)
+        ++cpuStats.dvrReplayContinuePastFLRTemplates;
     // Source lanes begin at the next committed trigger occurrence.  The
     // replay register image must come from that same occurrence, otherwise
     // the source address and the non-trigger inputs belong to different
@@ -3419,7 +3433,10 @@ CPU::launchDVRNestedPrefetches(
 {
     auto replay = std::make_shared<DVRReplayTemplate>();
     replay->triggerPC = dvrNestedContext.triggerPC;
-    replay->stridePC = dvrNestedContext.triggerPC;
+    replay->stridePC = dvrNestedContext.loopBound.targetPC() != 0 ?
+        dvrNestedContext.loopBound.targetPC() :
+        dvrNestedContext.triggerPC;
+    replay->loopControlPC = dvrNestedContext.loopBound.branchPC();
     // Keep branches after FLR in the persistent template for the same
     // divergent-path rule used by ordinary DVR replay.
     replay->count = dvrNestedContext.recorder.size();
@@ -3431,6 +3448,8 @@ CPU::launchDVRNestedPrefetches(
     const Addr lcr_pc = dvrNestedContext.loopBound.branchPC();
     replay->continuePastFLR = dvrNestedContext.recorder.hasConditionalBetween(
         dvrNestedContext.taint.flr(), lcr_pc);
+    if (replay->continuePastFLR)
+        ++cpuStats.dvrReplayContinuePastFLRTemplates;
     replay->initialRegs = finish_regs;
     if (replay->count != 0) {
         replay->triggerDestination =
@@ -3970,8 +3989,16 @@ CPU::issueDVRReplayLanes(unsigned slots)
             for (auto &lane : dvrHelperThread.replayLanes) {
                 if (lane.active && lane.reconvergence == reconvergence &&
                     !lane.reconvergenceBlocked) {
-                    lane.simtDivergent = false;
-                    lane.simtPath = 0;
+                    // A template with a branch between FLR and LCR remains
+                    // in the paper's divergent-generation mode after the
+                    // alternate frame is popped.  The LCR itself is the
+                    // termination boundary, so clearing this bit here would
+                    // make the final branch look scalar and strand the
+                    // generation past its intended next-stride stop.
+                    if (!lane.continuePastFLR) {
+                        lane.simtDivergent = false;
+                        lane.simtPath = 0;
+                    }
                 }
             }
         }
@@ -4094,6 +4121,13 @@ CPU::issueDVRReplayLanes(unsigned slots)
             ++active_branch_lanes;
             all_branch_lanes_ready &= laneSourcesReady(candidate);
         }
+        // Keep a trace point even when the branch cannot be admitted yet.
+        // This distinguishes "the replay template has no branch" from
+        // "the branch is present but its dependent operands never became
+        // ready", which is the critical BFS diagnostic.
+        dvrTraceVector("replay_branch_candidate", curTick(), uop.pc,
+                       branch_reconvergence, active_branch_lanes,
+                       uop.tainted ? 1 : 0);
         // SIMT branch grouping is atomic over the active group.  Waiting for
         // all operands prevents a partial ready mask from being committed as
         // if it represented the whole vector.
@@ -4166,6 +4200,9 @@ CPU::issueDVRReplayLanes(unsigned slots)
         const unsigned not_taken_lanes =
             __builtin_popcountll(branch_not_taken_mask[0]) +
             __builtin_popcountll(branch_not_taken_mask[1]);
+        dvrTraceVector("replay_branch_evaluated", curTick(), uop.pc,
+                       branch_reconvergence, evaluated_branch_lanes,
+                       static_cast<int>(branch_groups));
         cpuStats.dvrSIMTTakenLanes += taken_lanes;
         cpuStats.dvrSIMTNotTakenLanes += not_taken_lanes;
         cpuStats.dvrSIMTBranchGroups += branch_groups;
@@ -4254,8 +4291,16 @@ CPU::issueDVRReplayLanes(unsigned slots)
                     Lane::TerminationReason::External;
                 continue;
             }
-            if (next_pc == candidate.stridePC &&
-                (candidate.simtDivergent || branch_groups > 1)) {
+            const bool loop_backedge =
+                uop.branchTargetPC != 0 &&
+                uop.branchTargetPC < uop.pc;
+            const bool at_lcr = candidate.continuePastFLR &&
+                candidate.loopControlPC != 0 &&
+                uop.pc == candidate.loopControlPC;
+            if ((next_pc == candidate.stridePC ||
+                 (candidate.continuePastFLR && (loop_backedge || at_lcr))) &&
+                (candidate.simtDivergent || branch_groups > 1 ||
+                 candidate.continuePastFLR)) {
                 candidate.active = false;
                 candidate.termination =
                     Lane::TerminationReason::StridePC;
@@ -4477,9 +4522,14 @@ CPU::issueDVRReplayLanes(unsigned slots)
     bool control_divergence = false;
     for (Lane *lane : group)
         control_divergence |= lane->simtDivergent;
+    const bool destination_vectorized = uop.destination > 0 &&
+        uop.destination < DVRLoopBoundDetector::MaxArchitecturalIntRegs &&
+        seed->helperRegs &&
+        seed->helperRegs->isVectorized(uop.destination);
     const bool vector_destination = uop.destination > 0 &&
         uop.destination < DVRLoopBoundDetector::MaxArchitecturalIntRegs &&
-        seed->helperRegs && (source_vectorized || control_divergence);
+        seed->helperRegs && (source_vectorized || control_divergence) &&
+        !destination_vectorized;
     // A scalar instruction that overwrites a vectorized architectural
     // register must demote it to a fresh scalar mapping.  Otherwise the
     // scalar result would overwrite the vector bundle in VRAT.
@@ -4706,9 +4756,11 @@ CPU::issueDVRReplayLanes(unsigned slots)
                 continue;
             }
             const Addr line = dvrPrefetchLine(result);
-            if (dvrQueuedDependentLines.count(line) == 0 &&
-                dvrDependentOutstandingLines.count(line) == 0 &&
-                dvrDependentCompletedLines.count(line) == 0 &&
+            const bool value_response = lane->continuePastFLR;
+            if ((value_response ||
+                 (dvrQueuedDependentLines.count(line) == 0 &&
+                  dvrDependentOutstandingLines.count(line) == 0 &&
+                  dvrDependentCompletedLines.count(line) == 0)) &&
                 dvrPrefetchQueue.size() < DvrMaxQueuedPrefetches) {
                 DVRPrefetchAddress dependent;
                 dependent.address = static_cast<Addr>(result);
@@ -4764,11 +4816,26 @@ CPU::issueDVRReplayLanes(unsigned slots)
                         static_cast<int>(line));
                 }
             }
-            if (lane_uop.alternatePath &&
-                lane_uop.alternateResumePC != 0)
-                ++cpuStats.dvrReconvergenceResumeSuccesses;
-            lane->active = false;
-            lane->termination = Lane::TerminationReason::FLR;
+            // A normal chain ends at its first tainted load.  When discovery
+            // recorded a conditional between FLR and the loop-control
+            // reconvergence point, the paper requires the helper to keep the
+            // load result in the lane state and execute both paths.  Ending
+            // here would kill the alternate path before it can issue its
+            // dependent load and would make stride-PC termination impossible.
+            if (!lane->continuePastFLR) {
+                if (lane_uop.alternatePath &&
+                    lane_uop.alternateResumePC != 0)
+                    ++cpuStats.dvrReconvergenceResumeSuccesses;
+                lane->active = false;
+                lane->termination = Lane::TerminationReason::FLR;
+                continue;
+            }
+            // A value-returning dependent request owns the lane until its
+            // response arrives.  Park it outside the current SIMT group;
+            // resumeDependentLane() restores the load destination and
+            // successor PC.  In particular, do not write the computed
+            // address into the load destination here.
+            lane->lanePC = 0;
             continue;
         }
 
@@ -5091,8 +5158,11 @@ CPU::serviceDVRPrefetchRequest()
      * not a scalar load value.  ReadReq still has no architectural consumer
      * here, while Request::PREFETCH preserves helper accounting/priority.
      */
+    const bool value_response = !prefetch.source && prefetch.replay &&
+        prefetch.replay->continuePastFLR;
     PacketPtr pkt = new Packet(
-        req, prefetch.source ? MemCmd::ReadReq : MemCmd::SoftPFReq);
+        req, (prefetch.source || value_response) ?
+            MemCmd::ReadReq : MemCmd::SoftPFReq);
     pkt->allocate();
     auto *sender_state = new DVRPrefetchSenderState(
         prefetch.source, prefetch.nested, prefetch.oracle,
@@ -5102,6 +5172,7 @@ CPU::serviceDVRPrefetchRequest()
         prefetch.predicate, prefetch.lane, prefetch.tid);
     sender_state->helperLoadId = helper_load_id;
     sender_state->issueTick = curTick();
+    sender_state->valueResponse = value_response;
     pkt->senderState = sender_state;
     auto &port = iew.ldstQueue.getDataPort();
     if (!port.tryTiming(pkt)) {
@@ -5203,6 +5274,55 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
         }
     }
     dvrCompletedPrefetchLines[line] = curTick();
+    if (!state->source && state->valueResponse && pkt->hasData()) {
+        RegVal raw = 0;
+        const unsigned bytes = std::min<unsigned>(pkt->getSize(),
+                                                  sizeof(RegVal));
+        const uint8_t *data = pkt->getPtr<uint8_t>();
+        for (unsigned index = 0; index < bytes; ++index)
+            raw |= static_cast<RegVal>(data[index]) << (index * 8);
+        RegVal value = raw;
+        if (state->replay) {
+            using Semantic = DVRInstructionRecorder::Uop::Semantic;
+            for (unsigned index = 1; index < state->replay->count; ++index) {
+                if (state->replay->uops[index].pc != pkt->req->getPC())
+                    continue;
+                switch (state->replay->uops[index].semantic) {
+                  case Semantic::LoadByteSigned:
+                    value = static_cast<RegVal>(static_cast<int64_t>(
+                        static_cast<int8_t>(raw))); break;
+                  case Semantic::LoadHalfSigned:
+                    value = static_cast<RegVal>(static_cast<int64_t>(
+                        static_cast<int16_t>(raw))); break;
+                  case Semantic::LoadWordSigned:
+                    value = static_cast<RegVal>(static_cast<int64_t>(
+                        static_cast<int32_t>(raw))); break;
+                  case Semantic::LoadWordUnsigned:
+                    value = static_cast<RegVal>(
+                        static_cast<uint32_t>(raw)); break;
+                  case Semantic::LoadByteUnsigned:
+                    value = static_cast<RegVal>(
+                        static_cast<uint8_t>(raw)); break;
+                  case Semantic::LoadHalfUnsigned:
+                    value = static_cast<RegVal>(
+                        static_cast<uint16_t>(raw)); break;
+                  default:
+                    break;
+                }
+                break;
+            }
+        }
+        dvrTraceDependency("dependent_value", curTick(),
+                           state->replay ? state->replay->triggerPC :
+                           pkt->req->getPC(), pkt->req->getPC(), value,
+                           0, state->lane);
+        unsigned became_ready = 0;
+        if (dvrHelperThread.resumeDependentLane(
+                *state, pkt->req->getPC(), value, became_ready)) {
+            cpuStats.dvrHelperUopsBecameReady += became_ready;
+            ++cpuStats.dvrVIRContinuationResumes;
+        }
+    }
     if (state->source && pkt->hasData()) {
         ++cpuStats.dvrHelperLoadEntryWakeups;
         // Read exactly the architectural width requested by the trigger and
@@ -5254,6 +5374,8 @@ CPU::completeDVRPrefetch(PacketPtr pkt)
         retireDVRPredicateLane(state->predicate, state->lane, true, value);
         if (dvrVectorChunkModel && state->replay &&
             state->replay->count > 1) {
+            if (state->replay->continuePastFLR)
+                ++cpuStats.dvrReplayContinuePastFLRLanes;
             ++cpuStats.dvrReplayAttempts;
             if (state->nested)
                 ++cpuStats.dvrNestedReplayAttempts;

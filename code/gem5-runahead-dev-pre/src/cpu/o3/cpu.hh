@@ -828,6 +828,8 @@ class CPU : public BaseCPU
         statistics::Scalar dvrSIMTReconvergencePops;
         statistics::Scalar dvrSIMTTakenDependentLoads;
         statistics::Scalar dvrSIMTNotTakenDependentLoads;
+        statistics::Scalar dvrReplayContinuePastFLRTemplates;
+        statistics::Scalar dvrReplayContinuePastFLRLanes;
         statistics::Scalar dvrSIMTTakenPathTerminations;
         statistics::Scalar dvrSIMTNotTakenPathTerminations;
         statistics::Scalar dvrSIMTFLRTerminations;
@@ -1544,6 +1546,9 @@ class CPU : public BaseCPU
         // The stride PC is the loop-iteration boundary used when a
         // divergent path reaches the next iteration before the FLR.
         Addr stridePC = 0;
+        // Static PC of the loop-control branch (LCR), distinct from
+        // reconvergence PCs of branches inside the loop body.
+        Addr loopControlPC = 0;
         // The final dependent load is the ordinary DVR termination point.
         Addr finalLoadPC = 0;
         // Complete captured stream consumed by the persistent VIR.  The
@@ -1597,6 +1602,10 @@ class CPU : public BaseCPU
         // Helper-local identity, independent of the main DynInst/ROB.
         uint64_t helperLoadId = 0;
         Tick issueTick = 0;
+        // A dependent FLR load between the stride PC and the loop
+        // reconvergence point must return its value so the helper can
+        // evaluate the following per-lane branch.
+        bool valueResponse = false;
 
         DVRPrefetchSenderState(bool is_source, bool is_nested,
             bool is_oracle,
@@ -1901,7 +1910,13 @@ class CPU : public BaseCPU
             ThreadID tid = 0;
             Addr triggerPC = 0;
             Addr stridePC = 0;
+            Addr loopControlPC = 0;
             Addr finalLoadPC = 0;
+            // Ordinary replay terminates at the first tainted (FLR) load.
+            // A divergent template must carry on through that load so both
+            // branch paths can execute and the generation can terminate at
+            // the next stride PC (the paper's LCR rule).
+            bool continuePastFLR = false;
             unsigned uopIndex = 1;
             Addr lanePC = 0;
             bool reconvergenceBlocked = false;
@@ -2182,7 +2197,9 @@ class CPU : public BaseCPU
             lane_context.triggerPC = sender.replay->triggerPC;
             lane_context.stridePC = sender.replay->stridePC != 0 ?
                 sender.replay->stridePC : sender.replay->triggerPC;
+            lane_context.loopControlPC = sender.replay->loopControlPC;
             lane_context.finalLoadPC = sender.replay->finalLoadPC;
+            lane_context.continuePastFLR = sender.replay->continuePastFLR;
             lane_context.lanePC = sender.replay->count > 1 ?
                 sender.replay->uops[1].pc : 0;
             lane_context.nested = sender.nested;
@@ -2211,6 +2228,54 @@ class CPU : public BaseCPU
                 state = State::Running;
             }
             return true;
+        }
+
+        // Resume a lane after a dependent FLR load returned a real value.
+        // The lane was parked with lanePC=0 at the load; restore its
+        // destination and advance to the recorded successor without creating
+        // a second lane context.
+        bool resumeDependentLane(const DVRPrefetchSenderState &sender,
+                                 Addr load_pc, RegVal value,
+                                 unsigned &became_ready)
+        {
+            became_ready = 0;
+            if (!sender.replay || !sender.helperRegs || load_pc == 0)
+                return false;
+            for (auto &lane : replayLanes) {
+                if (!lane.active || lane.helperRegs != sender.helperRegs ||
+                    lane.program != sender.replay ||
+                    lane.lane != sender.lane || lane.lanePC != 0 ||
+                    lane.uopIndex >= lane.program->count ||
+                    lane.program->uops[lane.uopIndex].pc != load_pc)
+                    continue;
+                const auto &uop = lane.program->uops[lane.uopIndex];
+                if (uop.destination >= 0 &&
+                    uop.destination <
+                        DVRLoopBoundDetector::MaxArchitecturalIntRegs) {
+                    lane.regs[uop.destination] = value;
+                    lane.readyCycle[uop.destination] = 0;
+                    lane.helperRegs->write(uop.destination, lane.lane,
+                                           value, 0);
+                }
+                ++lane.helperUops;
+                const unsigned next = lane.uopIndex + 1;
+                lane.lanePC = next < lane.program->count ?
+                    lane.program->uops[next].pc : 0;
+                lane.uopIndex = next < lane.program->count ? next :
+                    lane.program->count;
+                if (lane.lanePC == 0) {
+                    lane.active = false;
+                    lane.termination = ReplayLaneContext::TerminationReason::
+                        External;
+                }
+                became_ready = readyUops == 0 ? 1 : 0;
+                if (became_ready != 0) {
+                    readyUops = 1;
+                    state = State::Running;
+                }
+                return true;
+            }
+            return false;
         }
 
         unsigned retireCompletedVIR(Tick now)
