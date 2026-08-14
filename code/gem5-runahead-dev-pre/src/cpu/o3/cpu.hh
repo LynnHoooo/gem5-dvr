@@ -825,6 +825,9 @@ class CPU : public BaseCPU
         statistics::Scalar dvrSIMTReconvergencePops;
         statistics::Scalar dvrSIMTTakenDependentLoads;
         statistics::Scalar dvrSIMTNotTakenDependentLoads;
+        statistics::Scalar dvrSIMTTakenPathTerminations;
+        statistics::Scalar dvrSIMTNotTakenPathTerminations;
+        statistics::Scalar dvrSIMTStackOverflowDroppedLanes;
         statistics::Scalar dvrVIRUnsupportedControlFlow;
         statistics::Scalar dvrVIRNormalTerminatedLanes;
         statistics::Scalar dvrVIREarlyExitLanes;

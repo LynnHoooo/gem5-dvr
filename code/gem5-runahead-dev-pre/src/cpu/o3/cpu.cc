@@ -1073,6 +1073,15 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Dependent loads executed on taken SIMT paths"),
       ADD_STAT(dvrSIMTNotTakenDependentLoads, statistics::units::Count::get(),
                "Dependent loads executed on not-taken SIMT paths"),
+      ADD_STAT(dvrSIMTTakenPathTerminations,
+               statistics::units::Count::get(),
+               "Taken-path lanes terminated during helper replay"),
+      ADD_STAT(dvrSIMTNotTakenPathTerminations,
+               statistics::units::Count::get(),
+               "Not-taken-path lanes terminated during helper replay"),
+      ADD_STAT(dvrSIMTStackOverflowDroppedLanes,
+               statistics::units::Count::get(),
+               "Deferred lanes dropped when the SIMT stack was full"),
       ADD_STAT(dvrVIRUnsupportedControlFlow,
                statistics::units::Count::get(),
                "VIR programs terminated because a lane target was outside "
@@ -4072,6 +4081,9 @@ CPU::issueDVRReplayLanes(unsigned slots)
             if (reconvergence->depth >=
                 DVRHelperThread::ReplayReconvergenceState::Entries) {
                 ++cpuStats.dvrReconvergenceStackOverflows;
+                cpuStats.dvrSIMTStackOverflowDroppedLanes +=
+                    __builtin_popcountll(branch_masks[path][0]) +
+                    __builtin_popcountll(branch_masks[path][1]);
                 break;
             }
             auto &frame = reconvergence->stack[reconvergence->depth++];
@@ -4489,6 +4501,17 @@ CPU::issueDVRReplayLanes(unsigned slots)
     issued_dyn_uop.completeCycle = ready_tick;
     // Completion is accounted for by retireCompletedVIR() at completeCycle;
     // the uop remains in the VIR while its modeled FU latency elapses.
+    // Account for every lane that terminated in this issue group.  The path
+    // tag lets CC diagnostics distinguish a normal/unsupported exit from a
+    // path that actually reached a dependent load (counted above).
+    for (Lane *lane : group) {
+        if (lane->active)
+            continue;
+        if (lane->simtPath == 1)
+            ++cpuStats.dvrSIMTTakenPathTerminations;
+        else if (lane->simtPath == 2)
+            ++cpuStats.dvrSIMTNotTakenPathTerminations;
+    }
     for (auto it = dvrHelperThread.replayLanes.begin();
          it != dvrHelperThread.replayLanes.end();) {
         if (!it->active)
