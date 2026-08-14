@@ -788,6 +788,9 @@ class CPU : public BaseCPU
         statistics::Scalar dvrTaintedInstructions;
         statistics::Scalar dvrDependentLoads;
         statistics::Scalar dvrDiscoveriesWithFLR;
+        statistics::Scalar dvrLoopBackBranchesSeen;
+        statistics::Scalar dvrLoopBackBranchesWithFLR;
+        statistics::Scalar dvrLoopBackBranchesWithoutFLR;
         statistics::Scalar dvrBackwardBranches;
         statistics::Scalar dvrLoopBoundsFound;
         statistics::Scalar dvrDiscoveriesWithBounds;
@@ -810,10 +813,22 @@ class CPU : public BaseCPU
         statistics::Scalar dvrRecorderOverflows;
         statistics::Scalar dvrVectorProgramsBuilt;
         statistics::Scalar dvrVRATAllocations;
+        statistics::Scalar dvrVRATControlDivergenceAllocations;
         statistics::Scalar dvrVIRChunkIssues;
         statistics::Scalar dvrVIRChunkExecutions;
         statistics::Scalar dvrDivergentBranches;
         statistics::Scalar dvrReconvergences;
+        statistics::Scalar dvrSIMTBranchGroups;
+        statistics::Scalar dvrSIMTTakenLanes;
+        statistics::Scalar dvrSIMTNotTakenLanes;
+        statistics::Scalar dvrSIMTMixedBranches;
+        statistics::Scalar dvrSIMTReconvergencePushes;
+        statistics::Scalar dvrSIMTReconvergencePops;
+        statistics::Scalar dvrSIMTTakenDependentLoads;
+        statistics::Scalar dvrSIMTNotTakenDependentLoads;
+        statistics::Scalar dvrSIMTTakenPathTerminations;
+        statistics::Scalar dvrSIMTNotTakenPathTerminations;
+        statistics::Scalar dvrSIMTStackOverflowDroppedLanes;
         statistics::Scalar dvrVIRUnsupportedControlFlow;
         statistics::Scalar dvrVIRNormalTerminatedLanes;
         statistics::Scalar dvrVIREarlyExitLanes;
@@ -858,6 +873,12 @@ class CPU : public BaseCPU
         statistics::Scalar dvrAlternatePathLookups;
         statistics::Scalar dvrAlternatePathHits;
         statistics::Scalar dvrAlternatePathCompleteHits;
+        statistics::Scalar dvrAlternatePathCandidates;
+        statistics::Scalar dvrAlternatePathBackwardFiltered;
+        statistics::Scalar dvrAlternatePathTargetPresent;
+        statistics::Scalar dvrAlternatePathCompleteRecords;
+        statistics::Scalar dvrAlternatePathIncompleteRecords;
+        statistics::Scalar dvrAlternatePathInsertRejects;
         statistics::Scalar dvrAlternatePathLiveInRejects;
         statistics::Scalar dvrAlternatePathIncompleteRejects;
         statistics::Scalar dvrAlternatePathUnsupportedRejects;
@@ -1532,6 +1553,12 @@ class CPU : public BaseCPU
         Addr branch_pc, Addr target_pc, int source0, int source1,
         uint8_t comparison, bool has_bound,
         const DVRLoopBoundDetector::Inference *inference);
+    void dvrTraceSIMTBranch(
+        Tick tick, Addr branch_pc, Addr reconvergence_pc,
+        const std::array<uint64_t, 2> &active_mask,
+        const std::array<uint64_t, 2> &taken_mask,
+        const std::array<uint64_t, 2> &not_taken_mask,
+        unsigned groups);
     struct DVRPrefetchAddress
     {
         Addr address;
@@ -1673,6 +1700,7 @@ class CPU : public BaseCPU
                 Addr pc = 0;
                 std::array<uint64_t, 2> mask = {};
                 bool alternatePath = false;
+                bool takenPath = false;
             };
             static constexpr unsigned Entries = 8;
             std::array<Frame, Entries> stack = {};
@@ -1699,6 +1727,11 @@ class CPU : public BaseCPU
             unsigned uopIndex = 1;
             Addr lanePC = 0;
             bool reconvergenceBlocked = false;
+            // 0 means no active split; 1 and 2 identify taken and
+            // not-taken SIMT paths.  The tag is restored with a stack frame
+            // so dependent loads can be attributed to both paths.
+            uint8_t simtPath = 0;
+            bool simtDivergent = false;
             unsigned helperUops = 0;
             bool nested = false;
             bool active = true;

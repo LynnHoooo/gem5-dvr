@@ -668,6 +668,36 @@ CPU::dvrTraceLoopBound(
 }
 
 void
+CPU::dvrTraceSIMTBranch(
+    Tick tick, Addr branch_pc, Addr reconvergence_pc,
+    const std::array<uint64_t, 2> &active_mask,
+    const std::array<uint64_t, 2> &taken_mask,
+    const std::array<uint64_t, 2> &not_taken_mask,
+    unsigned groups)
+{
+    if (!dvrTrace.enabled())
+        return;
+    // Keep the full 128-bit masks in the event stream.  The CSV vector trace
+    // intentionally remains backward compatible with older post-processing.
+    std::fprintf(dvrTrace.events,
+        "{\"category\":\"simt_branch\",\"tick\":%llu,"
+        "\"branch_pc\":%llu,\"reconvergence_pc\":%llu,"
+        "\"active_mask_lo\":%llu,\"active_mask_hi\":%llu,"
+        "\"taken_mask_lo\":%llu,\"taken_mask_hi\":%llu,"
+        "\"not_taken_mask_lo\":%llu,\"not_taken_mask_hi\":%llu,"
+        "\"groups\":%u}\n",
+        static_cast<unsigned long long>(tick),
+        static_cast<unsigned long long>(branch_pc),
+        static_cast<unsigned long long>(reconvergence_pc),
+        static_cast<unsigned long long>(active_mask[0]),
+        static_cast<unsigned long long>(active_mask[1]),
+        static_cast<unsigned long long>(taken_mask[0]),
+        static_cast<unsigned long long>(taken_mask[1]),
+        static_cast<unsigned long long>(not_taken_mask[0]),
+        static_cast<unsigned long long>(not_taken_mask[1]), groups);
+}
+
+void
 CPU::oracleOnCommittedLoad(Addr address, ThreadID tid)
 {
     if (!oraclePrefetch || oracleLoadTrace.empty())
@@ -998,6 +1028,12 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Discovery loads whose address input is tainted"),
       ADD_STAT(dvrDiscoveriesWithFLR, statistics::units::Count::get(),
                "Completed discoveries with a nonzero Final Load Register"),
+      ADD_STAT(dvrLoopBackBranchesSeen, statistics::units::Count::get(),
+               "Backward conditional branches seen in DVR discoveries"),
+      ADD_STAT(dvrLoopBackBranchesWithFLR, statistics::units::Count::get(),
+               "Backward conditional branches in discoveries with an FLR"),
+      ADD_STAT(dvrLoopBackBranchesWithoutFLR, statistics::units::Count::get(),
+               "Backward conditional branches in discoveries without an FLR"),
       ADD_STAT(dvrBackwardBranches, statistics::units::Count::get(),
                "Backward conditional branches seen during discovery"),
       ADD_STAT(dvrLoopBoundsFound, statistics::units::Count::get(),
@@ -1045,7 +1081,10 @@ CPU::CPUStats::CPUStats(CPU *cpu)
       ADD_STAT(dvrVectorProgramsBuilt, statistics::units::Count::get(),
                "Recorded slices materialized as DVR vector programs"),
       ADD_STAT(dvrVRATAllocations, statistics::units::Count::get(),
-               "16-lane physical mappings allocated by the DVR VRAT"),
+               "16-copy (128 scalar-lane) physical mappings allocated by the DVR VRAT"),
+      ADD_STAT(dvrVRATControlDivergenceAllocations,
+               statistics::units::Count::get(),
+               "VRAT vector bundles allocated solely because control-flow diverged"),
       ADD_STAT(dvrVIRChunkIssues, statistics::units::Count::get(),
                "Recorded uop chunks issued through the DVR VIR"),
       ADD_STAT(dvrVIRChunkExecutions, statistics::units::Count::get(),
@@ -1056,6 +1095,31 @@ CPU::CPUStats::CPUStats(CPU *cpu)
       ADD_STAT(dvrReconvergences, statistics::units::Count::get(),
                "Completed divergent DVR predicate generations whose lane "
                "masks reconverged"),
+      ADD_STAT(dvrSIMTBranchGroups, statistics::units::Count::get(),
+               "Distinct next-PC groups formed by SIMT data-dependent branches"),
+      ADD_STAT(dvrSIMTTakenLanes, statistics::units::Count::get(),
+               "Lane outcomes selecting the taken branch path"),
+      ADD_STAT(dvrSIMTNotTakenLanes, statistics::units::Count::get(),
+               "Lane outcomes selecting the not-taken branch path"),
+      ADD_STAT(dvrSIMTMixedBranches, statistics::units::Count::get(),
+               "Data-dependent branches with both taken and not-taken lanes"),
+      ADD_STAT(dvrSIMTReconvergencePushes, statistics::units::Count::get(),
+               "SIMT reconvergence frames pushed for deferred paths"),
+      ADD_STAT(dvrSIMTReconvergencePops, statistics::units::Count::get(),
+               "SIMT reconvergence frames popped at the join PC"),
+      ADD_STAT(dvrSIMTTakenDependentLoads, statistics::units::Count::get(),
+               "Dependent loads executed on taken SIMT paths"),
+      ADD_STAT(dvrSIMTNotTakenDependentLoads, statistics::units::Count::get(),
+               "Dependent loads executed on not-taken SIMT paths"),
+      ADD_STAT(dvrSIMTTakenPathTerminations,
+               statistics::units::Count::get(),
+               "Taken-path lanes terminated during helper replay"),
+      ADD_STAT(dvrSIMTNotTakenPathTerminations,
+               statistics::units::Count::get(),
+               "Not-taken-path lanes terminated during helper replay"),
+      ADD_STAT(dvrSIMTStackOverflowDroppedLanes,
+               statistics::units::Count::get(),
+               "Deferred lanes dropped when the SIMT stack was full"),
       ADD_STAT(dvrVIRUnsupportedControlFlow,
                statistics::units::Count::get(),
                "VIR programs terminated because a lane target was outside "
@@ -1169,6 +1233,21 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Alternate-path cache entries found"),
       ADD_STAT(dvrAlternatePathCompleteHits, statistics::units::Count::get(),
                "Complete alternate-path entries admitted for replay"),
+      ADD_STAT(dvrAlternatePathCandidates, statistics::units::Count::get(),
+               "Tainted conditional branches considered for alternate paths"),
+      ADD_STAT(dvrAlternatePathBackwardFiltered,
+               statistics::units::Count::get(),
+               "Backward loop branches filtered from alternate paths"),
+      ADD_STAT(dvrAlternatePathTargetPresent, statistics::units::Count::get(),
+               "Alternate targets already present in the recorder"),
+      ADD_STAT(dvrAlternatePathCompleteRecords,
+               statistics::units::Count::get(),
+               "Complete alternate-path records produced"),
+      ADD_STAT(dvrAlternatePathIncompleteRecords,
+               statistics::units::Count::get(),
+               "Incomplete alternate-path records rejected before caching"),
+      ADD_STAT(dvrAlternatePathInsertRejects, statistics::units::Count::get(),
+               "Complete alternate paths rejected by recorder insertion"),
       ADD_STAT(dvrAlternatePathLiveInRejects, statistics::units::Count::get(),
                "Alternate paths rejected because live-ins are unavailable"),
       ADD_STAT(dvrAlternatePathIncompleteRejects,
@@ -2505,6 +2584,18 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 cpuStats.dvrDiscoveredInstructions += result.instructions;
                 if (committed_flr != 0)
                     ++cpuStats.dvrDiscoveriesWithFLR;
+                for (unsigned index = 0;
+                     index < dvrInstructionRecorder.size(); ++index) {
+                    const auto &uop = dvrInstructionRecorder[index];
+                    if (!uop.conditional || uop.branchTargetPC == 0 ||
+                        uop.branchTargetPC >= uop.pc)
+                        continue;
+                    ++cpuStats.dvrLoopBackBranchesSeen;
+                    if (committed_flr != 0)
+                        ++cpuStats.dvrLoopBackBranchesWithFLR;
+                    else
+                        ++cpuStats.dvrLoopBackBranchesWithoutFLR;
+                }
                 if (dvrLoopBoundDetector.hasBound())
                     ++cpuStats.dvrDiscoveriesWithBounds;
                 DVRLoopBoundDetector::RegisterSnapshot finish_regs = {};
@@ -2527,11 +2618,18 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 // Publish this complete dynamic path before looking up its
                 // opposite direction.  A later discovery can then splice
                 // the cached suffix into the same reconvergence point.
-                recordDVRAlternatePaths(dvrInstructionRecorder,
-                                        inst->contextId());
-                const bool alternate_complete_hit =
-                    augmentDVRAlternatePaths(dvrInstructionRecorder,
-                                             inst->contextId(), finish_regs);
+                // A discovery without an FLR has no prefetch-producing
+                // termination point.  Do not publish its loop/control path
+                // as an incomplete alternate entry: it would poison the
+                // cache and turn later lookups into guaranteed rejects.
+                bool alternate_complete_hit = false;
+                if (committed_flr != 0) {
+                    recordDVRAlternatePaths(dvrInstructionRecorder,
+                                            inst->contextId());
+                    alternate_complete_hit = augmentDVRAlternatePaths(
+                        dvrInstructionRecorder, inst->contextId(),
+                        finish_regs);
+                }
                 for (unsigned index = 0;
                      index < dvrInstructionRecorder.size(); ++index) {
                     const auto &uop = dvrInstructionRecorder[index];
@@ -3676,12 +3774,57 @@ CPU::issueDVRReplayLanes(unsigned slots)
         }
         return std::numeric_limits<unsigned>::max();
     };
+    const auto laneSourcesReady = [this](const Lane &lane) {
+        if (!lane.program || lane.uopIndex >= lane.program->count)
+            return false;
+        const auto &uop = lane.program->uops[lane.uopIndex];
+        const auto ready = [&](int8_t reg) {
+            if (reg < 0 || reg >=
+                    DVRLoopBoundDetector::MaxArchitecturalIntRegs)
+                return true;
+            return lane.helperRegs ?
+                lane.helperRegs->readyAt(reg, lane.lane) <= curTick() :
+                lane.readyCycle[reg] <= curTick();
+        };
+        return ready(uop.source0) && ready(uop.source1);
+    };
     // Reconvergence is group state.  At the termination PC, pop one frame
     // and reactivate exactly the lanes named by its 128-bit mask.
     std::shared_ptr<CPU::DVRHelperThread::ReplayReconvergenceState>
         reconvergence;
+    // Prefer a context whose active lanes have reached the current join, or
+    // whose current path has exhausted all unblocked lanes.  Otherwise choose
+    // a context with at least one ready lane.  This prevents an unrelated
+    // blocked generation from starving the stack that owns the VIR group.
     for (auto &lane : dvrHelperThread.replayLanes) {
-        if (lane.active && lane.reconvergence) {
+        if (!lane.active || !lane.reconvergence ||
+            lane.reconvergence->depth == 0)
+            continue;
+        const auto &frame = lane.reconvergence->stack[
+            lane.reconvergence->depth - 1];
+        bool at_reconvergence = false;
+        bool current_path_active = false;
+        for (const auto &peer : dvrHelperThread.replayLanes) {
+            if (!peer.active || peer.reconvergence != lane.reconvergence)
+                continue;
+            const uint64_t peer_bit = uint64_t(1) << (peer.lane % 64);
+            const bool deferred = frame.mask[peer.lane / 64] & peer_bit;
+            if (!peer.reconvergenceBlocked &&
+                peer.lanePC == frame.reconvergencePC)
+                at_reconvergence = true;
+            if (!peer.reconvergenceBlocked && !deferred)
+                current_path_active = true;
+        }
+        if (at_reconvergence || !current_path_active) {
+            reconvergence = lane.reconvergence;
+            break;
+        }
+    }
+    if (!reconvergence) {
+        for (auto &lane : dvrHelperThread.replayLanes) {
+            if (!lane.active || lane.reconvergenceBlocked ||
+                !lane.reconvergence || !laneSourcesReady(lane))
+                continue;
             reconvergence = lane.reconvergence;
             break;
         }
@@ -3691,15 +3834,20 @@ CPU::issueDVRReplayLanes(unsigned slots)
             const auto frame = reconvergence->stack[
                 reconvergence->depth - 1];
             bool at_reconvergence = false;
+            bool current_path_active = false;
             for (const auto &lane : dvrHelperThread.replayLanes) {
-                if (lane.active && !lane.reconvergenceBlocked &&
-                    lane.reconvergence == reconvergence &&
+                if (!lane.active || lane.reconvergence != reconvergence)
+                    continue;
+                const uint64_t lane_bit = uint64_t(1) << (lane.lane % 64);
+                const bool deferred = frame.mask[lane.lane / 64] & lane_bit;
+                if (!lane.reconvergenceBlocked &&
                     lane.lanePC == frame.reconvergencePC) {
                     at_reconvergence = true;
-                    break;
                 }
+                if (!lane.reconvergenceBlocked && !deferred)
+                    current_path_active = true;
             }
-            if (!at_reconvergence)
+            if (!at_reconvergence && current_path_active)
                 break;
             --reconvergence->depth;
             const unsigned resumed_lanes =
@@ -3708,6 +3856,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
             dvrTraceVector("reconvergence_pop", curTick(), frame.pc,
                            frame.reconvergencePC, resumed_lanes,
                            static_cast<int>(reconvergence->depth));
+            ++cpuStats.dvrSIMTReconvergencePops;
             for (auto &lane : dvrHelperThread.replayLanes) {
                 if (!lane.active || lane.reconvergence != reconvergence)
                     continue;
@@ -3715,6 +3864,8 @@ CPU::issueDVRReplayLanes(unsigned slots)
                 if (frame.mask[lane.lane / 64] & bit) {
                     lane.reconvergenceBlocked = false;
                     lane.lanePC = frame.pc;
+                    lane.simtPath = frame.takenPath ? 1 : 2;
+                    lane.simtDivergent = true;
                 } else if (lane.lanePC == frame.reconvergencePC) {
                     // The SIMT stack selects the deferred mask after a
                     // reconvergence point. Lanes from the path just
@@ -3735,6 +3886,12 @@ CPU::issueDVRReplayLanes(unsigned slots)
             lane.helperUops >= dvrHelperMaxUops)
             continue;
         if (lane.reconvergenceBlocked)
+            continue;
+        // A VIR issue group and its SIMT stack are one helper-generation
+        // context.  Without this guard, the first active generation supplies
+        // the stack while a later generation supplies the seed lane; its
+        // deferred frame can then never be popped by the matching lanes.
+        if (reconvergence && lane.reconvergence != reconvergence)
             continue;
         unsigned pc_index = findPC(lane.program, lane.lanePC);
         if (pc_index == std::numeric_limits<unsigned>::max()) {
@@ -3804,9 +3961,13 @@ CPU::issueDVRReplayLanes(unsigned slots)
     std::array<bool, 128> branch_next_valid = {};
     std::array<std::array<uint64_t, 2>, 128> branch_masks = {};
     std::array<Addr, 128> branch_group_pc = {};
+    std::array<bool, 128> branch_group_taken = {};
+    std::array<uint64_t, 2> branch_active_mask = {};
+    std::array<uint64_t, 2> branch_taken_mask = {};
+    std::array<uint64_t, 2> branch_not_taken_mask = {};
     unsigned branch_groups = 0;
     unsigned selected_branch_group = 0;
-    const bool branch_divergent = uop.conditional;
+    bool branch_outcomes_complete = !uop.conditional;
     if (uop.conditional) {
         // Branch grouping is over the whole helper generation, not merely
         // the eight-lane AVX issue chunk selected for this cycle.
@@ -3821,10 +3982,14 @@ CPU::issueDVRReplayLanes(unsigned slots)
             const auto &lane_uop = lane->program->uops[lane->uopIndex];
             const RegVal source0 = lane_uop.source0 >= 0 &&
                 lane_uop.source0 < DVRLoopBoundDetector::MaxArchitecturalIntRegs ?
-                lane->helperRegs->read(lane_uop.source0, lane->lane) : 0;
+                (lane->helperRegs ?
+                 lane->helperRegs->read(lane_uop.source0, lane->lane) :
+                 lane->regs[lane_uop.source0]) : 0;
             const RegVal source1 = lane_uop.source1 >= 0 &&
                 lane_uop.source1 < DVRLoopBoundDetector::MaxArchitecturalIntRegs ?
-                lane->helperRegs->read(lane_uop.source1, lane->lane) : 0;
+                (lane->helperRegs ?
+                 lane->helperRegs->read(lane_uop.source1, lane->lane) :
+                 lane->regs[lane_uop.source1]) : 0;
             const bool source0_ready = lane_uop.source0 < 0 ||
                 lane_uop.source0 >= DVRLoopBoundDetector::MaxArchitecturalIntRegs ||
                 lane->helperRegs->readyAt(lane_uop.source0, lane->lane) <= curTick();
@@ -3834,23 +3999,51 @@ CPU::issueDVRReplayLanes(unsigned slots)
             if (!source0_ready || !source1_ready)
                 continue;
             bool taken = lane_uop.branchTaken;
-            if (lane_uop.tainted &&
-                !lane_uop.evaluateBranch(source0, source1, taken))
+            const bool evaluated = !lane_uop.tainted ||
+                lane_uop.evaluateBranch(source0, source1, taken);
+            if (!evaluated)
                 continue;
             const Addr next = taken ? lane_uop.branchTargetPC :
                 lane_uop.fallthroughPC;
+            branch_active_mask[lane->lane / 64] |=
+                uint64_t(1) << (lane->lane % 64);
+            if (taken) {
+                branch_taken_mask[lane->lane / 64] |=
+                    uint64_t(1) << (lane->lane % 64);
+            } else {
+                branch_not_taken_mask[lane->lane / 64] |=
+                    uint64_t(1) << (lane->lane % 64);
+            }
             branch_next_pc[lane->lane] = next;
             branch_next_valid[lane->lane] = true;
             unsigned path = 0;
             while (path < branch_groups && branch_group_pc[path] != next)
                 ++path;
-            if (path == branch_groups && branch_groups < 128)
+            if (path == branch_groups && branch_groups < 128) {
                 branch_group_pc[branch_groups++] = next;
+                branch_group_taken[path] = taken;
+            }
             if (path < 128)
                 branch_masks[path][lane->lane / 64] |=
                     uint64_t(1) << (lane->lane % 64);
             if (lane == seed)
                 selected_branch_group = path;
+        }
+        branch_outcomes_complete = branch_next_valid[seed->lane];
+        const unsigned taken_lanes =
+            __builtin_popcountll(branch_taken_mask[0]) +
+            __builtin_popcountll(branch_taken_mask[1]);
+        const unsigned not_taken_lanes =
+            __builtin_popcountll(branch_not_taken_mask[0]) +
+            __builtin_popcountll(branch_not_taken_mask[1]);
+        cpuStats.dvrSIMTTakenLanes += taken_lanes;
+        cpuStats.dvrSIMTNotTakenLanes += not_taken_lanes;
+        cpuStats.dvrSIMTBranchGroups += branch_groups;
+        dvrTraceSIMTBranch(curTick(), uop.pc, branch_reconvergence,
+                           branch_active_mask, branch_taken_mask,
+                           branch_not_taken_mask, branch_groups);
+        if (taken_lanes != 0 && not_taken_lanes != 0) {
+            ++cpuStats.dvrSIMTMixedBranches;
         }
     }
     bool decoded_cache_hit = false;
@@ -3917,7 +4110,9 @@ CPU::issueDVRReplayLanes(unsigned slots)
     // been admitted to the VIR. Deferred groups are stored in reverse order,
     // making the stack head the next path resumed at the common termination
     // PC, exactly as in the paper's reconvergence stack.
-    if (branch_divergent && branch_groups > 1 &&
+    const bool branch_divergent = uop.conditional &&
+        branch_outcomes_complete && branch_groups > 1;
+    if (branch_divergent &&
         branch_reconvergence != 0 && reconvergence) {
         for (unsigned path = branch_groups; path-- > 0;) {
             if (path == selected_branch_group)
@@ -3925,6 +4120,9 @@ CPU::issueDVRReplayLanes(unsigned slots)
             if (reconvergence->depth >=
                 DVRHelperThread::ReplayReconvergenceState::Entries) {
                 ++cpuStats.dvrReconvergenceStackOverflows;
+                cpuStats.dvrSIMTStackOverflowDroppedLanes +=
+                    __builtin_popcountll(branch_masks[path][0]) +
+                    __builtin_popcountll(branch_masks[path][1]);
                 break;
             }
             auto &frame = reconvergence->stack[reconvergence->depth++];
@@ -3932,12 +4130,14 @@ CPU::issueDVRReplayLanes(unsigned slots)
             frame.pc = branch_group_pc[path];
             frame.mask = branch_masks[path];
             frame.alternatePath = true;
+            frame.takenPath = branch_group_taken[path];
             const unsigned deferred_lanes =
                 __builtin_popcountll(frame.mask[0]) +
                 __builtin_popcountll(frame.mask[1]);
             dvrTraceVector("reconvergence_push", curTick(), frame.pc,
                            frame.reconvergencePC, deferred_lanes,
                            static_cast<int>(reconvergence->depth));
+            ++cpuStats.dvrSIMTReconvergencePushes;
             for (auto &lane : dvrHelperThread.replayLanes) {
                 if (lane.reconvergence != reconvergence)
                     continue;
@@ -3947,6 +4147,14 @@ CPU::issueDVRReplayLanes(unsigned slots)
             }
         }
         ++cpuStats.dvrDivergentBranches;
+    }
+    if (uop.conditional && branch_outcomes_complete && branch_groups != 0) {
+        const bool selected_taken = branch_group_taken[selected_branch_group];
+        for (Lane *lane : group) {
+            lane->simtPath = selected_taken ? 1 : 2;
+            if (branch_divergent)
+                lane->simtDivergent = true;
+        }
     }
     // This is the helper's actual same-PC vector issue group.  Keep the
     // continuation counters tied to the execution-driven lane path rather
@@ -4047,18 +4255,28 @@ CPU::issueDVRReplayLanes(unsigned slots)
     // Rename a vector destination exactly once for this dynamic uop.  The
     // old source names were retained above, so destination==source and WAW
     // cases preserve the old values until this VIR copy retires.
-    const bool vector_destination = uop.destination > 0 &&
-        uop.destination < DVRLoopBoundDetector::MaxArchitecturalIntRegs &&
-        seed->helperRegs &&
+    const bool source_vectorized = seed->helperRegs &&
         ((uop.source0 >= 0 &&
           seed->helperRegs->isVectorized(uop.source0)) ||
          (uop.source1 >= 0 &&
           seed->helperRegs->isVectorized(uop.source1)));
+    // Paper 4.2.1 requires a vector destination when either a source is
+    // already vectorized or the current lane group is on a divergent path.
+    // The latter matters for control-only diamonds whose arithmetic inputs
+    // remain scalar but whose results differ by lane.
+    bool control_divergence = false;
+    for (Lane *lane : group)
+        control_divergence |= lane->simtDivergent;
+    const bool vector_destination = uop.destination > 0 &&
+        uop.destination < DVRLoopBoundDetector::MaxArchitecturalIntRegs &&
+        seed->helperRegs && (source_vectorized || control_divergence);
     const uint64_t rename_key = (static_cast<uint64_t>(uop.pc) << 8) |
         static_cast<uint64_t>(uop.destination & 0xff);
     const bool first_vector_destination = vector_destination && reconvergence &&
         reconvergence->renamedDestinations.insert(rename_key).second;
     if (first_vector_destination) {
+        if (control_divergence && !source_vectorized)
+            ++cpuStats.dvrVRATControlDivergenceAllocations;
         if (!seed->helperRegs->renameVector(uop.destination)) {
             ++cpuStats.dvrVIRSourceValueSemanticFailures;
             for (Lane *lane : group)
@@ -4084,7 +4302,6 @@ CPU::issueDVRReplayLanes(unsigned slots)
         if (lane_uop.conditional) {
             const Addr next_pc = branch_next_pc[lane->lane];
             const bool have_grouped_branch = branch_next_valid[lane->lane];
-            bool taken = next_pc == lane_uop.branchTargetPC;
             if (!have_grouped_branch)
                 valid = false;
             if (!valid) {
@@ -4149,6 +4366,17 @@ CPU::issueDVRReplayLanes(unsigned slots)
                 lane->active = false;
                 ++cpuStats.dvrPredicateMisses;
                 continue;
+            }
+            if (lane->simtPath == 1) {
+                ++cpuStats.dvrSIMTTakenDependentLoads;
+                dvrTraceDependency("simt_taken_dependent_load", curTick(),
+                    lane->triggerPC, lane_uop.pc, result, 1,
+                    static_cast<int>(lane->lane));
+            } else if (lane->simtPath == 2) {
+                ++cpuStats.dvrSIMTNotTakenDependentLoads;
+                dvrTraceDependency("simt_not_taken_dependent_load", curTick(),
+                    lane->triggerPC, lane_uop.pc, result, 1,
+                    static_cast<int>(lane->lane));
             }
             // NDM flattening can combine invocations with different learned
             // relation sets.  Validate against the exact replay load PC
@@ -4325,6 +4553,17 @@ CPU::issueDVRReplayLanes(unsigned slots)
     issued_dyn_uop.completeCycle = ready_tick;
     // Completion is accounted for by retireCompletedVIR() at completeCycle;
     // the uop remains in the VIR while its modeled FU latency elapses.
+    // Account for every lane that terminated in this issue group.  The path
+    // tag lets CC diagnostics distinguish a normal/unsupported exit from a
+    // path that actually reached a dependent load (counted above).
+    for (Lane *lane : group) {
+        if (lane->active)
+            continue;
+        if (lane->simtPath == 1)
+            ++cpuStats.dvrSIMTTakenPathTerminations;
+        else if (lane->simtPath == 2)
+            ++cpuStats.dvrSIMTNotTakenPathTerminations;
+    }
     for (auto it = dvrHelperThread.replayLanes.begin();
          it != dvrHelperThread.replayLanes.end();) {
         if (!it->active)
@@ -5312,6 +5551,15 @@ CPU::recordDVRAlternatePaths(const DVRInstructionRecorder &recorder,
         const auto &op = recorder[branch];
         if (!op.conditional || !op.tainted)
             continue;
+        ++cpuStats.dvrAlternatePathCandidates;
+        // A backward conditional is loop control (the taken edge starts the
+        // next iteration), not a diamond alternate path.  Its loop bound is
+        // handled by the discovery/loop-bound machinery; caching it here
+        // would manufacture a suffix with no stable post-dominator.
+        if (op.branchTargetPC != 0 && op.branchTargetPC < op.pc) {
+            ++cpuStats.dvrAlternatePathBackwardFiltered;
+            continue;
+        }
 
         const Addr reconvergence = op.reconvergencePC;
         const Addr target = op.branchTaken ? op.branchTargetPC :
@@ -5487,6 +5735,14 @@ CPU::recordDVRAlternatePaths(const DVRInstructionRecorder &recorder,
                        "alternate_path_record_incomplete", curTick(),
                        op.pc, target, path.uops.size(),
                        static_cast<int>(address_space_id));
+        // Incomplete paths are diagnostic artifacts only.  Keeping them in
+        // the cache makes a later lookup appear to hit, then guarantees an
+        // admission reject even when a usable path could be learned later.
+        if (!path.complete) {
+            ++cpuStats.dvrAlternatePathIncompleteRecords;
+            continue;
+        }
+        ++cpuStats.dvrAlternatePathCompleteRecords;
         const auto existing = dvrAlternatePathCache.find(key);
         if (existing == dvrAlternatePathCache.end() ||
             (!existing->second.complete && path.complete))
@@ -5531,6 +5787,8 @@ CPU::augmentDVRAlternatePaths(
         const auto &op = occurrence->op;
         if (!op.conditional || op.reconvergencePC == 0)
             continue;
+        if (op.branchTargetPC != 0 && op.branchTargetPC < op.pc)
+            continue;
 
         const unsigned branch = occurrence->index;
         if (branch >= recorder.size() || recorder[branch].pc != op.pc)
@@ -5541,6 +5799,8 @@ CPU::augmentDVRAlternatePaths(
         if (alternate_target == 0)
             continue;
 
+        ++cpuStats.dvrAlternatePathCandidates;
+
         bool target_present = alternate_target == op.reconvergencePC;
         for (unsigned index = branch + 1; index < recorder.size(); ++index) {
             if (recorder[index].pc == op.reconvergencePC)
@@ -5550,8 +5810,10 @@ CPU::augmentDVRAlternatePaths(
                 break;
             }
         }
-        if (target_present)
+        if (target_present) {
+            ++cpuStats.dvrAlternatePathTargetPresent;
             continue;
+        }
 
         ++cpuStats.dvrAlternatePathLookups;
         const DVRAlternatePathKey key{op.pc, alternate_target,
@@ -5611,7 +5873,7 @@ CPU::augmentDVRAlternatePaths(
             continue;
         }
         if (!recorder.insertBeforePC(op.reconvergencePC, path.uops)) {
-            ++cpuStats.dvrAlternatePathIncompleteRejects;
+            ++cpuStats.dvrAlternatePathInsertRejects;
             continue;
         }
         ++cpuStats.dvrAlternatePathCompleteHits;
