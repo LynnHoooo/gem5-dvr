@@ -3860,6 +3860,19 @@ CPU::issueDVRReplayLanes(unsigned slots)
             if (frame.alternatePath)
                 ++cpuStats.dvrReconvergenceResumeSuccesses;
         }
+        // Once the final frame is popped, all surviving lanes are at a
+        // common control-flow point.  Divergence is a property of the active
+        // SIMT path, not a lifetime bit on the lane object.
+        if (reconvergence->depth == 0) {
+            reconvergence->renamedDestinations.clear();
+            for (auto &lane : dvrHelperThread.replayLanes) {
+                if (lane.active && lane.reconvergence == reconvergence &&
+                    !lane.reconvergenceBlocked) {
+                    lane.simtDivergent = false;
+                    lane.simtPath = 0;
+                }
+            }
+        }
     }
     const Lane *seed = nullptr;
     std::vector<Lane *> group;
@@ -4102,11 +4115,24 @@ CPU::issueDVRReplayLanes(unsigned slots)
                 continue;
             if (reconvergence->depth >=
                 DVRHelperThread::ReplayReconvergenceState::Entries) {
-                ++cpuStats.dvrReconvergenceStackOverflows;
-                cpuStats.dvrSIMTStackOverflowDroppedLanes +=
+                const unsigned dropped =
                     __builtin_popcountll(branch_masks[path][0]) +
                     __builtin_popcountll(branch_masks[path][1]);
-                break;
+                ++cpuStats.dvrReconvergenceStackOverflows;
+                cpuStats.dvrSIMTStackOverflowDroppedLanes += dropped;
+                dvrTraceVector("reconvergence_overflow", curTick(),
+                               uop.pc, branch_reconvergence, dropped,
+                               static_cast<int>(reconvergence->depth));
+                // An unrepresented path cannot be executed correctly: its
+                // mask and resume PC would be lost.  Abort this helper
+                // generation and let the scalar main thread continue.
+                for (auto &lane : dvrHelperThread.replayLanes) {
+                    if (lane.reconvergence == reconvergence)
+                        lane.active = false;
+                }
+                reconvergence->depth = 0;
+                reconvergence->renamedDestinations.clear();
+                return 1;
             }
             auto &frame = reconvergence->stack[reconvergence->depth++];
             frame.reconvergencePC = branch_reconvergence;
@@ -4132,11 +4158,17 @@ CPU::issueDVRReplayLanes(unsigned slots)
         ++cpuStats.dvrDivergentBranches;
     }
     if (uop.conditional && branch_outcomes_complete && branch_groups != 0) {
-        const bool selected_taken = branch_group_taken[selected_branch_group];
-        for (Lane *lane : group) {
-            lane->simtPath = selected_taken ? 1 : 2;
+        for (auto &lane : dvrHelperThread.replayLanes) {
+            if (!lane.active || lane.reconvergence != reconvergence ||
+                !branch_next_valid[lane.lane])
+                continue;
+            lane.simtPath = branch_group_taken[
+                std::find(branch_group_pc.begin(),
+                          branch_group_pc.begin() + branch_groups,
+                          branch_next_pc[lane.lane]) -
+                branch_group_pc.begin()] ? 1 : 2;
             if (branch_divergent)
-                lane->simtDivergent = true;
+                lane.simtDivergent = true;
         }
     }
     // This is the helper's actual same-PC vector issue group.  Keep the
@@ -4240,11 +4272,15 @@ CPU::issueDVRReplayLanes(unsigned slots)
     // Rename a vector destination exactly once for this dynamic uop.  The
     // old source names were retained above, so destination==source and WAW
     // cases preserve the old values until this VIR copy retires.
-    const bool source_vectorized = seed->helperRegs &&
-        ((uop.source0 >= 0 &&
-          seed->helperRegs->isVectorized(uop.source0)) ||
-         (uop.source1 >= 0 &&
-          seed->helperRegs->isVectorized(uop.source1)));
+    bool source_vectorized = false;
+    if (seed->helperRegs) {
+        for (Lane *lane : group) {
+            source_vectorized |= uop.source0 >= 0 &&
+                seed->helperRegs->isVectorized(uop.source0, lane->lane);
+            source_vectorized |= uop.source1 >= 0 &&
+                seed->helperRegs->isVectorized(uop.source1, lane->lane);
+        }
+    }
     // Paper 4.2.1 requires a vector destination when either a source is
     // already vectorized or the current lane group is on a divergent path.
     // The latter matters for control-only diamonds whose arithmetic inputs
@@ -4262,34 +4298,65 @@ CPU::issueDVRReplayLanes(unsigned slots)
         uop.destination < DVRLoopBoundDetector::MaxArchitecturalIntRegs &&
         seed->helperRegs && !vector_destination &&
         seed->helperRegs->isVectorized(uop.destination);
-    const uint64_t rename_key = (static_cast<uint64_t>(uop.pc) << 8) |
-        static_cast<uint64_t>(uop.destination & 0xff);
+    // Rename once for the complete active path, not once per eight-lane
+    // VIR copy.  Different paths receive different keys and therefore get
+    // independent masked mappings.
+    std::array<uint64_t, 2> rename_mask = {};
+    for (auto &candidate : dvrHelperThread.replayLanes) {
+        if (!candidate.active || candidate.reconvergence != reconvergence ||
+            candidate.program != seed->program ||
+            candidate.uopIndex != seed->uopIndex ||
+            candidate.lanePC != uop.pc ||
+            candidate.reconvergenceBlocked ||
+            candidate.simtPath != seed->simtPath)
+            continue;
+        rename_mask[candidate.lane / 64] |=
+            uint64_t(1) << (candidate.lane % 64);
+    }
+    if (rename_mask[0] == 0 && rename_mask[1] == 0) {
+        for (Lane *lane : group)
+            rename_mask[lane->lane / 64] |=
+                uint64_t(1) << (lane->lane % 64);
+    }
+    const uint64_t mask_hash = rename_mask[0] ^
+        ((rename_mask[1] << 17) | (rename_mask[1] >> 47));
+    const uint64_t rename_key = (static_cast<uint64_t>(uop.pc) << 8) ^
+        static_cast<uint64_t>(uop.destination & 0xff) ^
+        mask_hash ^ (static_cast<uint64_t>(seed->simtPath) << 56);
     const bool first_destination_rename =
         (vector_destination || scalar_overwrite) && reconvergence &&
         reconvergence->renamedDestinations.insert(rename_key).second;
     if (first_destination_rename) {
-        const auto old_vector =
-            seed->helperRegs->vectorMapping(uop.destination);
-        const int16_t old_scalar =
-            seed->helperRegs->scalarMapping(uop.destination);
+        const auto old_physical =
+            seed->helperRegs->physicalMappings(uop.destination);
         bool renamed = false;
         if (vector_destination) {
             if (control_divergence && !source_vectorized)
                 ++cpuStats.dvrVRATControlDivergenceAllocations;
-            renamed = seed->helperRegs->renameVector(uop.destination);
+            renamed = seed->helperRegs->renameVectorMasked(
+                uop.destination, rename_mask);
         } else {
-            renamed = seed->helperRegs->rename(uop.destination) >= 0;
+            renamed = seed->helperRegs->renameScalarMasked(
+                uop.destination, rename_mask) >= 0;
         }
         if (!renamed) {
             ++cpuStats.dvrVIRSourceValueSemanticFailures;
             for (Lane *lane : group)
                 lane->active = false;
         } else {
-            // The old mapping is now dead in VRAT.  Mark every already
-            // issued VIR source that still names it; those bits are consumed
-            // when the corresponding copy retires.
+            // Only names no longer referenced by any lane are dead.  A
+            // deferred path may still legitimately retain part of the old
+            // mapping after this masked rename.
+            const auto current_physical =
+                seed->helperRegs->physicalMappings(uop.destination);
+            std::vector<int16_t> dead_physical;
+            for (const auto old : old_physical)
+                if (std::find(current_physical.begin(),
+                              current_physical.end(), old) ==
+                    current_physical.end())
+                    dead_physical.push_back(old);
             dvrHelperThread.markDeadSources(
-                seed->helperRegs, old_vector, old_scalar);
+                seed->helperRegs, dead_physical);
         }
         assert(seed->helperRegs->conservationValid());
     }
