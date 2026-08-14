@@ -1082,14 +1082,89 @@ DVRInstructionRecorder::insertBeforePC(
 }
 
 void
-DVRInstructionRecorder::setReconvergencePC(Addr pc)
+DVRInstructionRecorder::setReconvergencePC(Addr flr_pc,
+                                            Addr loop_branch_pc)
 {
-    if (pc == 0)
+    if (flr_pc == 0)
         return;
+
+    // The recorder is a dynamic stream and may contain the same PC more than
+    // once.  FLR is the last dependent load occurrence, while LCR is the
+    // first loop back-edge occurrence after that FLR.  Using PC ordering here
+    // would be wrong for backward branches and for repeated loop iterations.
+    int flr_index = -1;
     for (unsigned index = 0; index < count; ++index) {
-        if (uops[index].conditional)
-            uops[index].reconvergencePC = pc;
+        if (uops[index].load && uops[index].pc == flr_pc)
+            flr_index = static_cast<int>(index);
     }
+    if (flr_index < 0)
+        return;
+
+    unsigned lcr_index = count;
+    if (loop_branch_pc != 0) {
+        for (unsigned index = static_cast<unsigned>(flr_index + 1);
+             index < count; ++index) {
+            if (uops[index].conditional &&
+                uops[index].pc == loop_branch_pc) {
+                lcr_index = index;
+                break;
+            }
+        }
+    }
+
+    for (unsigned index = 0; index < count; ++index) {
+        if (!uops[index].conditional)
+            continue;
+
+        if (index <= static_cast<unsigned>(flr_index)) {
+            // Ordinary DVR termination/reconvergence remains the FLR.
+            uops[index].reconvergencePC = flr_pc;
+        } else if (index < lcr_index && loop_branch_pc != 0) {
+            // This is exactly the paper's exceptional case: a branch after
+            // FLR but before LCR.  FLR has already executed, so waiting for
+            // it would strand the deferred lanes.  Use the loop boundary as
+            // the shared reconvergence point and continue to the next stride
+            // PC (or the real loop exit).
+            uops[index].reconvergencePC = loop_branch_pc;
+        }
+        // A branch after the LCR is outside the current inner-loop body and
+        // keeps the CFG metadata captured by the recorder.
+    }
+}
+
+bool
+DVRInstructionRecorder::hasConditionalBetween(Addr flr_pc,
+                                               Addr loop_branch_pc) const
+{
+    if (flr_pc == 0 || loop_branch_pc == 0)
+        return false;
+
+    int flr_index = -1;
+    for (unsigned index = 0; index < count; ++index) {
+        if (uops[index].load && uops[index].pc == flr_pc)
+            flr_index = static_cast<int>(index);
+    }
+    if (flr_index < 0)
+        return false;
+
+    unsigned lcr_index = count;
+    for (unsigned index = static_cast<unsigned>(flr_index + 1);
+         index < count; ++index) {
+        if (uops[index].conditional &&
+            uops[index].pc == loop_branch_pc) {
+            lcr_index = index;
+            break;
+        }
+    }
+    if (lcr_index == count)
+        return false;
+
+    for (unsigned index = static_cast<unsigned>(flr_index + 1);
+         index < lcr_index; ++index) {
+        if (uops[index].conditional)
+            return true;
+    }
+    return false;
 }
 
 void

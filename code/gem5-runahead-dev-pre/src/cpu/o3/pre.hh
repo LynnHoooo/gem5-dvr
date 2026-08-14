@@ -353,8 +353,17 @@ class DVRInstructionRecorder
     void import(const std::array<Uop, MaxUops> &source, unsigned size);
     /** Append a validated alternate suffix while retaining its reconvergence PC. */
     bool insertBeforePC(Addr reconvergence_pc, const std::vector<Uop> &path);
-    /** Bind every conditional path to the DVR termination PC (the FLR). */
-    void setReconvergencePC(Addr pc);
+    /**
+     * Apply the paper's FLR/LCR reconvergence policy.  Branches at or before
+     * the FLR reconverge at the FLR.  A branch strictly between the FLR and
+     * the loop back-edge (the LCR branch) must not reconverge at the already
+     * consumed FLR; it reconverges at the loop boundary instead.  Branches
+     * after the LCR retain their captured CFG metadata.
+     */
+    void setReconvergencePC(Addr flr_pc, Addr loop_branch_pc);
+
+    /** True iff a conditional branch occurs strictly between FLR and LCR. */
+    bool hasConditionalBetween(Addr flr_pc, Addr loop_branch_pc) const;
     void reset();
     /**
      * Limit a copied template to the trigger-to-FLR prefix used by the

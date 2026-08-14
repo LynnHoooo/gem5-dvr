@@ -1133,7 +1133,9 @@ class CPU : public BaseCPU
             return result;
         }
 
-        void release(int16_t phys)
+        // VRAT overwrite: the old mapping becomes a dead source.  It may
+        // remain allocated while issued VIR copies still retain it.
+        void markDead(int16_t phys)
         {
             if (phys < 0 || phys >= NumPhysicalRegs)
                 return;
@@ -1157,6 +1159,11 @@ class CPU : public BaseCPU
             }
             allocated[phys] = false;
             entry = PhysicalRegister();
+        }
+
+        void release(int16_t phys)
+        {
+            markDead(phys);
         }
 
         void retainPhysical(int16_t phys)
@@ -1184,6 +1191,23 @@ class CPU : public BaseCPU
                 allocated[phys] = false;
                 entry = PhysicalRegister();
             }
+        }
+
+        std::array<int16_t, VectorCopies> vectorMapping(
+            unsigned arch) const
+        {
+            std::array<int16_t, VectorCopies> result;
+            result.fill(-1);
+            if (arch < NumArchitecturalRegs && vrat[arch].vectorized)
+                result = vrat[arch].vector;
+            return result;
+        }
+
+        int16_t scalarMapping(unsigned arch) const
+        {
+            if (arch >= NumArchitecturalRegs || vrat[arch].vectorized)
+                return -1;
+            return vrat[arch].scalar;
         }
 
         int16_t physicalIndex(unsigned arch, unsigned lane) const
@@ -1639,6 +1663,11 @@ class CPU : public BaseCPU
             // must release these names rather than re-resolving arch regs.
             std::vector<int16_t> source0Physical;
             std::vector<int16_t> source1Physical;
+            // Set when a later VRAT overwrite makes the corresponding source
+            // mapping dead.  The masks are lane-granular because a divergent
+            // VIR copy may retire only an active subset.
+            std::array<uint64_t, 2> source0DeadMask = {};
+            std::array<uint64_t, 2> source1DeadMask = {};
             unsigned chunksRemaining = 1;
             Tick issueCycle = 0;
             Tick completeCycle = 0;
@@ -1657,6 +1686,8 @@ class CPU : public BaseCPU
             std::array<uint64_t, 2> executedMask = {};
             std::array<uint64_t, 2> completedMask = {};
             std::array<uint64_t, 2> deadSourceMask = {};
+            std::array<uint64_t, 2> deadSource0Mask = {};
+            std::array<uint64_t, 2> deadSource1Mask = {};
             Addr pc = 0;
             unsigned uopIndex = 0;
             unsigned inFlight = 0;
@@ -2024,14 +2055,21 @@ class CPU : public BaseCPU
                         copy.executedMask[word] |= it->activeMask[word];
                         copy.completedMask[word] |= it->activeMask[word];
                         copy.issuedMask[word] &= ~it->activeMask[word];
+                        copy.deadSource0Mask[word] |=
+                            it->source0DeadMask[word];
+                        copy.deadSource1Mask[word] |=
+                            it->source1DeadMask[word];
+                        copy.deadSourceMask[word] |=
+                            it->source0DeadMask[word] |
+                            it->source1DeadMask[word];
                     }
                     if (copy.inFlight != 0)
                         --copy.inFlight;
-                    copy.deadSource = it->destination >= 0 &&
-                        (it->destination == it->source0 ||
-                         it->destination == it->source1);
-                    copy.deadSourceMask = copy.deadSource ?
-                        it->activeMask : std::array<uint64_t, 2>{};
+                    copy.deadSource = false;
+                    for (unsigned word = 0; word < 2; ++word)
+                        copy.deadSource |=
+                            it->source0DeadMask[word] != 0 ||
+                            it->source1DeadMask[word] != 0;
                     if (it->helperRegs) {
                         for (const auto phys : it->source0Physical)
                             it->helperRegs->releasePhysical(phys);
@@ -2046,6 +2084,45 @@ class CPU : public BaseCPU
                 }
             }
             return retired;
+        }
+
+        // Record the paper's dead-source bits when VRAT overwrites a
+        // mapping.  Already-issued VIR copies retain physical names in
+        // source{0,1}Physical; future copies resolve the new VRAT mapping and
+        // therefore do not need to be marked.
+        void markDeadSources(
+            const std::shared_ptr<DVRHelperVectorRegisterFile> &regs,
+            const std::array<int16_t,
+                             DVRHelperVectorRegisterFile::VectorCopies>
+                &old_vector,
+            int16_t old_scalar)
+        {
+            auto matches = [&](int16_t phys) {
+                if (phys >= 0 && phys == old_scalar)
+                    return true;
+                for (const auto old : old_vector)
+                    if (old >= 0 && phys == old)
+                        return true;
+                return false;
+            };
+            for (auto &pending : virBuffer) {
+                if (pending.helperRegs != regs)
+                    continue;
+                const unsigned count = std::min(
+                    pending.lanes.size(), pending.source0Physical.size());
+                for (unsigned index = 0; index < count; ++index) {
+                    const unsigned lane = pending.lanes[index];
+                    if (lane >= DVRHelperVectorRegisterFile::MaxLanes)
+                        continue;
+                    const uint64_t bit = uint64_t(1) << (lane % 64);
+                    const unsigned word = lane / 64;
+                    if (matches(pending.source0Physical[index]))
+                        pending.source0DeadMask[word] |= bit;
+                    if (index < pending.source1Physical.size() &&
+                        matches(pending.source1Physical[index]))
+                        pending.source1DeadMask[word] |= bit;
+                }
+            }
         }
 
         void refillIssueQueue()

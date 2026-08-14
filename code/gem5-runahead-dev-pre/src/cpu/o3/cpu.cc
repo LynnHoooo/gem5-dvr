@@ -2607,14 +2607,14 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 dvrTraceVector("discovery_complete", curTick(),
                     result.triggerPC, committed_flr,
                     inference.matched ? inference.lanes : 0);
-                // DVR follows the paper's reconvergence policy: all
-                // divergent paths are deferred until the final indirect
-                // load (FLR), which is the vector-runahead termination PC.
-                // The recorder's first-observed successor is only a fallback
-                // for incomplete control metadata and must not be used when
-                // a real FLR is known.
+                // DVR follows the paper's two-case reconvergence policy:
+                // branches at or before FLR use FLR as the termination/join
+                // point, while a branch strictly between FLR and the loop
+                // back-edge (LCR) uses the loop boundary.  The latter case
+                // lets divergent lanes continue to the next stride PC
+                // instead of waiting for an already-consumed FLR.
                 dvrInstructionRecorder.setReconvergencePC(
-                    committed_flr);
+                    committed_flr, dvrLoopBoundDetector.branchPC());
                 // Publish this complete dynamic path before looking up its
                 // opposite direction.  A later discovery can then splice
                 // the cached suffix into the same reconvergence point.
@@ -2759,15 +2759,9 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                             initial_vir_size = index + 1;
                     }
                     const Addr lcr_pc = dvrLoopBoundDetector.branchPC();
-                    bool continue_past_flr = false;
-                    for (unsigned index = initial_vir_size;
-                         index < vir_program.size(); ++index) {
-                        if (vir_program[index].conditional &&
-                            vir_program[index].pc != lcr_pc) {
-                            continue_past_flr = true;
-                            break;
-                        }
-                    }
+                    const bool continue_past_flr =
+                        vir_program.hasConditionalBetween(
+                            committed_flr, lcr_pc);
                     if (!continue_past_flr && initial_vir_size > 1)
                         vir_program.truncate(initial_vir_size);
                     const auto vir_result =
@@ -3094,14 +3088,8 @@ CPU::launchDVRStridePrefetches(ThreadID tid, Addr current_address,
             replay->scalarCount = index + 1;
     }
     const Addr lcr_pc = dvrLoopBoundDetector.branchPC();
-    for (unsigned index = replay->scalarCount; index < replay->count;
-         ++index) {
-        if (dvrInstructionRecorder[index].conditional &&
-            dvrInstructionRecorder[index].pc != lcr_pc) {
-            replay->continuePastFLR = true;
-            break;
-        }
-    }
+    replay->continuePastFLR = dvrInstructionRecorder.hasConditionalBetween(
+        dvrCommittedFinalLoadPC, lcr_pc);
     // Source lanes begin at the next committed trigger occurrence.  The
     // replay register image must come from that same occurrence, otherwise
     // the source address and the non-trigger inputs belong to different
@@ -3272,7 +3260,8 @@ CPU::completeDVRNestedContext(
         return;
 
     dvrNestedContext.recorder.setReconvergencePC(
-        dvrNestedContext.taint.flr());
+        dvrNestedContext.taint.flr(),
+        dvrNestedContext.loopBound.branchPC());
     recordDVRAlternatePaths(dvrNestedContext.recorder,
                             committing_inst->contextId());
     augmentDVRAlternatePaths(dvrNestedContext.recorder,
@@ -3412,14 +3401,8 @@ CPU::launchDVRNestedPrefetches(
             replay->scalarCount = index + 1;
     }
     const Addr lcr_pc = dvrNestedContext.loopBound.branchPC();
-    for (unsigned index = replay->scalarCount; index < replay->count;
-         ++index) {
-        if (dvrNestedContext.recorder[index].conditional &&
-            dvrNestedContext.recorder[index].pc != lcr_pc) {
-            replay->continuePastFLR = true;
-            break;
-        }
-    }
+    replay->continuePastFLR = dvrNestedContext.recorder.hasConditionalBetween(
+        dvrNestedContext.taint.flr(), lcr_pc);
     replay->initialRegs = finish_regs;
     if (replay->count != 0) {
         replay->triggerDestination =
@@ -4221,6 +4204,8 @@ CPU::issueDVRReplayLanes(unsigned slots)
     copy.executedMask = {};
     copy.completedMask = {};
     copy.deadSourceMask = {};
+    copy.deadSource0Mask = {};
+    copy.deadSource1Mask = {};
     copy.pc = uop.pc;
     copy.uopIndex = seed->uopIndex;
     copy.inFlight = 1;
@@ -4270,21 +4255,44 @@ CPU::issueDVRReplayLanes(unsigned slots)
     const bool vector_destination = uop.destination > 0 &&
         uop.destination < DVRLoopBoundDetector::MaxArchitecturalIntRegs &&
         seed->helperRegs && (source_vectorized || control_divergence);
+    // A scalar instruction that overwrites a vectorized architectural
+    // register must demote it to a fresh scalar mapping.  Otherwise the
+    // scalar result would overwrite the vector bundle in VRAT.
+    const bool scalar_overwrite = uop.destination > 0 &&
+        uop.destination < DVRLoopBoundDetector::MaxArchitecturalIntRegs &&
+        seed->helperRegs && !vector_destination &&
+        seed->helperRegs->isVectorized(uop.destination);
     const uint64_t rename_key = (static_cast<uint64_t>(uop.pc) << 8) |
         static_cast<uint64_t>(uop.destination & 0xff);
-    const bool first_vector_destination = vector_destination && reconvergence &&
+    const bool first_destination_rename =
+        (vector_destination || scalar_overwrite) && reconvergence &&
         reconvergence->renamedDestinations.insert(rename_key).second;
-    if (first_vector_destination) {
-        if (control_divergence && !source_vectorized)
-            ++cpuStats.dvrVRATControlDivergenceAllocations;
-        if (!seed->helperRegs->renameVector(uop.destination)) {
+    if (first_destination_rename) {
+        const auto old_vector =
+            seed->helperRegs->vectorMapping(uop.destination);
+        const int16_t old_scalar =
+            seed->helperRegs->scalarMapping(uop.destination);
+        bool renamed = false;
+        if (vector_destination) {
+            if (control_divergence && !source_vectorized)
+                ++cpuStats.dvrVRATControlDivergenceAllocations;
+            renamed = seed->helperRegs->renameVector(uop.destination);
+        } else {
+            renamed = seed->helperRegs->rename(uop.destination) >= 0;
+        }
+        if (!renamed) {
             ++cpuStats.dvrVIRSourceValueSemanticFailures;
             for (Lane *lane : group)
                 lane->active = false;
+        } else {
+            // The old mapping is now dead in VRAT.  Mark every already
+            // issued VIR source that still names it; those bits are consumed
+            // when the corresponding copy retires.
+            dvrHelperThread.markDeadSources(
+                seed->helperRegs, old_vector, old_scalar);
         }
         assert(seed->helperRegs->conservationValid());
     }
-
     for (Lane *lane : group) {
         const auto &lane_uop = lane->program->uops[lane->uopIndex];
         const RegVal source0 = lane_uop.source0 >= 0 &&
