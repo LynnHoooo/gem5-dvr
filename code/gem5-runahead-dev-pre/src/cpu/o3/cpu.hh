@@ -817,6 +817,14 @@ class CPU : public BaseCPU
         statistics::Scalar dvrVIRChunkExecutions;
         statistics::Scalar dvrDivergentBranches;
         statistics::Scalar dvrReconvergences;
+        statistics::Scalar dvrSIMTBranchGroups;
+        statistics::Scalar dvrSIMTTakenLanes;
+        statistics::Scalar dvrSIMTNotTakenLanes;
+        statistics::Scalar dvrSIMTMixedBranches;
+        statistics::Scalar dvrSIMTReconvergencePushes;
+        statistics::Scalar dvrSIMTReconvergencePops;
+        statistics::Scalar dvrSIMTTakenDependentLoads;
+        statistics::Scalar dvrSIMTNotTakenDependentLoads;
         statistics::Scalar dvrVIRUnsupportedControlFlow;
         statistics::Scalar dvrVIRNormalTerminatedLanes;
         statistics::Scalar dvrVIREarlyExitLanes;
@@ -1535,6 +1543,12 @@ class CPU : public BaseCPU
                             int lanes = 0);
     void dvrTraceVector(const char *kind, Tick tick, Addr pc, Addr address,
                         int lanes, int invocation = -1);
+    void dvrTraceSIMTBranch(
+        Tick tick, Addr branch_pc, Addr reconvergence_pc,
+        const std::array<uint64_t, 2> &active_mask,
+        const std::array<uint64_t, 2> &taken_mask,
+        const std::array<uint64_t, 2> &not_taken_mask,
+        unsigned groups);
     struct DVRPrefetchAddress
     {
         Addr address;
@@ -1676,6 +1690,7 @@ class CPU : public BaseCPU
                 Addr pc = 0;
                 std::array<uint64_t, 2> mask = {};
                 bool alternatePath = false;
+                bool takenPath = false;
             };
             static constexpr unsigned Entries = 8;
             std::array<Frame, Entries> stack = {};
@@ -1702,6 +1717,10 @@ class CPU : public BaseCPU
             unsigned uopIndex = 1;
             Addr lanePC = 0;
             bool reconvergenceBlocked = false;
+            // 0 means no active split; 1 and 2 identify taken and
+            // not-taken SIMT paths.  The tag is restored with a stack frame
+            // so dependent loads can be attributed to both paths.
+            uint8_t simtPath = 0;
             unsigned helperUops = 0;
             bool nested = false;
             bool active = true;
