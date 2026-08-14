@@ -218,6 +218,17 @@ class IEW
     /** True only while the architectural LSQ retains a demand-load slot. */
     bool hasFreeDVRHelperLoadEntry(ThreadID tid);
 
+    /** Reserve/release native LQ capacity for a helper memory uop. */
+    bool reserveDVRHelperLoadEntry(ThreadID tid);
+    void releaseDVRHelperLoadEntry(ThreadID tid);
+    bool allocateDVRHelperLoad(uint64_t token, ThreadID tid,
+                               Addr virtual_address, Addr pc);
+    void translateDVRHelperLoad(uint64_t token, Addr physical_address);
+    void issueDVRHelperLoad(uint64_t token);
+    void writebackDVRHelperLoad(uint64_t token);
+    void completeDVRHelperLoad(uint64_t token);
+    unsigned numDVRHelperLoads() const;
+
     /** Tells CPU that the IEW stage is active and running. */
     void activateStage();
 

@@ -749,6 +749,7 @@ Commit::tick()
     if (toIEW->commitInfo[0].usedROB &&
         toIEW->commitInfo[0].freeROBEntries == 0) {
 
+        const bool new_block = !blocking;
         if (!blocking) {
             block_begin = cpu->curCycle();
             blocking = true;
@@ -757,16 +758,24 @@ Commit::tick()
 
         MJ("Commit", "rob full") << " " << rob->readHeadInst(0)->toString();
 
-        // Only in running mode could we enter PRE.
-        if (commitStatus[0] == Running &&
-            cpu->isPREEnabled() && !cpu->isInPRE()) {
+        // Classic Vector Runahead is triggered by a full ROB whose head
+        // load is still outstanding.  DVR's VR mode must observe that
+        // trigger independently of whether PRE itself is enabled: the
+        // Figure-8 VR configuration enables DVR, not the PRE mechanism.
+        if (commitStatus[0] == Running) {
             auto &stallInst = rob->readHeadInst(0);
 
             // Make sure the stalling load is still blocking.
             if (stallInst->isLoad() && !stallInst->readyToCommit()) {
-                MJ("Commit", "enter pre") << " " << stallInst->toString();
-                sst->addInst(stallInst);
-                cpu->enterPRE();
+                if (new_block)
+                    cpu->launchDVRVectorRunaheadOnStall(0);
+                // PRE retains its original, separate admission condition.
+                if (cpu->isPREEnabled() && !cpu->isInPRE()) {
+                    MJ("Commit", "enter pre") << " " <<
+                        stallInst->toString();
+                    sst->addInst(stallInst);
+                    cpu->enterPRE();
+                }
             }
         }
 

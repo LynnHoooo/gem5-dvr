@@ -16,10 +16,12 @@ RUN_ID="${RUN_ID:-$(date +%Y%m%dT%H%M%S)-$$}"
 WORKLOADS="${WORKLOADS:-camel,bfs}"
 BFS_SCALE="${BFS_SCALE:-6}"
 BFS_BAREMETAL="${BFS_BAREMETAL:-1}"
-CAMEL_MAX_KEY="${CAMEL_MAX_KEY:-1024}"
-ORACLE_LOOKAHEAD="${ORACLE_LOOKAHEAD:-32}"
+CAMEL_MAX_KEY="${CAMEL_MAX_KEY:-65536}"
+ORACLE_LOOKAHEAD="${ORACLE_LOOKAHEAD:-256}"
 CC="${CC:-/home/lynnhoo/buckyball/result/bin/riscv64-unknown-linux-gnu-gcc}"
 CXX="${CXX:-/home/lynnhoo/buckyball/result/bin/riscv64-unknown-linux-gnu-g++}"
+M5_ROOT="${M5_ROOT:-$ROOT/util/m5}"
+M5_LIB="${M5_LIB:-$M5_ROOT/build/riscv/out/libm5.a}"
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 read_stat() {
@@ -32,19 +34,28 @@ num_or_zero() {
         *) printf '%s\n' "$1" ;;
     esac
 }
+output_signature() {
+    if [[ "$1" == bfs ]]; then
+        awk '/^BFS Tree has/ || /^Verification[[:space:]]*:/' "$2"
+    else
+        awk '/^Result /' "$2"
+    fi
+}
 
 [[ -x "$GEM5" ]] || die "missing gem5: $GEM5"
 [[ -f "$CONFIG" ]] || die "missing config: $CONFIG"
 [[ -d "$BENCH_ROOT" ]] || die "missing LeAP root: $BENCH_ROOT"
 [[ -x "$CC" && -x "$CXX" ]] || die "missing RISC-V compiler pair"
+[[ -s "$M5_LIB" ]] || die "missing RISC-V m5 library: $M5_LIB"
 
 OUT="$OUT_ROOT/$RUN_ID"
 BUILD_DIR="$OUT/benchmarks"
 mkdir -p "$BUILD_DIR"
 
 "$CC" -g -O3 -static -march=rv64gc -mcmodel=medany \
-    -DMAX_KEY="$CAMEL_MAX_KEY" \
-    -o "$BUILD_DIR/camel.riscv" "$BENCH_ROOT/hpc/camel/camel.c" -lm
+    -DMAX_KEY="$CAMEL_MAX_KEY" -DENABLE_GEM5_STATS -I"$ROOT/include" \
+    -o "$BUILD_DIR/camel.riscv" "$BENCH_ROOT/hpc/camel/camel.c" \
+    "$M5_LIB" -lm
 
 declare -A BENCH OPTIONS
 BENCH[camel]="$BUILD_DIR/camel.riscv"
@@ -122,23 +133,26 @@ for workload in "${workload_list[@]}"; do
 done
 
 printf '%s\n' \
-    'workload,mode,sim_ticks,ipc,normalized_ipc,committed_insts,committed_match,translation_faults,helper_generated,helper_issued,helper_completed,dependent_generated,dependent_issued,dependent_completed,quality_coverage,quality_accuracy,quality_timeliness,quality_pollution_evictions' \
+    'workload,mode,sim_ticks,ipc,normalized_ipc,committed_insts,committed_match,translation_faults,dvr_unmapped_skipped,helper_generated,helper_issued,helper_completed,dependent_generated,dependent_issued,dependent_completed,quality_coverage,quality_accuracy,quality_timeliness,quality_pollution_evictions,oracle_unmapped_skipped' \
     >"$OUT/performance.csv"
 printf '%s\n' \
-    'workload,mode,stride_candidates,discovery_starts,discovery_completions,loop_bound_matches,vector_programs,source_issued,source_completed,replay_attempts,replay_targets,dependent_demand_loads,dependent_demand_covered,ndm_attempts,outer_invocations,flattened_lanes,flatten_expected,flatten_failures,alternate_hits,alternate_uops,alternate_targets,alternate_demand_covered,reconvergence_resumes' \
+    'workload,mode,stride_candidates,vr_stall_launches,discovery_starts,discovery_completions,loop_bound_matches,vector_programs,source_issued,source_completed,replay_attempts,replay_targets,dependent_demand_loads,dependent_demand_covered,ndm_attempts,outer_invocations,flattened_lanes,flatten_expected,flatten_failures,alternate_hits,alternate_uops,alternate_targets,alternate_demand_covered,reconvergence_resumes' \
     >"$OUT/mechanism.csv"
 printf '%s\n' \
-    'workload,mode,baseline_committed,committed,committed_match,translation_faults,helper_issued,helper_completed,dependent_issued,dependent_completed,helper_pending,active_mask_failures,reconvergence_stack_overflows,status' \
+    'workload,mode,baseline_committed,committed,committed_match,output_match,translation_faults,helper_issued,helper_completed,dependent_issued,dependent_completed,helper_pending,active_mask_failures,reconvergence_stack_overflows,status' \
     >"$OUT/correctness.csv"
 
 for workload in "${workload_list[@]}"; do
     base_stats="$OUT/$workload/Baseline/stats.txt"
     base_committed="$(read_stat "$base_stats" system.cpu.committedInsts)"
     base_ipc="$(read_stat "$base_stats" system.cpu.ipc)"
+    base_output="$(output_signature "$workload" "$OUT/$workload/Baseline/stdout.log")"
     for mode in Baseline VR Offload Discovery Multiple Oracle; do
         stats="$OUT/$workload/$mode/stats.txt"
         committed="$(read_stat "$stats" system.cpu.committedInsts)"
         match=0; [[ "$committed" == "$base_committed" ]] && match=1
+        output_match=0
+        [[ "$(output_signature "$workload" "$OUT/$workload/$mode/stdout.log")" == "$base_output" ]] && output_match=1
         faults="$(read_stat "$stats" system.cpu.dvrPrefetchTranslationFaults)"
         helper_generated="$(read_stat "$stats" system.cpu.dvrPrefetchesGenerated)"
         helper_issued="$(read_stat "$stats" system.cpu.dvrPrefetchesIssued)"
@@ -152,13 +166,17 @@ for workload in "${workload_list[@]}"; do
         accuracy="$(num_or_zero "$(read_stat "$stats" system.cpu.dvr_quality_probe.fillAccuracy)")"
         timeliness="$(num_or_zero "$(read_stat "$stats" system.cpu.dvr_quality_probe.timeliness)")"
         pollution="$(num_or_zero "$(read_stat "$stats" system.cpu.dvr_quality_probe.pollutionEvictions)")"
-        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
             "$workload" "$mode" "$(read_stat "$stats" simTicks)" "$ipc" "$norm" \
-            "$committed" "$match" "$faults" "$helper_generated" "$helper_issued" \
+            "$committed" "$match" "$faults" \
+            "$(read_stat "$stats" system.cpu.dvrUnmappedPrefetchesSkipped)" \
+            "$helper_generated" "$helper_issued" \
             "$helper_completed" "$dep_generated" "$dep_issued" "$dep_completed" \
-            "$coverage" "$accuracy" "$timeliness" "$pollution" >>"$OUT/performance.csv"
-        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+            "$coverage" "$accuracy" "$timeliness" "$pollution" \
+            "$(read_stat "$stats" system.cpu.oracleUnmappedSkipped)" >>"$OUT/performance.csv"
+        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
             "$workload" "$mode" "$(read_stat "$stats" system.cpu.dvrStrideCandidates)" \
+            "$(read_stat "$stats" system.cpu.dvrVRStallLaunches)" \
             "$(read_stat "$stats" system.cpu.dvrDiscoveryStarts)" "$(read_stat "$stats" system.cpu.dvrDiscoveryCompletions)" \
             "$(read_stat "$stats" system.cpu.dvrLoopBoundMatches)" "$(read_stat "$stats" system.cpu.dvrVectorProgramsBuilt)" \
             "$(read_stat "$stats" system.cpu.dvrSourcePrefetchesIssued)" "$(read_stat "$stats" system.cpu.dvrSourcePrefetchesCompleted)" \
@@ -171,10 +189,10 @@ for workload in "${workload_list[@]}"; do
             "$(read_stat "$stats" system.cpu.dvrAlternatePathDependentTargets)" "$(read_stat "$stats" system.cpu.dvrAlternatePathDemandCovered)" \
             "$(read_stat "$stats" system.cpu.dvrReconvergenceResumeSuccesses)" >>"$OUT/mechanism.csv"
         status=pass
-        [[ "$match" == 1 && "$faults" == 0 && "$helper_issued" == "$helper_completed" && \
+        [[ "$output_match" == 1 && "$faults" == 0 && "$helper_issued" == "$helper_completed" && \
            "$dep_issued" == "$dep_completed" ]] || status=observe
-        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
-            "$workload" "$mode" "$base_committed" "$committed" "$match" "$faults" \
+        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+            "$workload" "$mode" "$base_committed" "$committed" "$match" "$output_match" "$faults" \
             "$helper_issued" "$helper_completed" "$dep_issued" "$dep_completed" \
             "$(read_stat "$stats" system.cpu.dvrHelperLoadEntryPending)" \
             "$(read_stat "$stats" system.cpu.dvrVIRActiveMaskFailures)" \

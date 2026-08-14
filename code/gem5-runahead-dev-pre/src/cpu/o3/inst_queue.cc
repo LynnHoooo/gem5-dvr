@@ -517,7 +517,7 @@ InstructionQueue::numFreeEntries()
 unsigned
 InstructionQueue::numFreeEntries(ThreadID tid)
 {
-    return maxEntries[tid] - count[tid];
+    return std::min(freeEntries, maxEntries[tid] - count[tid]);
 }
 
 // Might want to do something more complex if it knows how many instructions

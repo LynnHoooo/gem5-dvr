@@ -86,6 +86,7 @@ LSQ::LSQ(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params)
       numThreads(params.numThreads)
 {
     assert(numThreads > 0 && numThreads <= MaxThreads);
+    dvrHelperReservedLoads.resize(numThreads, 0);
 
     //**********************************************
     //************ Handle SMT Parameters ***********
@@ -536,7 +537,7 @@ LSQ::numFreeLoadEntries()
     while (threads != end) {
         ThreadID tid = *threads++;
 
-        total += thread[tid].numFreeLoadEntries();
+        total += numFreeLoadEntries(tid);
     }
 
     return total;
@@ -562,7 +563,76 @@ LSQ::numFreeStoreEntries()
 unsigned
 LSQ::numFreeLoadEntries(ThreadID tid)
 {
-        return thread[tid].numFreeLoadEntries();
+    const unsigned native_free = thread[tid].numFreeLoadEntries();
+    return native_free > dvrHelperReservedLoads[tid] ?
+        native_free - dvrHelperReservedLoads[tid] : 0;
+}
+
+bool
+LSQ::reserveDVRHelperLoadEntry(ThreadID tid)
+{
+    if (numFreeLoadEntries(tid) == 0)
+        return false;
+    ++dvrHelperReservedLoads[tid];
+    return true;
+}
+
+void
+LSQ::releaseDVRHelperLoadEntry(ThreadID tid)
+{
+    assert(dvrHelperReservedLoads[tid] != 0);
+    --dvrHelperReservedLoads[tid];
+}
+
+bool
+LSQ::allocateDVRHelperLoad(uint64_t token, ThreadID tid,
+                           Addr virtual_address, Addr pc)
+{
+    assert(token != 0);
+    assert(dvrHelperLoads.find(token) == dvrHelperLoads.end());
+    if (!reserveDVRHelperLoadEntry(tid))
+        return false;
+    dvrHelperLoads.emplace(token, DVRHelperLoadRecord{
+        tid, virtual_address, 0, pc, DVRHelperLoadState::Allocated});
+    return true;
+}
+
+void
+LSQ::translateDVRHelperLoad(uint64_t token, Addr physical_address)
+{
+    auto entry = dvrHelperLoads.find(token);
+    assert(entry != dvrHelperLoads.end());
+    assert(entry->second.state == DVRHelperLoadState::Allocated);
+    entry->second.physicalAddress = physical_address;
+    entry->second.state = DVRHelperLoadState::Translated;
+}
+
+void
+LSQ::issueDVRHelperLoad(uint64_t token)
+{
+    auto entry = dvrHelperLoads.find(token);
+    assert(entry != dvrHelperLoads.end());
+    assert(entry->second.state == DVRHelperLoadState::Translated);
+    entry->second.state = DVRHelperLoadState::WaitingResponse;
+}
+
+void
+LSQ::writebackDVRHelperLoad(uint64_t token)
+{
+    auto entry = dvrHelperLoads.find(token);
+    assert(entry != dvrHelperLoads.end());
+    assert(entry->second.state == DVRHelperLoadState::WaitingResponse);
+    entry->second.state = DVRHelperLoadState::Writeback;
+}
+
+void
+LSQ::completeDVRHelperLoad(uint64_t token)
+{
+    auto entry = dvrHelperLoads.find(token);
+    assert(entry != dvrHelperLoads.end());
+    const ThreadID tid = entry->second.tid;
+    dvrHelperLoads.erase(entry);
+    releaseDVRHelperLoadEntry(tid);
 }
 
 unsigned
