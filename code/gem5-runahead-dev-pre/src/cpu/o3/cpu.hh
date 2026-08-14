@@ -943,8 +943,6 @@ class CPU : public BaseCPU
     void observeDVRLoad(const DynInstPtr &inst, Addr address);
     /** IEW dispatch 阶段观察指令并启动/推进 DVR Discovery。 */
     void observeDVRDispatch(const DynInstPtr &inst);
-    /** Compatibility callback for the classic VR stall path. */
-    void launchDVRVectorRunaheadOnStall(ThreadID tid);
     /** Front-end callbacks used by the shared instruction-fetch port. */
     void completeDVRInstructionFetch(PacketPtr pkt);
     bool isDVRInstructionFetch(PacketPtr pkt) const;
