@@ -4094,6 +4094,32 @@ CPU::issueDVRReplayLanes(unsigned slots)
             lane_it = context_lanes.erase(lane_it);
         }
         if (context_lanes.empty()) {
+            // The lane list is removed from the scheduler as soon as the
+            // generation has no live lanes.  Drop the lane-owned references
+            // here as well: in shared-bank mode the last helper VRAT
+            // reference returns every borrowed scalar/vector physical name
+            // to the O3 free list.  Keeping terminated lane objects in the
+            // stable list is intentional (raw pointers may still be present
+            // in diagnostics), but they must not keep a completed VRAT alive.
+            for (auto &lane : dvrHelperThread.replayLanes) {
+                if (lane.reconvergence.get() != context.get())
+                    continue;
+                lane.helperRegs.reset();
+                lane.program.reset();
+                lane.predicate.reset();
+                lane.reconvergence.reset();
+            }
+            auto replay_context_it = std::find_if(
+                dvrHelperThread.replayReconvergenceContexts.begin(),
+                dvrHelperThread.replayReconvergenceContexts.end(),
+                [&](const auto &entry) {
+                    return entry.second.get() == context.get();
+                });
+            if (replay_context_it !=
+                    dvrHelperThread.replayReconvergenceContexts.end()) {
+                dvrHelperThread.replayReconvergenceContexts.erase(
+                    replay_context_it);
+            }
             dvrHelperThread.replayContextLanes.erase(context_it);
             dvrHelperThread.replayReadyContextSet.erase(context.get());
             dvrHelperThread.replayReadyContexts.erase(
