@@ -4684,10 +4684,11 @@ CPU::issueDVRReplayLanes(unsigned slots)
             }
             const unsigned next_index = findPC(candidate->program, next_pc);
             if (next_index == std::numeric_limits<unsigned>::max()) {
-                candidate->active = false;
-                candidate->termination =
-                    Lane::TerminationReason::External;
-                ++cpuStats.dvrVIRExternalPathLanes;
+                // PCv is independent of the Discovery stream. Leave the
+                // lane active with the new PC; the next scheduler pass will
+                // fetch/decode the alternate target and append it to the
+                // generation-local runtime program.
+                candidate->uopIndex = candidate->program->count;
                 continue;
             }
             candidate->uopIndex = next_index;
@@ -5141,7 +5142,14 @@ CPU::issueDVRReplayLanes(unsigned slots)
                 continue;
             }
             const Addr line = dvrPrefetchLine(result);
-            const bool value_response = lane->continuePastFLR;
+            const bool final_load = lane->finalLoadPC == 0 ||
+                lane_uop.pc == lane->finalLoadPC;
+            // Every tainted load before FLR is an address-producing load:
+            // issue it as a gather and return its value to this same lane.
+            // The FLR also returns a value when the paper requires replay to
+            // continue through a branch after FLR.
+            const bool value_response = !final_load ||
+                lane->continuePastFLR;
             if (bfs_debug_generation && lane_uop.pc == 0x14598 &&
                 value_response) {
                 ++cpuStats.dvrDebugContinuedPastFLR;
@@ -5160,6 +5168,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
                 dependent.tid = lane->tid;
                 dependent.readyTick = ready_tick;
                 dependent.source = false;
+                dependent.valueResponse = value_response;
                 dependent.nested = lane->nested;
                 dependent.relationCount = lane->relationCount;
                 dependent.scales = lane->scales;
@@ -5214,7 +5223,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
             // load result in the lane state and execute both paths.  Ending
             // here would kill the alternate path before it can issue its
             // dependent load and would make stride-PC termination impossible.
-            if (!lane->continuePastFLR) {
+            if (!value_response) {
                 if (lane_uop.alternatePath &&
                     lane_uop.alternateResumePC != 0)
                     ++cpuStats.dvrReconvergenceResumeSuccesses;
@@ -5570,8 +5579,9 @@ CPU::serviceDVRPrefetchRequest()
      * not a scalar load value.  ReadReq still has no architectural consumer
      * here, while Request::PREFETCH preserves helper accounting/priority.
      */
-    const bool value_response = !prefetch.source && prefetch.replay &&
-        prefetch.replay->continuePastFLR;
+    const bool value_response = !prefetch.source &&
+        (prefetch.valueResponse ||
+         (prefetch.replay && prefetch.replay->continuePastFLR));
     PacketPtr pkt = new Packet(
         req, (prefetch.source || value_response) ?
             MemCmd::ReadReq : MemCmd::SoftPFReq);

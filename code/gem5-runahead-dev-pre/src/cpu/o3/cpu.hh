@@ -1746,6 +1746,11 @@ class CPU : public BaseCPU
         // the vector DynUop producing it completes.
         Tick readyTick = 0;
         bool source;
+        // Intermediate tainted loads must return their data to the helper
+        // lane so the following uop can compute the next dependent address.
+        // The final FLR load only needs a value response when replay
+        // continues past FLR into a divergent path.
+        bool valueResponse = false;
         bool oracle = false;
         bool nested = false;
         unsigned relationCount = 0;
