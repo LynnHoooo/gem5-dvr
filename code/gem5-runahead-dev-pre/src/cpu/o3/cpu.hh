@@ -1875,6 +1875,10 @@ class CPU : public BaseCPU
         struct ReplayReconvergenceState
         {
             // A vector destination must be renamed once per captured uop,
+            // Runtime PCv fetches may discover instructions that were not on
+            // the scalar Discovery path. Keep those decoded uops in a
+            // generation-local stream so all lanes share the same PC map.
+            std::shared_ptr<DVRReplayTemplate> runtimeProgram;
             // not once per eight-lane VIR issue group.  Re-renaming for each
             // group would copy only the already-issued lanes and make the
             // remaining lanes read stale/zero values.

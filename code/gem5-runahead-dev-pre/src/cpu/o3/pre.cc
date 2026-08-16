@@ -996,6 +996,129 @@ DVRInstructionRecorder::Uop::evaluateBranch(
     }
 }
 
+bool
+DVRInstructionRecorder::decodeStatic(const StaticInstPtr &inst, Addr pc,
+                                      Uop &uop)
+{
+    if (!inst)
+        return false;
+    uop = {};
+    uop.pc = pc;
+    uop.staticInst = inst;
+    uop.control = inst->isControl();
+    uop.conditional = inst->isCondCtrl();
+    uop.load = inst->isLoad();
+    uop.branchTaken = true;
+    for (int i = 0; i < inst->numSrcRegs(); ++i) {
+        const auto &reg = inst->srcRegIdx(i);
+        if (reg.classValue() != IntRegClass || reg.index() >= 32)
+            continue;
+        uop.intSources |= uint32_t(1) << reg.index();
+        if (uop.source0 < 0) uop.source0 = reg.index();
+        else if (uop.source1 < 0) uop.source1 = reg.index();
+    }
+    for (int i = 0; i < inst->numDestRegs(); ++i) {
+        const auto &reg = inst->destRegIdx(i);
+        if (reg.classValue() != IntRegClass || reg.index() >= 32)
+            continue;
+        uop.intDestinations |= uint32_t(1) << reg.index();
+        if (uop.destination < 0) uop.destination = reg.index();
+    }
+    uint64_t encoded = 0;
+    const size_t encoded_size = inst->asBytes(&encoded, sizeof(encoded));
+    if (encoded_size == 0 || encoded_size > sizeof(encoded))
+        return false;
+    uop.encoding = static_cast<uint32_t>(encoded);
+    uop.encodingValid = true;
+    const uint32_t raw = uop.encoding;
+    const bool compressed = (raw & 0x3) != 0x3;
+    uop.fallthroughPC = pc + (compressed ? 2 : 4);
+    using Semantic = Uop::Semantic;
+    const auto sx = [](uint64_t value, unsigned width) {
+        const uint64_t sign = uint64_t(1) << (width - 1);
+        return static_cast<int64_t>((value ^ sign) - sign);
+    };
+    if (compressed) {
+        const uint16_t c = raw & 0xffff;
+        const unsigned q = c & 0x3;
+        const unsigned f3 = (c >> 13) & 0x7;
+        if (q == 1 && f3 == 0) {
+            uop.semantic = Semantic::AddImmediate;
+            uop.immediate = sx(((c >> 12) & 1) << 5 |
+                               ((c >> 2) & 0x1f), 6);
+        } else if (q == 1 && f3 == 4 && ((c >> 10) & 3) == 3) {
+            const unsigned op = (c >> 5) & 3;
+            uop.semantic = op == 0 ? Semantic::Sub :
+                           op == 1 ? Semantic::Xor :
+                           op == 2 ? Semantic::Or : Semantic::And;
+        } else if (q == 0 && f3 == 2) {
+            uop.semantic = Semantic::LoadWordSigned;
+            uop.loadBytes = 4;
+            uop.immediate = ((c >> 10) & 7) << 3 |
+                            ((c >> 6) & 1) << 2;
+        } else if (q == 0 && f3 == 3) {
+            uop.semantic = Semantic::LoadDouble;
+            uop.loadBytes = 8;
+            uop.immediate = ((c >> 10) & 7) << 3 |
+                            ((c >> 5) & 3) << 6;
+        } else if (q == 1 && (f3 == 6 || f3 == 7)) {
+            uop.semantic = f3 == 6 ? Semantic::BranchEqual :
+                                      Semantic::BranchNotEqual;
+            const uint64_t imm = ((c >> 12) & 1) << 8 |
+                ((c >> 5) & 3) << 6 | ((c >> 2) & 1) << 5 |
+                ((c >> 10) & 3) << 3 | ((c >> 3) & 3) << 1;
+            uop.branchTargetPC = pc + sx(imm, 9);
+            uop.conditional = true;
+            uop.control = true;
+        }
+        return uop.semantic != Semantic::Unsupported || uop.control;
+    }
+    const uint32_t opcode = raw & 0x7f;
+    const unsigned f3 = (raw >> 12) & 7;
+    const unsigned f7 = (raw >> 25) & 0x7f;
+    if (opcode == 0x03) {
+        switch (f3) {
+          case 0: uop.semantic = Semantic::LoadByteSigned; uop.loadBytes = 1; break;
+          case 1: uop.semantic = Semantic::LoadHalfSigned; uop.loadBytes = 2; break;
+          case 2: uop.semantic = Semantic::LoadWordSigned; uop.loadBytes = 4; break;
+          case 3: uop.semantic = Semantic::LoadDouble; uop.loadBytes = 8; break;
+          case 4: uop.semantic = Semantic::LoadByteUnsigned; uop.loadBytes = 1; break;
+          case 5: uop.semantic = Semantic::LoadHalfUnsigned; uop.loadBytes = 2; break;
+          default: break;
+        }
+        uop.immediate = sx(raw >> 20, 12);
+    } else if (opcode == 0x63) {
+        switch (f3) {
+          case 0: uop.semantic = Semantic::BranchEqual; break;
+          case 1: uop.semantic = Semantic::BranchNotEqual; break;
+          case 4: uop.semantic = Semantic::BranchSignedLess; break;
+          case 5: uop.semantic = Semantic::BranchSignedGreaterEqual; break;
+          case 6: uop.semantic = Semantic::BranchUnsignedLess; break;
+          case 7: uop.semantic = Semantic::BranchUnsignedGreaterEqual; break;
+          default: break;
+        }
+        const uint64_t imm = ((raw >> 31) & 1) << 12 |
+            ((raw >> 25) & 0x3f) << 5 | ((raw >> 8) & 0xf) << 1 |
+            ((raw >> 7) & 1) << 11;
+        uop.branchTargetPC = pc + sx(imm, 13);
+        uop.conditional = true;
+        uop.control = true;
+    } else if (opcode == 0x33) {
+        if (f3 == 0 && f7 == 0) uop.semantic = Semantic::Add;
+        else if (f3 == 0 && f7 == 0x20) uop.semantic = Semantic::Sub;
+        else if (f3 == 7) uop.semantic = Semantic::And;
+        else if (f3 == 6) uop.semantic = Semantic::Or;
+        else if (f3 == 4) uop.semantic = Semantic::Xor;
+        else if (f3 == 0 && f7 == 1) uop.semantic = Semantic::Multiply;
+    } else if (opcode == 0x13 && f3 == 0) {
+        uop.semantic = Semantic::AddImmediate;
+        uop.immediate = sx(raw >> 20, 12);
+    } else if (opcode == 0x1b && f3 == 0) {
+        uop.semantic = Semantic::AddWordImmediate;
+        uop.immediate = sx(raw >> 20, 12);
+    }
+    return uop.semantic != Semantic::Unsupported || uop.control;
+}
 void
 DVRInstructionRecorder::begin(const DynInstPtr &trigger)
 {

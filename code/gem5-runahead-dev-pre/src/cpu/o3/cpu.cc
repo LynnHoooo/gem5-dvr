@@ -4236,8 +4236,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
     std::vector<Lane *> group;
     for (auto *lane : selected_lanes ?
          *selected_lanes : std::vector<Lane *>{}) {
-        if (!lane->active || !lane->program ||
-            lane->uopIndex >= lane->program->count)
+        if (!lane->active || !lane->program)
             continue;
         if (lane->helperUops >= dvrHelperMaxUops) {
             lane->active = false;
@@ -4258,9 +4257,60 @@ CPU::issueDVRReplayLanes(unsigned slots)
         // deferred frame can then never be popped by the matching lanes.
         unsigned pc_index = findPC(lane->program, lane->lanePC);
         if (pc_index == std::numeric_limits<unsigned>::max()) {
-            lane->active = false;
-            ++cpuStats.dvrVIRExternalPathLanes;
-            continue;
+            // PCv is an independent helper PC. A divergent target that was
+            // not observed by scalar Discovery is fetched and decoded through
+            // the normal helper front-end, then appended to this generation's
+            // shared runtime stream.
+            bool fetch_fault = false;
+            bool cache_hit = false;
+            const StaticInstPtr decoded = fetchDecodeDVRUop(
+                lane->tid, lane->lanePC, nullptr, fetch_fault, cache_hit);
+            if (!decoded)
+                continue;
+            DVRInstructionRecorder::Uop dynamic;
+            if (!DVRInstructionRecorder::decodeStatic(
+                    decoded, lane->lanePC, dynamic)) {
+                lane->active = false;
+                lane->termination = Lane::TerminationReason::External;
+                ++cpuStats.dvrVIRExternalPathLanes;
+                continue;
+            }
+            dynamic.alternatePath = true;
+            dynamic.tainted = true;
+            dynamic.reconvergencePC =
+                lane->continuePastFLR && lane->loopControlPC != 0 ?
+                lane->loopControlPC :
+                (lane->finalLoadPC != 0 ? lane->finalLoadPC :
+                                         lane->stridePC);
+            auto runtime = reconvergence ?
+                reconvergence->runtimeProgram : nullptr;
+            if (!runtime) {
+                runtime = std::make_shared<DVRReplayTemplate>(
+                    *lane->program);
+                if (reconvergence)
+                    reconvergence->runtimeProgram = runtime;
+            }
+            if (runtime->count >= DVRInstructionRecorder::MaxUops) {
+                lane->active = false;
+                lane->termination = Lane::TerminationReason::External;
+                ++cpuStats.dvrVIRExternalPathLanes;
+                continue;
+            }
+            runtime->uops[runtime->count++] = dynamic;
+            for (auto *candidate : selected_lanes ?
+                 *selected_lanes : std::vector<Lane *>{})
+                candidate->program = runtime;
+            lane->program = runtime;
+            pc_index = findPC(lane->program, lane->lanePC);
+            dvrTraceVector("replay_dynamic_pc_fetch", curTick(),
+                           lane->lanePC, dynamic.control,
+                           dynamic.load, static_cast<int>(lane->lane));
+            if (pc_index == std::numeric_limits<unsigned>::max()) {
+                lane->active = false;
+                lane->termination = Lane::TerminationReason::External;
+                ++cpuStats.dvrVIRExternalPathLanes;
+                continue;
+            }
         }
         // Remove stateless unsupported instructions from the executable
         // dependency slice before they consume VIR/FU bandwidth.  Typical

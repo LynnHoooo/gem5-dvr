@@ -349,6 +349,8 @@ class DVRInstructionRecorder
   public:
     void begin(const DynInstPtr &trigger);
     bool record(const DynInstPtr &inst, bool tainted = false);
+    /** Build replay metadata directly from a helper-front-end decode. */
+    static bool decodeStatic(const StaticInstPtr &inst, Addr pc, Uop &uop);
     /** Import a committed helper template for response-driven replay. */
     void import(const std::array<Uop, MaxUops> &source, unsigned size);
     /** Append a validated alternate suffix while retaining its reconvergence PC. */
