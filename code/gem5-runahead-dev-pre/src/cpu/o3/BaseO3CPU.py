@@ -205,7 +205,7 @@ class BaseO3CPU(BaseCPU):
         "Enable DVR dependent target prefetch generation")
     dvrAllowBoundedFallback = Param.Bool(True,
         "Allow bounded speculative launches without a proven loop bound")
-    dvrSharedPhysicalBank = Param.Bool(True,
+    dvrSharedPhysicalBank = Param.Bool(False,
         "Back the helper VRAT with shared O3 scalar/vector physical registers")
     dvrDiscoveryMaxInsts = Param.Unsigned(512,
         "一次 DVR 发现区间允许提交的最大指令数")

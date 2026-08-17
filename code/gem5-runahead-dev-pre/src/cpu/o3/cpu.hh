@@ -962,10 +962,10 @@ class CPU : public BaseCPU
         static constexpr unsigned NumArchitecturalRegs =
             DVRLoopBoundDetector::MaxArchitecturalIntRegs;
         // Match the paper's helper-side physical-register budget: 256 scalar
-        // entries and 128 vector entries. The bank remains helper-private,
+        // entries and 512 vector entries (32 complete 16-copy bundles). The bank remains helper-private,
         // but can now hold several vectorized destinations in flight.
         static constexpr unsigned NumScalarPhysicalRegs = 256;
-        static constexpr unsigned NumVectorPhysicalRegs = 128;
+        static constexpr unsigned NumVectorPhysicalRegs = 512;
         static constexpr unsigned NumPhysicalRegs =
             NumScalarPhysicalRegs + NumVectorPhysicalRegs;
 
@@ -2333,6 +2333,26 @@ class CPU : public BaseCPU
                     lane.active = false;
                     lane.termination = ReplayLaneContext::TerminationReason::
                         External;
+                }
+                // A source response can arrive after the first lanes have
+                // already established the current SIMT group.  Those late
+                // lanes must join the same PC/mask when their successor is
+                // the current replay PC; otherwise the branch evaluator only
+                // sees the early (often taken) lanes and can never produce a
+                // mixed result.
+                if (lane.active && lane.reconvergence) {
+                    auto &state = *lane.reconvergence;
+                    if (!state.currentValid) {
+                        state.currentPC = lane.lanePC;
+                        state.currentMask = {};
+                        state.currentValid = state.currentPC != 0;
+                    }
+                    if (state.currentValid &&
+                        state.currentPC == lane.lanePC &&
+                        !lane.reconvergenceBlocked) {
+                        state.currentMask[lane.lane / 64] |=
+                            uint64_t(1) << (lane.lane % 64);
+                    }
                 }
                 activateReplayContext(lane.reconvergence);
                 became_ready = readyUops == 0 ? 1 : 0;

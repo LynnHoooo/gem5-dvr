@@ -227,10 +227,10 @@ def parse_args():
         help="Disable speculative launches without a proven loop bound")
     parser.add_argument(
         "--dvr-private-physical-bank", action="store_true",
-        help="Use helper-local register storage for an explicit ablation")
+        help="Use helper-local register storage (paper-faithful default)")
     parser.add_argument(
         "--dvr-shared-physical-bank", action="store_true",
-        help="Deprecated compatibility flag; shared physical banks are default")
+        help="Explicitly borrow the main O3 physical register bank")
     parser.add_argument(
         "--num-phys-vec-regs", type=int, default=128,
         help=("Physical vector-register count; 128 is the paper/Table-1 "
@@ -300,7 +300,7 @@ def main():
         dvrVectorElementBits=args.dvr_vector_element_bits,
         dvrEnableDependentPrefetch=not args.dvr_no_dependent_prefetch,
         dvrAllowBoundedFallback=not args.dvr_no_bounded_fallback,
-        dvrSharedPhysicalBank=not args.dvr_private_physical_bank,
+        dvrSharedPhysicalBank=args.dvr_shared_physical_bank,
         dvrNDMThreshold=args.dvr_ndm_threshold,
         dvrNDMMaxInsts=args.dvr_ndm_max_insts,
     )
