@@ -493,15 +493,18 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
         }
 
         // C.ADDI4SPN rd', nzuimm -- stack-relative address materialization.
-        if (quadrant == 0 && funct3 == 0 &&
-            ((compressed >> 2) & 0x1f) != 0) {
-            uop.semantic = Semantic::AddImmediate;
-            uop.source0 = 2;
-            uop.immediate = (((compressed >> 11) & 0x3) << 4) |
+        if (quadrant == 0 && funct3 == 0) {
+            const uint32_t nzuimm =
+                (((compressed >> 11) & 0x3) << 4) |
                 (((compressed >> 7) & 0xf) << 6) |
                 (((compressed >> 6) & 0x1) << 2) |
                 (((compressed >> 5) & 0x1) << 3);
-            return;
+            if (nzuimm != 0) {
+                uop.semantic = Semantic::AddImmediate;
+                uop.source0 = 2;
+                uop.immediate = nzuimm;
+                return;
+            }
         }
 
         // C.ADDI16SP rd=x2, nzimm -- signed stack adjustment.
@@ -1051,7 +1054,16 @@ DVRInstructionRecorder::decodeStatic(const StaticInstPtr &inst, Addr pc,
         const uint16_t c = raw & 0xffff;
         const unsigned q = c & 0x3;
         const unsigned f3 = (c >> 13) & 0x7;
-        if (q == 1 && f3 == 0) {
+        if (q == 0 && f3 == 0) {
+            const uint32_t nzuimm = ((c >> 11) & 3) << 4 |
+                ((c >> 7) & 0xf) << 6 | ((c >> 6) & 1) << 2 |
+                ((c >> 5) & 1) << 3;
+            if (nzuimm != 0) {
+                uop.semantic = Semantic::AddImmediate;
+                uop.source0 = 2;
+                uop.immediate = nzuimm;
+            }
+        } else if (q == 1 && f3 == 0) {
             uop.semantic = Semantic::AddImmediate;
             uop.immediate = sx(((c >> 12) & 1) << 5 |
                                ((c >> 2) & 0x1f), 6);
