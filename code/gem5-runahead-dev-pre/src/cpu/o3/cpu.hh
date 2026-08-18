@@ -1901,8 +1901,11 @@ class CPU : public BaseCPU
                 bool alternatePath = false;
                 bool takenPath = false;
             };
-            static constexpr unsigned Entries = 8;
-            std::array<Frame, Entries> stack = {};
+            // Model an unbounded architectural reconvergence stack.  The
+            // paper does not specify overflow behavior; dropping deferred
+            // masks changes which speculative paths execute and obscures
+            // replay correctness, so simulation grows this vector as needed.
+            std::vector<Frame> stack;
             unsigned depth = 0;
             // Current SIMT group state.  Lane contexts remain the source of
             // truth for values, while this state records the group PC/mask

@@ -263,6 +263,7 @@ class DVRInstructionRecorder
             ShiftRightArithmetic,
             Multiply,
             MultiplyWord,
+            DivideUnsigned,
             Remainder,
             RemainderUnsigned,
             RemainderWord,
@@ -412,7 +413,11 @@ class DVRVectorRenameTable
 class DVRVectorInstructionRegister
 {
   private:
-    static constexpr unsigned ReconvergenceEntries = 8;
+    // A helper can execute at most MaxUops metadata entries (and is also
+    // stopped by its uop budget), so a program-sized stack is effectively
+    // unbounded for every representable replay path.
+    static constexpr unsigned ReconvergenceEntries =
+        DVRInstructionRecorder::MaxUops;
     struct ReconvergenceEntry
     {
         std::array<uint64_t, 2> deferredMask = {};

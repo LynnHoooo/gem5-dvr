@@ -617,12 +617,15 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
             return;
         }
 
-        // C.JR rs1 -- an indirect return.  Do not guess its target.
+        // C.JR rs1 -- the target is the lane value of rs1.  Move leaves
+        // that value in result and helper execution redirects PCv to it.
         if (quadrant == 2 && funct3 == 4 &&
             ((compressed >> 12) & 1) == 0 &&
             ((compressed >> 7) & 0x1f) != 0 &&
-            ((compressed >> 2) & 0x1f) == 0)
+            ((compressed >> 2) & 0x1f) == 0) {
+            uop.semantic = Semantic::Move;
             return;
+        }
 
         // C.MV rd, rs2 -- quadrant 2, funct3 100, bit12=0, rd/rs2 != x0.
         if (quadrant == 2 && funct3 == 4 &&
@@ -698,6 +701,7 @@ dvrDecodeRiscvSemantic(DVRInstructionRecorder::Uop &uop,
         else if (funct3 == 5 && funct7 == 0) uop.semantic = Semantic::ShiftRightLogical;
         else if (funct3 == 5 && funct7 == 0x20) uop.semantic = Semantic::ShiftRightArithmetic;
         else if (funct3 == 0 && funct7 == 1) uop.semantic = Semantic::Multiply;
+        else if (funct3 == 5 && funct7 == 1) uop.semantic = Semantic::DivideUnsigned;
         else if (funct3 == 6 && funct7 == 1) uop.semantic = Semantic::Remainder;
         else if (funct3 == 7 && funct7 == 1) uop.semantic = Semantic::RemainderUnsigned;
         return;
@@ -864,6 +868,11 @@ DVRInstructionRecorder::Uop::evaluate(
         result = static_cast<RegVal>(static_cast<int64_t>(static_cast<int32_t>(
             static_cast<uint32_t>(source0_value) *
             static_cast<uint32_t>(source1_value))));
+        return true;
+      case Semantic::DivideUnsigned:
+        result = source1_value == 0 ?
+            std::numeric_limits<RegVal>::max() :
+            source0_value / source1_value;
         return true;
       case Semantic::Remainder:
         if (source1_value == 0)
@@ -1061,6 +1070,12 @@ DVRInstructionRecorder::decodeStatic(const StaticInstPtr &inst, Addr pc,
             uop.loadBytes = 8;
             uop.immediate = ((c >> 10) & 7) << 3 |
                             ((c >> 5) & 3) << 6;
+        } else if (q == 2 && f3 == 4 && ((c >> 12) & 1) == 0 &&
+                   ((c >> 7) & 0x1f) != 0 &&
+                   ((c >> 2) & 0x1f) == 0) {
+            // C.JR/C.RET: its integer source is the dynamic target.
+            uop.semantic = Semantic::Move;
+            uop.control = true;
         } else if (q == 1 && (f3 == 6 || f3 == 7)) {
             uop.semantic = f3 == 6 ? Semantic::BranchEqual :
                                       Semantic::BranchNotEqual;
@@ -1110,6 +1125,7 @@ DVRInstructionRecorder::decodeStatic(const StaticInstPtr &inst, Addr pc,
         else if (f3 == 6) uop.semantic = Semantic::Or;
         else if (f3 == 4) uop.semantic = Semantic::Xor;
         else if (f3 == 0 && f7 == 1) uop.semantic = Semantic::Multiply;
+        else if (f3 == 5 && f7 == 1) uop.semantic = Semantic::DivideUnsigned;
     } else if (opcode == 0x13 && f3 == 0) {
         uop.semantic = Semantic::AddImmediate;
         uop.immediate = sx(raw >> 20, 12);
@@ -1315,7 +1331,8 @@ DVRInstructionRecorder::resourceCounts() const
             continue;
         }
         if (uop.semantic == Uop::Semantic::Multiply ||
-            uop.semantic == Uop::Semantic::MultiplyWord) {
+            uop.semantic == Uop::Semantic::MultiplyWord ||
+            uop.semantic == Uop::Semantic::DivideUnsigned) {
             ++resources.multiply;
             continue;
         }

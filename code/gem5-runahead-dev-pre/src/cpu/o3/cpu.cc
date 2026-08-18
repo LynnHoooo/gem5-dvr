@@ -1211,7 +1211,8 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "Helper lanes terminated at the 200-uop timeout"),
       ADD_STAT(dvrSIMTStackOverflowDroppedLanes,
                statistics::units::Count::get(),
-               "Deferred lanes dropped when the SIMT stack was full"),
+               "Legacy deferred lanes dropped by stack overflow; expected "
+               "to remain zero with the dynamic replay stack"),
       ADD_STAT(dvrVIRUnsupportedControlFlow,
                statistics::units::Count::get(),
                "VIR programs terminated because a lane target was outside "
@@ -1267,7 +1268,8 @@ CPU::CPUStats::CPUStats(CPU *cpu)
                "DVR helpers terminated by the helper-uop budget"),
       ADD_STAT(dvrReconvergenceStackOverflows,
                statistics::units::Count::get(),
-               "DVR helpers terminated by an eight-entry stack overflow"),
+               "Legacy VIR stack overflow events; expected to remain zero "
+               "with a program-sized stack"),
       ADD_STAT(dvrHelpersSuppressed, statistics::units::Count::get(),
                "DVR helper launches suppressed by invalid or terminated VIR"),
       ADD_STAT(dvrControlFallbackSourceLaunches,
@@ -4196,6 +4198,7 @@ CPU::issueDVRReplayLanes(unsigned slots)
             if (!at_reconvergence && current_path_active)
                 break;
             --reconvergence->depth;
+            reconvergence->stack.pop_back();
             const unsigned resumed_lanes =
                 __builtin_popcountll(frame.mask[0]) +
                 __builtin_popcountll(frame.mask[1]);
@@ -4657,7 +4660,8 @@ CPU::issueDVRReplayLanes(unsigned slots)
         uop.semantic == Semantic::LoadDouble;
     const OpClass op_class = is_shift ? SimdShiftOp :
         ((uop.semantic == Semantic::Multiply ||
-          uop.semantic == Semantic::MultiplyWord) ? SimdMultOp :
+          uop.semantic == Semantic::MultiplyWord ||
+          uop.semantic == Semantic::DivideUnsigned) ? SimdMultOp :
          (is_add ? SimdAddOp : SimdAluOp));
     ++cpuStats.dvrHelperFURequests;
     ++cpuStats.dvrVectorChunkRequests;
@@ -4737,34 +4741,9 @@ CPU::issueDVRReplayLanes(unsigned slots)
         for (unsigned path = branch_groups; path-- > 0;) {
             if (path == selected_branch_group)
                 continue;
-            if (reconvergence->depth >=
-                DVRHelperThread::ReplayReconvergenceState::Entries) {
-                const unsigned dropped =
-                    __builtin_popcountll(branch_masks[path][0]) +
-                    __builtin_popcountll(branch_masks[path][1]);
-                ++cpuStats.dvrReconvergenceStackOverflows;
-                cpuStats.dvrSIMTStackOverflowDroppedLanes += dropped;
-                dvrTraceVector("reconvergence_overflow", curTick(),
-                               uop.pc, branch_reconvergence, dropped,
-                               static_cast<int>(reconvergence->depth));
-                // The paper bounds the hardware stack at eight entries but
-                // does not define an architectural overflow protocol.  DVR
-                // is speculative, so preserve the current path and all
-                // already-represented frames, while masking off only the
-                // deferred lanes for this unrepresentable path.  This is the
-                // bounded recovery used by the helper; the main thread is
-                // unaffected and remains the correctness fallback.
-                for (auto *lane : selected_lanes ?
-                     *selected_lanes : std::vector<Lane *>{}) {
-                    const uint64_t bit = uint64_t(1) << (lane->lane % 64);
-                    if (branch_masks[path][lane->lane / 64] & bit) {
-                        lane->active = false;
-                        lane->termination = Lane::TerminationReason::External;
-                    }
-                }
-                continue;
-            }
-            auto &frame = reconvergence->stack[reconvergence->depth++];
+            reconvergence->stack.emplace_back();
+            auto &frame = reconvergence->stack.back();
+            ++reconvergence->depth;
             frame.currentPC = branch_group_pc[selected_branch_group];
             frame.currentMask = branch_masks[selected_branch_group];
             frame.reconvergencePC = branch_reconvergence;
@@ -4899,7 +4878,8 @@ CPU::issueDVRReplayLanes(unsigned slots)
     if (is_shift)
         ++cpuStats.dvrVectorShiftChunkIssues;
     else if (uop.semantic == DVRInstructionRecorder::Uop::Semantic::Multiply ||
-             uop.semantic == DVRInstructionRecorder::Uop::Semantic::MultiplyWord)
+             uop.semantic == DVRInstructionRecorder::Uop::Semantic::MultiplyWord ||
+             uop.semantic == DVRInstructionRecorder::Uop::Semantic::DivideUnsigned)
         ++cpuStats.dvrVectorMultiplyChunkIssues;
     else
         ++cpuStats.dvrVectorALUChunkIssues;
@@ -4981,6 +4961,9 @@ CPU::issueDVRReplayLanes(unsigned slots)
         }
         if (!renamed) {
             ++cpuStats.dvrVIRSourceValueSemanticFailures;
+            dvrTraceVector("vir_rename_failure", curTick(), uop.pc,
+                           uop.encoding, static_cast<int>(group.size()),
+                           static_cast<int>(uop.destination));
             for (Lane *lane : group)
                 lane->active = false;
         } else {
@@ -5014,7 +4997,13 @@ CPU::issueDVRReplayLanes(unsigned slots)
              lane->regs[lane_uop.source1]) : 0;
         RegVal result = 0;
         bool valid = true;
-        if (lane_uop.conditional) {
+        // Branch commit above has already advanced every lane's uopIndex to
+        // its successor.  Testing lane_uop here therefore observes the next
+        // instruction (or the zero-filled slot at program->count), and used
+        // to execute/kill that successor as part of the branch VIR issue.
+        // The instruction actually issued by this group is the stable uop
+        // captured before branch commit.
+        if (uop.conditional) {
             // The full branch group was committed after FU admission above.
             // Its helper-uop budget was charged once for every lane during
             // the group-wide commit; charging the selected VIR copy again
@@ -5026,6 +5015,9 @@ CPU::issueDVRReplayLanes(unsigned slots)
             lane->active = false;
             lane->termination = Lane::TerminationReason::External;
             ++cpuStats.dvrVIRSourceValueSemanticFailures;
+            dvrTraceVector("vir_unsupported_semantic", curTick(),
+                           lane_uop.pc, lane_uop.encoding, 1,
+                           static_cast<int>(lane_uop.semantic));
             continue;
         }
 
@@ -5285,10 +5277,16 @@ CPU::issueDVRReplayLanes(unsigned slots)
         if (lane_uop.alternatePath && lane_uop.alternateResumePC != 0) {
             lane->lanePC = lane_uop.alternateResumePC;
         } else {
-            lane->lanePC = lane_uop.control && !lane_uop.conditional &&
-            lane_uop.branchTargetPC != 0 ? lane_uop.branchTargetPC :
-            (lane->uopIndex + 1 < lane->program->count ?
-             lane->program->uops[lane->uopIndex + 1].pc : 0);
+            const bool indirect_control = lane_uop.control &&
+                !lane_uop.conditional && lane_uop.branchTargetPC == 0;
+            if (indirect_control) {
+                lane->lanePC = static_cast<Addr>(result) & ~Addr(1);
+            } else {
+                lane->lanePC = lane_uop.control && !lane_uop.conditional &&
+                    lane_uop.branchTargetPC != 0 ? lane_uop.branchTargetPC :
+                    (lane->uopIndex + 1 < lane->program->count ?
+                     lane->program->uops[lane->uopIndex + 1].pc : 0);
+            }
         }
         if (lane->lanePC == 0 || lane->helperUops >= dvrHelperMaxUops) {
             lane->active = false;
@@ -6099,6 +6097,7 @@ CPU::replayDVRSource(const DVRPrefetchSenderState &state,
             uop.semantic == DVRInstructionRecorder::Uop::Semantic::ShiftRightLogical ||
             uop.semantic == DVRInstructionRecorder::Uop::Semantic::ShiftRightArithmetic ||
             uop.semantic == DVRInstructionRecorder::Uop::Semantic::Multiply ||
+            uop.semantic == DVRInstructionRecorder::Uop::Semantic::DivideUnsigned ||
             uop.semantic == DVRInstructionRecorder::Uop::Semantic::AddWord ||
             uop.semantic == DVRInstructionRecorder::Uop::Semantic::SubWord ||
             uop.conditional;
